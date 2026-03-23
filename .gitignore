@@ -1,0 +1,20 @@
+# Data
+notebooks/data/
+
+# Secrets
+.streamlit/secrets.toml
+keys/
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
