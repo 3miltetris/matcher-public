@@ -56,13 +56,18 @@ def _load_topics(agencies: list[str]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def _keyword_filter(df: pd.DataFrame, keyword: str) -> pd.DataFrame:
-    if not keyword.strip():
+def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+    active = [f for f in filters if f['keyword'].strip() and f['column']]
+    if not active:
         return df
-    kw = keyword.lower()
-    mask = df.apply(
-        lambda col: col.astype(str).str.lower().str.contains(kw, na=False)
-    ).any(axis=1)
+    mask = df[active[0]['column']].astype(str).str.lower().str.contains(
+        active[0]['keyword'].lower(), na=False
+    )
+    for f in active[1:]:
+        m = df[f['column']].astype(str).str.lower().str.contains(
+            f['keyword'].lower(), na=False
+        )
+        mask = (mask & m) if f['operator'] == 'AND' else (mask | m)
     return df[mask]
 
 
@@ -89,6 +94,8 @@ def _similarity_search(df: pd.DataFrame, query_embedding: list[float], threshold
 for _k in ['gs_topics_df', 'gs_results_df']:
     if _k not in st.session_state:
         st.session_state[_k] = None
+if 'gs_filters' not in st.session_state:
+    st.session_state.gs_filters = [{'column': None, 'keyword': '', 'operator': 'AND'}]
 
 
 # ── Page ───────────────────────────────────────────────────────────────────
@@ -126,13 +133,48 @@ if st.session_state.gs_topics_df is None:
 
 df = st.session_state.gs_topics_df
 
-# ── Section 2 · Keyword filter + preview ───────────────────────────────────
+# ── Section 2 · Filters + preview ─────────────────────────────────────────
 
 st.divider()
 st.subheader('2 · Filter topics')
 
-keyword = st.text_input('Keyword filter', placeholder='Search across all columns…')
-filtered = _keyword_filter(df, keyword)
+filterable_cols = [c for c in df.columns if c != 'embeddings']
+
+# Ensure existing filter columns are still valid after a reload
+for f in st.session_state.gs_filters:
+    if f['column'] not in filterable_cols:
+        f['column'] = filterable_cols[0] if filterable_cols else None
+
+# Render filter rows
+for i, f in enumerate(st.session_state.gs_filters):
+    if i == 0:
+        col_sel, kw_input, _, remove_col = st.columns([2, 3, 1, 0.5])
+    else:
+        op_col, col_sel, kw_input, remove_col = st.columns([1, 2, 3, 0.5])
+        f['operator'] = op_col.radio(
+            'op', ['AND', 'OR'], index=0 if f['operator'] == 'AND' else 1,
+            key=f'gs_op_{i}', horizontal=True, label_visibility='collapsed'
+        )
+
+    f['column'] = col_sel.selectbox(
+        'Column', filterable_cols,
+        index=filterable_cols.index(f['column']) if f['column'] in filterable_cols else 0,
+        key=f'gs_col_{i}', label_visibility='collapsed'
+    )
+    f['keyword'] = kw_input.text_input(
+        'Keyword', value=f['keyword'],
+        placeholder=f'Filter by {f["column"]}…',
+        key=f'gs_kw_{i}', label_visibility='collapsed'
+    )
+    if remove_col.button('✕', key=f'gs_rm_{i}', disabled=len(st.session_state.gs_filters) == 1):
+        st.session_state.gs_filters.pop(i)
+        st.rerun()
+
+if st.button('+ Add filter'):
+    st.session_state.gs_filters.append({'column': filterable_cols[0], 'keyword': '', 'operator': 'AND'})
+    st.rerun()
+
+filtered = _apply_filters(df, st.session_state.gs_filters)
 
 display_cols = [c for c in filtered.columns if c != 'embeddings']
 st.caption(f'**{len(filtered):,}** topics match — showing first 50')
