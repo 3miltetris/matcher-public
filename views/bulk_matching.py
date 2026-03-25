@@ -53,13 +53,14 @@ def _load_parquets(prefix: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def _load_contacts(sources: list[str]) -> pd.DataFrame:
-    frames = []
+def _iter_contact_blobs(sources: list[str]):
+    """Yield (blob_name, DataFrame) one parquet file at a time — avoids loading all contacts at once."""
+    client = _get_storage_client()
     for source in sources:
-        df = _load_parquets(f'{_CONTACTS_PREFIX}{source}/')
-        if not df.empty:
-            frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        for blob in client.list_blobs(_BUCKET, prefix=f'{_CONTACTS_PREFIX}{source}/'):
+            if blob.name.endswith('.parquet'):
+                df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+                yield blob.name, df
 
 
 def _load_topics(agencies: list[str]) -> pd.DataFrame:
@@ -240,18 +241,6 @@ with opt_mid:
 can_run = selected_sources and st.session_state.bm_topics_df is not None
 if st.button('▶ Run Matching', type='primary', disabled=not can_run):
     try:
-        # ── Load contacts ────────────────────────────────────────────────
-        with st.spinner('Loading contacts…'):
-            contacts = _load_contacts(selected_sources)
-
-        if contacts.empty:
-            st.error('No contacts loaded.')
-            st.stop()
-
-        if 'embeddings' not in contacts.columns:
-            st.error('Contacts are missing an embeddings column.')
-            st.stop()
-
         # ── Prepare grants ───────────────────────────────────────────────
         grants = _apply_filters(st.session_state.bm_topics_df, st.session_state.bm_filters)
 
@@ -263,28 +252,37 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             st.error('Grant topics are missing an embeddings column.')
             st.stop()
 
-        contacts, grants = _normalize_columns(contacts, grants)
+        grants = grants[grants['embeddings'].notna()].reset_index(drop=True)
 
-        contacts = contacts[contacts['embeddings'].notna()].reset_index(drop=True)
-        grants   = grants[grants['embeddings'].notna()].reset_index(drop=True)
-        st.info(f'After null filter — contacts: {len(contacts)}, grants: {len(grants)}')
+        # ── Cosine similarity matching (one parquet file at a time) ──────
+        _BATCH      = 500
+        match_parts = []
+        bar         = st.progress(0, text='Loading contacts and matching…')
+        blob_list   = list(_iter_contact_blobs(selected_sources))
 
-        if contacts.empty or grants.empty:
-            st.error('No valid embeddings found after filtering nulls.')
+        if not blob_list:
+            st.error('No contact parquet files found for the selected sources.')
             st.stop()
 
-        # ── Cosine similarity matching (batched to avoid OOM) ────────────
-        _BATCH = 500
-        n_batches   = (len(contacts) + _BATCH - 1) // _BATCH
-        match_parts = []
-        bar = st.progress(0, text='Running cosine similarity matching…')
+        for file_i, (blob_name, contacts) in enumerate(blob_list):
+            if 'embeddings' not in contacts.columns:
+                continue
 
-        for b in range(n_batches):
-            batch = contacts.iloc[b * _BATCH : (b + 1) * _BATCH].reset_index(drop=True)
-            part  = get_matches(threshold, grants, batch)
-            if not part.empty:
-                match_parts.append(part)
-            bar.progress((b + 1) / n_batches, text=f'Matching batch {b + 1}/{n_batches}…')
+            contacts, _ = _normalize_columns(contacts, grants)
+            contacts = contacts[contacts['embeddings'].notna()].reset_index(drop=True)
+
+            if contacts.empty:
+                continue
+
+            n_batches = (len(contacts) + _BATCH - 1) // _BATCH
+            for b in range(n_batches):
+                batch = contacts.iloc[b * _BATCH : (b + 1) * _BATCH].reset_index(drop=True)
+                part  = get_matches(threshold, grants, batch)
+                if not part.empty:
+                    match_parts.append(part)
+
+            pct = (file_i + 1) / len(blob_list)
+            bar.progress(pct, text=f'Matched file {file_i + 1}/{len(blob_list)}: {blob_name.split("/")[-1]}')
 
         bar.empty()
 
@@ -293,11 +291,6 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             st.stop()
 
         matches = _normalize_matches(pd.concat(match_parts, ignore_index=True))
-
-        if matches.empty:
-            st.warning(f'No matches found above {threshold} similarity threshold.')
-            st.stop()
-
         st.success(f'Found **{len(matches):,}** candidate matches.')
 
         # ── AI validation ────────────────────────────────────────────────
