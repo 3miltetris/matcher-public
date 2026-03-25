@@ -243,7 +243,6 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
         # ── Load contacts ────────────────────────────────────────────────
         with st.spinner('Loading contacts…'):
             contacts = _load_contacts(selected_sources)
-        st.info(f'Contacts loaded: {len(contacts)} rows, columns: {list(contacts.columns)}')
 
         if contacts.empty:
             st.error('No contacts loaded.')
@@ -274,10 +273,26 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             st.error('No valid embeddings found after filtering nulls.')
             st.stop()
 
-        # ── Cosine similarity matching ───────────────────────────────────
-        with st.spinner('Running cosine similarity matching…'):
-            matches = get_matches(threshold, grants, contacts)
-            matches = _normalize_matches(matches)
+        # ── Cosine similarity matching (batched to avoid OOM) ────────────
+        _BATCH = 500
+        n_batches   = (len(contacts) + _BATCH - 1) // _BATCH
+        match_parts = []
+        bar = st.progress(0, text='Running cosine similarity matching…')
+
+        for b in range(n_batches):
+            batch = contacts.iloc[b * _BATCH : (b + 1) * _BATCH].reset_index(drop=True)
+            part  = get_matches(threshold, grants, batch)
+            if not part.empty:
+                match_parts.append(part)
+            bar.progress((b + 1) / n_batches, text=f'Matching batch {b + 1}/{n_batches}…')
+
+        bar.empty()
+
+        if not match_parts:
+            st.warning(f'No matches found above {threshold} similarity threshold.')
+            st.stop()
+
+        matches = _normalize_matches(pd.concat(match_parts, ignore_index=True))
 
         if matches.empty:
             st.warning(f'No matches found above {threshold} similarity threshold.')
