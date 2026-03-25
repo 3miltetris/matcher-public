@@ -8,3 +8,4 @@ numpy>=1.26.0
 google-cloud-storage>=2.0.0
 google-auth>=2.0.0
 pyarrow>=14.0.0
+pinecone>=3.0.0

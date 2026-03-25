@@ -1,30 +1,32 @@
 """
 Bulk Matching
 -------------
-Load contacts and grant topics from GCS, run cosine-similarity matching,
-optionally validate with AI and pre-write email copy, then export to CSV.
+Query Pinecone with grant-topic embeddings to find matching contacts,
+optionally validate with Claude AI and pre-write email copy, then export to CSV.
 """
 
 import io
+import traceback
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 from anthropic import Anthropic
 from google.cloud import storage
 from google.oauth2 import service_account
 from openai import OpenAI
+from pinecone import Pinecone
 
 from src.modules.email_generator import generate_subject_line, josiah_copy
-from src.modules.matcher import get_matches
 
-# ── GCS ────────────────────────────────────────────────────────────────────
+# ── Constants ────────────────────────────────────────────────────────────────
 
-_BUCKET           = 'cc-matcher-bucket-jeg-v1'
-_CONTACTS_PREFIX  = 'data/all-contacts/'
-_TOPICS_PREFIX    = 'data/all-topics/processed/'
-_MIN_THRESHOLD    = 0.82
+_BUCKET          = 'cc-matcher-bucket-jeg-v1'
+_CONTACTS_PREFIX = 'data/all-contacts/'
+_TOPICS_PREFIX   = 'data/all-topics/processed/'
+_MIN_THRESHOLD   = 0.82
 
+
+# ── GCS helpers ──────────────────────────────────────────────────────────────
 
 def _get_storage_client() -> storage.Client:
     creds = service_account.Credentials.from_service_account_info(
@@ -36,44 +38,35 @@ def _get_storage_client() -> storage.Client:
 def _list_prefixes(prefix: str) -> list[str]:
     try:
         client = _get_storage_client()
-        blobs = client.list_blobs(_BUCKET, prefix=prefix, delimiter='/')
+        blobs  = client.list_blobs(_BUCKET, prefix=prefix, delimiter='/')
         list(blobs)
         return sorted(p.replace(prefix, '').strip('/') for p in blobs.prefixes)
     except Exception as e:
-        st.error(f'Failed to list GCS prefixes: {e}')
+        st.error(f'Failed to list GCS prefixes under `{prefix}`: {e}')
         return []
-
-
-def _load_parquets(prefix: str) -> pd.DataFrame:
-    client = _get_storage_client()
-    frames = []
-    for blob in client.list_blobs(_BUCKET, prefix=prefix):
-        if blob.name.endswith('.parquet'):
-            frames.append(pd.read_parquet(io.BytesIO(blob.download_as_bytes())))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
-def _iter_contact_blobs(sources: list[str]):
-    """Yield (blob_name, DataFrame) one parquet file at a time — avoids loading all contacts at once."""
-    client = _get_storage_client()
-    for source in sources:
-        for blob in client.list_blobs(_BUCKET, prefix=f'{_CONTACTS_PREFIX}{source}/'):
-            if blob.name.endswith('.parquet'):
-                df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-                yield blob.name, df
 
 
 def _load_topics(agencies: list[str]) -> pd.DataFrame:
     client = _get_storage_client()
     frames = []
     for agency in agencies:
-        for blob in client.list_blobs(_BUCKET, prefix=f'{_TOPICS_PREFIX}{agency}/'):
+        prefix = f'{_TOPICS_PREFIX}{agency}/'
+        for blob in client.list_blobs(_BUCKET, prefix=prefix):
             if blob.name.endswith('.parquet'):
                 df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
                 df['broad_agency'] = agency
                 frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
+
+# ── Pinecone helper ───────────────────────────────────────────────────────────
+
+def _get_pinecone_index():
+    pc = Pinecone(api_key=st.secrets['pinecone_api_key'])
+    return pc.Index(st.secrets['pinecone_index'])
+
+
+# ── Filter helpers ────────────────────────────────────────────────────────────
 
 def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
     active = [f for f in filters if f['keyword'].strip() and f['column']]
@@ -90,43 +83,7 @@ def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
     return df[mask]
 
 
-def _normalize_columns(contacts: pd.DataFrame, grants: pd.DataFrame):
-    """Ensure company_summary and grant_summary exist after loading."""
-    contacts = contacts.copy()
-    grants   = grants.copy()
-
-    # Contacts: need a 'summary' column for get_matches merge rename
-    if 'summary' not in contacts.columns:
-        if 'company_summary' in contacts.columns:
-            contacts['summary'] = contacts['company_summary']
-
-    # Grants: need 'grant_summary' for AI validation
-    if 'grant_summary' not in grants.columns:
-        for col in ('description', 'summary'):
-            if col in grants.columns:
-                grants = grants.rename(columns={col: 'grant_summary'})
-                break
-
-    return contacts, grants
-
-
-def _normalize_matches(matches: pd.DataFrame) -> pd.DataFrame:
-    """Ensure company_summary and grant_summary exist on the merged result."""
-    matches = matches.copy()
-    if 'company_summary' not in matches.columns:
-        for col in ('summary_x', 'summary', 'company_summary'):
-            if col in matches.columns:
-                matches = matches.rename(columns={col: 'company_summary'})
-                break
-    if 'grant_summary' not in matches.columns:
-        for col in ('summary_y', 'description'):
-            if col in matches.columns:
-                matches = matches.rename(columns={col: 'grant_summary'})
-                break
-    return matches
-
-
-# ── Session state ───────────────────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 
 for _k in ['bm_topics_df', 'bm_results_df']:
     if _k not in st.session_state:
@@ -135,12 +92,12 @@ if 'bm_filters' not in st.session_state:
     st.session_state.bm_filters = [{'column': None, 'keyword': '', 'operator': 'AND'}]
 
 
-# ── Page ────────────────────────────────────────────────────────────────────
+# ── Page ──────────────────────────────────────────────────────────────────────
 
 st.title('⚙️ Bulk Matching')
-st.caption('Match contacts against grant topics using cosine similarity.')
+st.caption('Query Pinecone with grant-topic embeddings to find matching contacts.')
 
-# ── Section 1 · Contact sources ─────────────────────────────────────────────
+# ── Section 1 · Contact sources ───────────────────────────────────────────────
 
 st.subheader('1 · Select contact sources')
 
@@ -151,11 +108,12 @@ if not contact_sources:
 
 src_cols = st.columns(min(len(contact_sources), 6))
 selected_sources = [
-    src for i, src in enumerate(contact_sources)
+    src
+    for i, src in enumerate(contact_sources)
     if src_cols[i % len(src_cols)].checkbox(src, value=True, key=f'bm_src_{src}')
 ]
 
-# ── Section 2 · Grant topics ─────────────────────────────────────────────────
+# ── Section 2 · Grant topics ──────────────────────────────────────────────────
 
 st.divider()
 st.subheader('2 · Select grant topics')
@@ -167,24 +125,28 @@ if not grant_agencies:
 
 ag_cols = st.columns(min(len(grant_agencies), 6))
 selected_agencies = [
-    ag for i, ag in enumerate(grant_agencies)
+    ag
+    for i, ag in enumerate(grant_agencies)
     if ag_cols[i % len(ag_cols)].checkbox(ag, value=True, key=f'bm_agency_{ag}')
 ]
 
 if st.button('Load Topics', type='primary', disabled=not selected_agencies):
     with st.spinner('Loading grant topics…'):
-        df = _load_topics(selected_agencies)
-    if df.empty:
+        _df = _load_topics(selected_agencies)
+    if _df.empty:
         st.warning('No topics found for the selected agencies.')
     else:
-        st.session_state.bm_topics_df = df
-        st.session_state.bm_filters   = [{'column': None, 'keyword': '', 'operator': 'AND'}]
+        # Normalise grant description column to 'grant_summary'
+        if 'grant_summary' not in _df.columns and 'description' in _df.columns:
+            _df = _df.rename(columns={'description': 'grant_summary'})
+        st.session_state.bm_topics_df  = _df
+        st.session_state.bm_filters    = [{'column': None, 'keyword': '', 'operator': 'AND'}]
         st.session_state.bm_results_df = None
-        st.success(f'Loaded **{len(df):,}** grant topics.')
+        st.success(f'Loaded **{len(_df):,}** grant topics.')
 
 if st.session_state.bm_topics_df is not None:
-    df = st.session_state.bm_topics_df
-    filterable_cols = [c for c in df.columns if c != 'embeddings']
+    _topics_df     = st.session_state.bm_topics_df
+    filterable_cols = [c for c in _topics_df.columns if c != 'embeddings']
 
     for f in st.session_state.bm_filters:
         if f['column'] not in filterable_cols:
@@ -196,7 +158,8 @@ if st.session_state.bm_topics_df is not None:
         else:
             op_col, col_sel, kw_input, remove_col = st.columns([1, 2, 3, 0.5])
             f['operator'] = op_col.radio(
-                'op', ['AND', 'OR'], index=0 if f['operator'] == 'AND' else 1,
+                'op', ['AND', 'OR'],
+                index=0 if f['operator'] == 'AND' else 1,
                 key=f'bm_op_{i}', horizontal=True, label_visibility='collapsed'
             )
         f['column'] = col_sel.selectbox(
@@ -214,13 +177,15 @@ if st.session_state.bm_topics_df is not None:
             st.rerun()
 
     if st.button('+ Add filter', key='bm_add_filter'):
-        st.session_state.bm_filters.append({'column': filterable_cols[0], 'keyword': '', 'operator': 'AND'})
+        st.session_state.bm_filters.append(
+            {'column': filterable_cols[0], 'keyword': '', 'operator': 'AND'}
+        )
         st.rerun()
 
-    filtered_topics = _apply_filters(df, st.session_state.bm_filters)
-    display_cols    = [c for c in filtered_topics.columns if c != 'embeddings']
-    st.caption(f'**{len(filtered_topics):,}** topics match — showing first 50')
-    st.dataframe(filtered_topics[display_cols].head(50), width="stretch", hide_index=True)
+    _filtered_preview = _apply_filters(_topics_df, st.session_state.bm_filters)
+    _display_cols     = [c for c in _filtered_preview.columns if c != 'embeddings']
+    st.caption(f'**{len(_filtered_preview):,}** topics match — showing first 50')
+    st.dataframe(_filtered_preview[_display_cols].head(50), width="stretch", hide_index=True)
 
 # ── Section 3 · Run options ───────────────────────────────────────────────────
 
@@ -234,78 +199,100 @@ with opt_left:
         min_value=_MIN_THRESHOLD, max_value=1.0,
         value=_MIN_THRESHOLD, step=0.01,
     )
+    top_k = st.number_input(
+        'Top-K contacts per topic',
+        min_value=10, max_value=1000,
+        value=200, step=10,
+    )
 with opt_mid:
-    ai_validation = st.checkbox('AI validation', value=True)
+    ai_validation  = st.checkbox('AI validation',  value=True)
     prewrite_email = st.checkbox('Pre-write email', value=False)
 
-can_run = selected_sources and st.session_state.bm_topics_df is not None
-if st.button('▶ Run Matching', type='primary', disabled=not can_run):
+can_run = bool(selected_sources) and st.session_state.bm_topics_df is not None
+
+if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_container_width=False):
     try:
-        # ── Prepare grants ───────────────────────────────────────────────
+        # ── Prepare filtered grants ───────────────────────────────────────
         grants = _apply_filters(st.session_state.bm_topics_df, st.session_state.bm_filters)
 
         if grants.empty:
-            st.error('No grant topics after filtering.')
+            st.error('No grant topics after applying filters.')
             st.stop()
 
         if 'embeddings' not in grants.columns:
-            st.error('Grant topics are missing an embeddings column.')
+            st.error('Grant topics are missing an `embeddings` column.')
             st.stop()
 
         grants = grants[grants['embeddings'].notna()].reset_index(drop=True)
 
-        # ── Cosine similarity matching (one parquet file at a time) ──────
-        _BATCH      = 500
-        match_parts = []
-        bar         = st.progress(0, text='Loading contacts and matching…')
-        blob_list   = list(_iter_contact_blobs(selected_sources))
-
-        if not blob_list:
-            st.error('No contact parquet files found for the selected sources.')
+        if grants.empty:
+            st.error('All grant topics have null embeddings after filtering.')
             st.stop()
 
-        for file_i, (blob_name, contacts) in enumerate(blob_list):
-            if 'embeddings' not in contacts.columns:
-                continue
+        # ── Pinecone query — one topic at a time ─────────────────────────
+        index           = _get_pinecone_index()
+        source_filter   = {'source': {'$in': selected_sources}}
+        match_rows: list[dict] = []
+        n_topics        = len(grants)
+        bar             = st.progress(0, text='Querying Pinecone…')
 
-            contacts, _ = _normalize_columns(contacts, grants)
-            contacts = contacts[contacts['embeddings'].notna()].reset_index(drop=True)
+        for topic_i, (_, grant_row) in enumerate(grants.iterrows()):
+            embedding = grant_row['embeddings']
+            if hasattr(embedding, 'tolist'):
+                embedding = embedding.tolist()
+            else:
+                embedding = list(embedding)
 
-            if contacts.empty:
-                continue
+            result = index.query(
+                vector=embedding,
+                top_k=int(top_k),
+                include_metadata=True,
+                filter=source_filter,
+            )
 
-            n_batches = (len(contacts) + _BATCH - 1) // _BATCH
-            for b in range(n_batches):
-                batch = contacts.iloc[b * _BATCH : (b + 1) * _BATCH].reset_index(drop=True)
-                part  = get_matches(threshold, grants, batch)
-                if not part.empty:
-                    match_parts.append(part)
+            for match in result.matches:
+                if match.score < threshold:
+                    continue
+                row = dict(match.metadata or {})
+                row['similarity_score'] = match.score
+                row['topic_number']     = grant_row.get('topic_number',  '')
+                row['title']            = grant_row.get('title',         '')
+                row['agency']           = grant_row.get('agency',        '')
+                row['broad_agency']     = grant_row.get('broad_agency',  '')
+                row['due_date']         = grant_row.get('due_date',      '')
+                row['grant_summary']    = grant_row.get(
+                    'grant_summary',
+                    grant_row.get('description', '')
+                )
+                match_rows.append(row)
 
-            pct = (file_i + 1) / len(blob_list)
-            bar.progress(pct, text=f'Matched file {file_i + 1}/{len(blob_list)}: {blob_name.split("/")[-1]}')
+            bar.progress(
+                (topic_i + 1) / n_topics,
+                text=f'Queried topic {topic_i + 1}/{n_topics}: {str(grant_row.get("title", ""))[:60]}'
+            )
 
         bar.empty()
 
-        if not match_parts:
+        if not match_rows:
             st.warning(f'No matches found above {threshold} similarity threshold.')
             st.stop()
 
-        matches = _normalize_matches(pd.concat(match_parts, ignore_index=True))
+        matches = pd.DataFrame(match_rows)
         st.success(f'Found **{len(matches):,}** candidate matches.')
 
-        # ── AI validation ────────────────────────────────────────────────
+        # ── AI validation ─────────────────────────────────────────────────
         if ai_validation:
-            anth_client = Anthropic(api_key=st.secrets['anthropic_api_key'])
-            matches['good_match'] = None
+            anth_client             = Anthropic(api_key=st.secrets['anthropic_api_key'])
+            matches['good_match']   = None
             yes_websites: list[str] = []
             bar = st.progress(0, text='AI validation…')
 
             for i, (idx, row) in enumerate(matches.iterrows()):
-                website = row.get('companyWebsite', '')
-                if website in yes_websites:
+                website = str(row.get('companyWebsite', '') or '')
+                if website and website in yes_websites:
                     matches.at[idx, 'good_match'] = 'yes'
                 else:
-                    msg = anth_client.messages.create(
+                    msg    = anth_client.messages.create(
                         model='claude-3-haiku-20240307',
                         max_tokens=15,
                         temperature=0,
@@ -313,14 +300,17 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
                             'Tell me if this company summary and grant summary are aligned. '
                             'Only give a one-word answer. Either "yes" or "no".'
                         ),
-                        messages=[{'role': 'user', 'content': (
-                            f"company summary: {row.get('company_summary', '')}\n\n"
-                            f"grant summary: {row.get('grant_summary', '')}"
-                        )}],
+                        messages=[{
+                            'role': 'user',
+                            'content': (
+                                f"company summary: {row.get('company_summary', '')}\n\n"
+                                f"grant summary: {row.get('grant_summary', '')}"
+                            ),
+                        }],
                     )
                     result = msg.content[0].text.strip().lower()
                     matches.at[idx, 'good_match'] = result
-                    if 'yes' in result:
+                    if 'yes' in result and website:
                         yes_websites.append(website)
 
                 bar.progress((i + 1) / len(matches), text=f'AI validation: {i + 1}/{len(matches)}')
@@ -329,7 +319,7 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             yes_count = matches['good_match'].str.contains('yes', na=False).sum()
             st.success(f'AI validation complete — **{yes_count}** good matches.')
 
-        # ── Pre-write email ──────────────────────────────────────────────
+        # ── Pre-write email ───────────────────────────────────────────────
         if prewrite_email:
             email_targets = (
                 matches[matches['good_match'].str.contains('yes', na=False)]
@@ -339,26 +329,29 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             if email_targets.empty:
                 st.warning('No matches to generate emails for.')
             else:
-                anth_client   = Anthropic(api_key=st.secrets['anthropic_api_key'])
-                openai_client = OpenAI(api_key=st.secrets['openai_api_key'])
+                anth_client           = Anthropic(api_key=st.secrets['anthropic_api_key'])
+                openai_client         = OpenAI(api_key=st.secrets['openai_api_key'])
                 matches['subject_line'] = None
                 matches['ai_message']   = None
                 bar = st.progress(0, text='Generating email copy…')
 
                 for i, (idx, row) in enumerate(email_targets.iterrows()):
                     matches.at[idx, 'subject_line'] = generate_subject_line(
-                        company_summary=row.get('company_summary', ''),
-                        agency=row.get('agency', row.get('broad_agency', '')),
+                        company_summary=str(row.get('company_summary', '') or ''),
+                        agency=str(row.get('agency', row.get('broad_agency', '')) or ''),
                         openai_client=openai_client,
                         anth_client=anth_client,
                     )
                     matches.at[idx, 'ai_message'] = josiah_copy(
-                        company_summary=row.get('company_summary', ''),
-                        grant_summary=row.get('grant_summary', ''),
+                        company_summary=str(row.get('company_summary', '') or ''),
+                        grant_summary=str(row.get('grant_summary', '') or ''),
                         word_limit=50,
                         anth_client=anth_client,
                     )
-                    bar.progress((i + 1) / len(email_targets), text=f'Generating emails: {i + 1}/{len(email_targets)}')
+                    bar.progress(
+                        (i + 1) / len(email_targets),
+                        text=f'Generating emails: {i + 1}/{len(email_targets)}'
+                    )
 
                 bar.empty()
                 st.success(f'Email copy generated for **{len(email_targets)}** matches.')
@@ -366,18 +359,17 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
         st.session_state.bm_results_df = matches
 
     except Exception as e:
-        import traceback
         st.error(f'**Error:** {e}')
         st.code(traceback.format_exc())
 
-# ── Section 4 · Results & export ─────────────────────────────────────────────
+# ── Section 4 · Results & export ──────────────────────────────────────────────
 
 if st.session_state.bm_results_df is not None:
     results = st.session_state.bm_results_df
     st.divider()
     st.subheader('4 · Results & export')
 
-    export_cols = [c for c in results.columns if c not in ('embeddings',)]
+    export_cols   = [c for c in results.columns if c != 'embeddings']
     selected_cols = st.multiselect(
         'Columns to export',
         options=export_cols,
