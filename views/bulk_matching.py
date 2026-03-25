@@ -239,6 +239,7 @@ with opt_mid:
 
 can_run = selected_sources and st.session_state.bm_topics_df is not None
 if st.button('▶ Run Matching', type='primary', disabled=not can_run):
+  try:
 
     # ── Load contacts ───────────────────────────────────────────────────
     with st.spinner('Loading contacts…'):
