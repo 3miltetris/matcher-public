@@ -184,7 +184,7 @@ class TextProcessor:
         text = text.lower()
         text = ''.join([char if char not in '“”.!?,—():-/;–•' else ' ' for char in text])
         text = ''.join([char for char in text if char not in string.punctuation])
-        text = re.sub('\s{2,}', ' ', text)
+        text = re.sub(r'\s{2,}', ' ', text)
         return text
     
     def normalize_column(self, df, column, new_column):
@@ -194,7 +194,7 @@ class TextProcessor:
                           .astype(str).str.lower()
                           .str.replace(f'[{special_chars}]+', ' ', regex=True)
                           .str.replace(f'[{string.punctuation}]+', '', regex=True)
-                          .str.replace('\s{2,}', ' ', regex=True)
+                          .str.replace(r'\s{2,}', ' ', regex=True)
                           )
         return df
 
