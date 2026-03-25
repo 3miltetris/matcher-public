@@ -180,7 +180,7 @@ display_cols = [c for c in filtered.columns if c != 'embeddings']
 st.caption(f'**{len(filtered):,}** topics match — showing first 50')
 st.dataframe(
     filtered[display_cols].head(50),
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 
@@ -215,7 +215,7 @@ if st.session_state.gs_results_df is not None:
         st.success(f'**{len(results):,}** topics above {threshold} similarity.')
         st.dataframe(
             results[result_cols],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 'similarity_score': st.column_config.NumberColumn('Score', format='%.4f'),

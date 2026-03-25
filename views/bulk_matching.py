@@ -219,7 +219,7 @@ if st.session_state.bm_topics_df is not None:
     filtered_topics = _apply_filters(df, st.session_state.bm_filters)
     display_cols    = [c for c in filtered_topics.columns if c != 'embeddings']
     st.caption(f'**{len(filtered_topics):,}** topics match — showing first 50')
-    st.dataframe(filtered_topics[display_cols].head(50), use_container_width=True, hide_index=True)
+    st.dataframe(filtered_topics[display_cols].head(50), width="stretch", hide_index=True)
 
 # ── Section 3 · Run options ───────────────────────────────────────────────────
 
@@ -372,7 +372,7 @@ if st.session_state.bm_results_df is not None:
 
     if selected_cols:
         preview = results[selected_cols]
-        st.dataframe(preview, use_container_width=True, hide_index=True)
+        st.dataframe(preview, width="stretch", hide_index=True)
 
         csv_bytes = preview.to_csv(index=False).encode('utf-8')
         st.download_button(

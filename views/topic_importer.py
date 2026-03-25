@@ -232,7 +232,7 @@ if st.session_state.topics_df is not None:
             key='agency_fill_input',
         )
     with fill_right:
-        if st.button('Apply to all rows', use_container_width=True):
+        if st.button('Apply to all rows', width="stretch"):
             df = st.session_state.topics_df.copy()
             df['agency'] = fill_value.strip()
             st.session_state.topics_df = df
@@ -241,7 +241,7 @@ if st.session_state.topics_df is not None:
     # Data editor — always sync edits back to session state so they survive reruns
     edited_df = st.data_editor(
         st.session_state.topics_df,
-        use_container_width=True,
+        width="stretch",
         num_rows='dynamic',
         column_config={
             'topic_number': st.column_config.TextColumn('Topic #',      width='small'),
