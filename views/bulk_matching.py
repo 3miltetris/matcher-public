@@ -8,13 +8,13 @@ optionally validate with Claude AI and pre-write email copy, then export to CSV.
 import io
 import traceback
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from anthropic import Anthropic
 from google.cloud import storage
 from google.oauth2 import service_account
 from openai import OpenAI
-from pinecone import Pinecone
 
 from src.modules.email_generator import generate_subject_line, josiah_copy
 
@@ -59,11 +59,15 @@ def _load_topics(agencies: list[str]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-# ── Pinecone helper ───────────────────────────────────────────────────────────
-
-def _get_pinecone_index():
-    pc = Pinecone(api_key=st.secrets['pinecone_api_key'])
-    return pc.Index(st.secrets['pinecone_index'])
+def _list_contact_blobs(sources: list[str]) -> list[tuple]:
+    """Return (source, blob) pairs without downloading data."""
+    client = _get_storage_client()
+    result = []
+    for source in sources:
+        for blob in client.list_blobs(_BUCKET, prefix=f'{_CONTACTS_PREFIX}{source}/'):
+            if blob.name.endswith('.parquet'):
+                result.append((source, blob))
+    return result
 
 
 # ── Filter helpers ────────────────────────────────────────────────────────────
@@ -200,9 +204,9 @@ with opt_left:
         value=_MIN_THRESHOLD, step=0.01,
     )
     top_k = st.number_input(
-        'Top-K contacts per topic',
-        min_value=10, max_value=1000,
-        value=200, step=10,
+        'Top-K topics per contact',
+        min_value=1, max_value=50,
+        value=5, step=1,
     )
 with opt_mid:
     ai_validation  = st.checkbox('AI validation',  value=True)
@@ -229,47 +233,59 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_conta
             st.error('All grant topics have null embeddings after filtering.')
             st.stop()
 
-        # ── Pinecone query — one topic at a time ─────────────────────────
-        index           = _get_pinecone_index()
-        source_filter   = {'source': {'$in': selected_sources}}
+        # ── Build grant matrix (small — stays in memory throughout) ────────
+        grant_embeddings = np.stack(grants['embeddings'].values)  # (n_grants, 1536)
+        grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'grant_summary']
+        grant_meta = grants[[c for c in grant_cols if c in grants.columns]].reset_index(drop=True)
+
+        # ── Stream contacts one file at a time — top-K topics per contact ─
+        with st.spinner('Listing contact files…'):
+            blob_list = _list_contact_blobs(selected_sources)
+
+        if not blob_list:
+            st.error('No contact parquet files found for the selected sources.')
+            st.stop()
+
         match_rows: list[dict] = []
-        n_topics        = len(grants)
-        bar             = st.progress(0, text='Querying Pinecone…')
+        bar = st.progress(0, text='Matching contacts…')
 
-        for topic_i, (_, grant_row) in enumerate(grants.iterrows()):
-            embedding = grant_row['embeddings']
-            if hasattr(embedding, 'tolist'):
-                embedding = embedding.tolist()
-            else:
-                embedding = list(embedding)
+        for file_i, (source, blob) in enumerate(blob_list):
+            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+            df = df[df['embeddings'].notna()].reset_index(drop=True)
+            if df.empty:
+                continue
 
-            result = index.query(
-                vector=embedding,
-                top_k=int(top_k),
-                include_metadata=True,
-                filter=source_filter,
-            )
+            # Normalise summary column
+            if 'company_summary' not in df.columns and 'summary' in df.columns:
+                df = df.rename(columns={'summary': 'company_summary'})
 
-            for match in result.matches:
-                if match.score < threshold:
+            contact_embeddings = np.stack(df['embeddings'].values)  # (n_contacts, 1536)
+            scores = np.dot(contact_embeddings, grant_embeddings.T)  # (n_contacts, n_grants)
+
+            for ci in range(len(df)):
+                contact_scores = scores[ci]
+                above = np.where(contact_scores >= threshold)[0]
+                if len(above) == 0:
                     continue
-                row = dict(match.metadata or {})
-                row['similarity_score'] = match.score
-                row['topic_number']     = grant_row.get('topic_number',  '')
-                row['title']            = grant_row.get('title',         '')
-                row['agency']           = grant_row.get('agency',        '')
-                row['broad_agency']     = grant_row.get('broad_agency',  '')
-                row['due_date']         = grant_row.get('due_date',      '')
-                row['grant_summary']    = grant_row.get(
-                    'grant_summary',
-                    grant_row.get('description', '')
-                )
-                match_rows.append(row)
+                top_indices = above[np.argsort(contact_scores[above])[::-1][:int(top_k)]]
+                contact_row = df.iloc[ci]
+                for gi in top_indices:
+                    row = {
+                        'companyName':     str(contact_row.get('companyName',    '') or ''),
+                        'companyWebsite':  str(contact_row.get('companyWebsite', '') or ''),
+                        'firstName':       str(contact_row.get('firstName',      '') or ''),
+                        'lastName':        str(contact_row.get('lastName',       '') or ''),
+                        'email':           str(contact_row.get('email',          '') or ''),
+                        'company_summary': str(contact_row.get('company_summary', '') or ''),
+                        'source':          source,
+                        'similarity_score': float(contact_scores[gi]),
+                    }
+                    for col in grant_meta.columns:
+                        row[col] = grant_meta.iloc[gi].get(col, '')
+                    match_rows.append(row)
 
-            bar.progress(
-                (topic_i + 1) / n_topics,
-                text=f'Queried topic {topic_i + 1}/{n_topics}: {str(grant_row.get("title", ""))[:60]}'
-            )
+            bar.progress((file_i + 1) / len(blob_list),
+                         text=f'File {file_i + 1}/{len(blob_list)}: {blob.name.split("/")[-1]}')
 
         bar.empty()
 
