@@ -239,123 +239,128 @@ with opt_mid:
 
 can_run = selected_sources and st.session_state.bm_topics_df is not None
 if st.button('▶ Run Matching', type='primary', disabled=not can_run):
-  try:
+    try:
+        # ── Load contacts ────────────────────────────────────────────────
+        with st.spinner('Loading contacts…'):
+            contacts = _load_contacts(selected_sources)
+        st.info(f'Contacts loaded: {len(contacts)} rows, columns: {list(contacts.columns)}')
 
-    # ── Load contacts ───────────────────────────────────────────────────
-    with st.spinner('Loading contacts…'):
-        contacts = _load_contacts(selected_sources)
+        if contacts.empty:
+            st.error('No contacts loaded.')
+            st.stop()
 
-    if contacts.empty:
-        st.error('No contacts loaded.')
-        st.stop()
+        if 'embeddings' not in contacts.columns:
+            st.error('Contacts are missing an embeddings column.')
+            st.stop()
 
-    if 'embeddings' not in contacts.columns:
-        st.error('Contacts are missing an embeddings column.')
-        st.stop()
+        # ── Prepare grants ───────────────────────────────────────────────
+        grants = _apply_filters(st.session_state.bm_topics_df, st.session_state.bm_filters)
 
-    # ── Prepare grants ──────────────────────────────────────────────────
-    grants = _apply_filters(st.session_state.bm_topics_df, st.session_state.bm_filters)
+        if grants.empty:
+            st.error('No grant topics after filtering.')
+            st.stop()
 
-    if grants.empty:
-        st.error('No grant topics after filtering.')
-        st.stop()
+        if 'embeddings' not in grants.columns:
+            st.error('Grant topics are missing an embeddings column.')
+            st.stop()
 
-    if 'embeddings' not in grants.columns:
-        st.error('Grant topics are missing an embeddings column.')
-        st.stop()
+        contacts, grants = _normalize_columns(contacts, grants)
 
-    contacts, grants = _normalize_columns(contacts, grants)
+        contacts = contacts[contacts['embeddings'].notna()].reset_index(drop=True)
+        grants   = grants[grants['embeddings'].notna()].reset_index(drop=True)
+        st.info(f'After null filter — contacts: {len(contacts)}, grants: {len(grants)}')
 
-    # Drop rows with null embeddings
-    contacts = contacts[contacts['embeddings'].notna()].reset_index(drop=True)
-    grants   = grants[grants['embeddings'].notna()].reset_index(drop=True)
+        if contacts.empty or grants.empty:
+            st.error('No valid embeddings found after filtering nulls.')
+            st.stop()
 
-    if contacts.empty or grants.empty:
-        st.error('No valid embeddings found after filtering nulls.')
-        st.stop()
+        # ── Cosine similarity matching ───────────────────────────────────
+        with st.spinner('Running cosine similarity matching…'):
+            matches = get_matches(threshold, grants, contacts)
+            matches = _normalize_matches(matches)
 
-    # ── Cosine similarity matching ──────────────────────────────────────
-    with st.spinner('Running cosine similarity matching…'):
-        matches = get_matches(threshold, grants, contacts)
-        matches = _normalize_matches(matches)
+        if matches.empty:
+            st.warning(f'No matches found above {threshold} similarity threshold.')
+            st.stop()
 
-    if matches.empty:
-        st.warning(f'No matches found above {threshold} similarity threshold.')
-        st.stop()
+        st.success(f'Found **{len(matches):,}** candidate matches.')
 
-    st.success(f'Found **{len(matches):,}** candidate matches.')
-
-    # ── AI validation ───────────────────────────────────────────────────
-    if ai_validation:
-        anth_client = Anthropic(api_key=st.secrets['anthropic_api_key'])
-        matches['good_match'] = None
-        yes_websites: list[str] = []
-        bar = st.progress(0, text='AI validation…')
-
-        for i, (idx, row) in enumerate(matches.iterrows()):
-            website = row.get('companyWebsite', '')
-            if website in yes_websites:
-                matches.at[idx, 'good_match'] = 'yes'
-            else:
-                msg = anth_client.messages.create(
-                    model='claude-3-haiku-20240307',
-                    max_tokens=15,
-                    temperature=0,
-                    system=(
-                        'Tell me if this company summary and grant summary are aligned. '
-                        'Only give a one-word answer. Either "yes" or "no".'
-                    ),
-                    messages=[{'role': 'user', 'content': (
-                        f"company summary: {row.get('company_summary', '')}\n\n"
-                        f"grant summary: {row.get('grant_summary', '')}"
-                    )}],
-                )
-                result = msg.content[0].text.strip().lower()
-                matches.at[idx, 'good_match'] = result
-                if 'yes' in result:
-                    yes_websites.append(website)
-
-            bar.progress((i + 1) / len(matches), text=f'AI validation: {i + 1}/{len(matches)}')
-
-        bar.empty()
-        yes_count = matches['good_match'].str.contains('yes', na=False).sum()
-        st.success(f'AI validation complete — **{yes_count}** good matches.')
-
-    # ── Pre-write email ─────────────────────────────────────────────────
-    if prewrite_email:
+        # ── AI validation ────────────────────────────────────────────────
         if ai_validation:
-            email_targets = matches[matches['good_match'].str.contains('yes', na=False)]
-        else:
-            email_targets = matches
+            anth_client = Anthropic(api_key=st.secrets['anthropic_api_key'])
+            matches['good_match'] = None
+            yes_websites: list[str] = []
+            bar = st.progress(0, text='AI validation…')
 
-        if email_targets.empty:
-            st.warning('No matches to generate emails for.')
-        else:
-            anth_client  = Anthropic(api_key=st.secrets['anthropic_api_key'])
-            openai_client = OpenAI(api_key=st.secrets['openai_api_key'])
-            matches['subject_line'] = None
-            matches['ai_message']   = None
-            bar = st.progress(0, text='Generating email copy…')
+            for i, (idx, row) in enumerate(matches.iterrows()):
+                website = row.get('companyWebsite', '')
+                if website in yes_websites:
+                    matches.at[idx, 'good_match'] = 'yes'
+                else:
+                    msg = anth_client.messages.create(
+                        model='claude-3-haiku-20240307',
+                        max_tokens=15,
+                        temperature=0,
+                        system=(
+                            'Tell me if this company summary and grant summary are aligned. '
+                            'Only give a one-word answer. Either "yes" or "no".'
+                        ),
+                        messages=[{'role': 'user', 'content': (
+                            f"company summary: {row.get('company_summary', '')}\n\n"
+                            f"grant summary: {row.get('grant_summary', '')}"
+                        )}],
+                    )
+                    result = msg.content[0].text.strip().lower()
+                    matches.at[idx, 'good_match'] = result
+                    if 'yes' in result:
+                        yes_websites.append(website)
 
-            for i, (idx, row) in enumerate(email_targets.iterrows()):
-                matches.at[idx, 'subject_line'] = generate_subject_line(
-                    company_summary=row.get('company_summary', ''),
-                    agency=row.get('agency', row.get('broad_agency', '')),
-                    openai_client=openai_client,
-                    anth_client=anth_client,
-                )
-                matches.at[idx, 'ai_message'] = josiah_copy(
-                    company_summary=row.get('company_summary', ''),
-                    grant_summary=row.get('grant_summary', ''),
-                    word_limit=50,
-                    anth_client=anth_client,
-                )
-                bar.progress((i + 1) / len(email_targets), text=f'Generating emails: {i + 1}/{len(email_targets)}')
+                bar.progress((i + 1) / len(matches), text=f'AI validation: {i + 1}/{len(matches)}')
 
             bar.empty()
-            st.success(f'Email copy generated for **{len(email_targets)}** matches.')
+            yes_count = matches['good_match'].str.contains('yes', na=False).sum()
+            st.success(f'AI validation complete — **{yes_count}** good matches.')
 
-    st.session_state.bm_results_df = matches
+        # ── Pre-write email ──────────────────────────────────────────────
+        if prewrite_email:
+            email_targets = (
+                matches[matches['good_match'].str.contains('yes', na=False)]
+                if ai_validation else matches
+            )
+
+            if email_targets.empty:
+                st.warning('No matches to generate emails for.')
+            else:
+                anth_client   = Anthropic(api_key=st.secrets['anthropic_api_key'])
+                openai_client = OpenAI(api_key=st.secrets['openai_api_key'])
+                matches['subject_line'] = None
+                matches['ai_message']   = None
+                bar = st.progress(0, text='Generating email copy…')
+
+                for i, (idx, row) in enumerate(email_targets.iterrows()):
+                    matches.at[idx, 'subject_line'] = generate_subject_line(
+                        company_summary=row.get('company_summary', ''),
+                        agency=row.get('agency', row.get('broad_agency', '')),
+                        openai_client=openai_client,
+                        anth_client=anth_client,
+                    )
+                    matches.at[idx, 'ai_message'] = josiah_copy(
+                        company_summary=row.get('company_summary', ''),
+                        grant_summary=row.get('grant_summary', ''),
+                        word_limit=50,
+                        anth_client=anth_client,
+                    )
+                    bar.progress((i + 1) / len(email_targets), text=f'Generating emails: {i + 1}/{len(email_targets)}')
+
+                bar.empty()
+                st.success(f'Email copy generated for **{len(email_targets)}** matches.')
+
+        st.session_state.bm_results_df = matches
+
+    except Exception as e:
+        import traceback
+        st.error(f'**Error:** {e}')
+        st.code(traceback.format_exc())
 
 # ── Section 4 · Results & export ─────────────────────────────────────────────
 
