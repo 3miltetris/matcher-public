@@ -44,16 +44,15 @@ def _list_contact_sources() -> list[str]:
     return sorted(p.replace(_CONTACTS_PREFIX, '').strip('/') for p in blobs.prefixes)
 
 
-def _iter_contact_blobs(sources: list[str]):
-    """Yield (blob_name, DataFrame) one parquet at a time for the given sources."""
+def _list_contact_blobs(sources: list[str]) -> list[tuple]:
+    """Return list of (source, blob) tuples without downloading any data."""
     client = _get_storage_client()
+    result = []
     for source in sources:
-        prefix = f'{_CONTACTS_PREFIX}{source}/'
-        for blob in client.list_blobs(_BUCKET, prefix=prefix):
+        for blob in client.list_blobs(_BUCKET, prefix=f'{_CONTACTS_PREFIX}{source}/'):
             if blob.name.endswith('.parquet'):
-                df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-                df['_source'] = source
-                yield blob.name, df
+                result.append((source, blob))
+    return result
 
 
 def _make_vector_id(source: str, company_website: str) -> str:
@@ -152,9 +151,9 @@ if st.button('Upsert to Pinecone', type='primary', disabled=not selected_sources
     try:
         index = _get_pinecone_index()
 
-        # Collect blob list first so we know the total for the progress bar
+        # List blobs first (metadata only — no data downloaded yet)
         with st.spinner('Enumerating parquet files in GCS…'):
-            blob_list = list(_iter_contact_blobs(selected_sources))
+            blob_list = _list_contact_blobs(selected_sources)
 
         if not blob_list:
             st.error('No parquet files found for the selected sources.')
@@ -164,14 +163,15 @@ if st.button('Upsert to Pinecone', type='primary', disabled=not selected_sources
         total_upserted = 0
         bar = st.progress(0, text='Starting…')
 
-        for file_i, (blob_name, df) in enumerate(blob_list):
-            source       = df['_source'].iloc[0] if '_source' in df.columns else 'unknown'
-            short_name   = blob_name.split('/')[-1]
+        for file_i, (source, blob) in enumerate(blob_list):
+            short_name = blob.name.split('/')[-1]
             bar.progress(
                 file_i / total_files,
                 text=f'Processing file {file_i + 1}/{total_files}: {short_name}'
             )
 
+            # Download and process one file at a time
+            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
             vectors = _build_vectors(df, source)
             if not vectors:
                 continue
