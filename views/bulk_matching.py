@@ -16,7 +16,7 @@ import streamlit as st
 from anthropic import AsyncAnthropic
 from google.cloud import storage
 from google.oauth2 import service_account
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI  # AsyncOpenAI used inside _generate_email_batch
 
 from src.modules.email_generator import async_generate_subject_line, async_josiah_copy
 
@@ -100,61 +100,66 @@ def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
 
 async def _validate_rows(
     rows: list[tuple[int, dict]],
-    anth_client: AsyncAnthropic,
+    anth_key: str,
 ) -> list[tuple[int, str]]:
-    """Run validation for a batch of (df_index, row_dict) pairs concurrently."""
-    async def _one(idx: int, row: dict) -> tuple[int, str]:
-        for attempt in range(_MAX_RETRIES):
-            try:
-                msg = await anth_client.messages.create(
-                    model='claude-3-haiku-20240307',
-                    max_tokens=15,
-                    temperature=0,
-                    system=_VALIDATION_SYSTEM,
-                    messages=[{
-                        'role': 'user',
-                        'content': (
-                            f"company summary: {row.get('company_summary', '')}\n\n"
-                            f"grant summary: {row.get('grant_summary', '')}"
-                        ),
-                    }],
-                )
-                return idx, msg.content[0].text.strip().lower()
-            except Exception as e:
-                err = str(e)
-                if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):
-                    await asyncio.sleep((2 ** attempt) + random.random())
-                else:
-                    raise
-        return idx, 'no'  # give up after retries — treat as non-match
+    """Run validation for a batch of (df_index, row_dict) pairs concurrently.
+    Client is created inside the coroutine so it lives in the correct event loop."""
+    async with AsyncAnthropic(api_key=anth_key) as anth_client:
+        async def _one(idx: int, row: dict) -> tuple[int, str]:
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    msg = await anth_client.messages.create(
+                        model='claude-3-haiku-20240307',
+                        max_tokens=15,
+                        temperature=0,
+                        system=_VALIDATION_SYSTEM,
+                        messages=[{
+                            'role': 'user',
+                            'content': (
+                                f"company summary: {row.get('company_summary', '')}\n\n"
+                                f"grant summary: {row.get('grant_summary', '')}"
+                            ),
+                        }],
+                    )
+                    return idx, msg.content[0].text.strip().lower()
+                except Exception as e:
+                    err = str(e)
+                    if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):
+                        await asyncio.sleep((2 ** attempt) + random.random())
+                    else:
+                        raise
+            return idx, 'no'  # give up after retries — treat as non-match
 
-    return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
+        return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
 
 
 async def _generate_email_batch(
     rows: list[tuple[int, dict]],
-    openai_client: AsyncOpenAI,
-    anth_client: AsyncAnthropic,
+    openai_key: str,
+    anth_key: str,
 ) -> list[tuple[int, str, str]]:
-    """Generate subject line + body concurrently for a batch of rows."""
-    async def _one(idx: int, row: dict) -> tuple[int, str, str]:
-        subject, body = await asyncio.gather(
-            async_generate_subject_line(
-                company_summary=str(row.get('company_summary', '') or ''),
-                agency=str(row.get('agency', row.get('broad_agency', '')) or ''),
-                openai_client=openai_client,
-                anth_client=anth_client,
-            ),
-            async_josiah_copy(
-                company_summary=str(row.get('company_summary', '') or ''),
-                grant_summary=str(row.get('grant_summary', '') or ''),
-                word_limit=50,
-                anth_client=anth_client,
-            ),
-        )
-        return idx, subject, body
+    """Generate subject line + body concurrently for a batch of rows.
+    Clients are created inside the coroutine so they live in the correct event loop."""
+    async with AsyncOpenAI(api_key=openai_key) as openai_client, \
+               AsyncAnthropic(api_key=anth_key) as anth_client:
+        async def _one(idx: int, row: dict) -> tuple[int, str, str]:
+            subject, body = await asyncio.gather(
+                async_generate_subject_line(
+                    company_summary=str(row.get('company_summary', '') or ''),
+                    agency=str(row.get('agency', row.get('broad_agency', '')) or ''),
+                    openai_client=openai_client,
+                    anth_client=anth_client,
+                ),
+                async_josiah_copy(
+                    company_summary=str(row.get('company_summary', '') or ''),
+                    grant_summary=str(row.get('grant_summary', '') or ''),
+                    word_limit=50,
+                    anth_client=anth_client,
+                ),
+            )
+            return idx, subject, body
 
-    return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
+        return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -368,7 +373,7 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_conta
 
         # ── AI validation (async, deduplicated by website) ────────────────
         if ai_validation:
-            anth_async            = AsyncAnthropic(api_key=st.secrets['anthropic_api_key'])
+            anth_key              = st.secrets['anthropic_api_key']
             matches['good_match'] = None
 
             # One API call per unique website; rows without a website each get their own call
@@ -392,7 +397,7 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_conta
 
             for i in range(0, total_tasks, _VALIDATION_BATCH):
                 batch   = unique_tasks[i : i + _VALIDATION_BATCH]
-                results = asyncio.run(_validate_rows(batch, anth_async))
+                results = asyncio.run(_validate_rows(batch, anth_key))
                 idx_to_result.update(results)
                 done += len(batch)
                 bar.progress(done / total_tasks, text=f'AI validation: {done}/{total_tasks} unique companies')
@@ -417,8 +422,8 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_conta
             if matches.empty:
                 st.warning('No confirmed matches to generate emails for.')
             else:
-                anth_async    = AsyncAnthropic(api_key=st.secrets['anthropic_api_key'])
-                openai_async  = AsyncOpenAI(api_key=st.secrets['openai_api_key'])
+                anth_key     = st.secrets['anthropic_api_key']
+                openai_key   = st.secrets['openai_api_key']
                 matches['subject_line'] = None
                 matches['ai_message']   = None
                 email_rows = [(idx, row.to_dict()) for idx, row in matches.iterrows()]
@@ -428,7 +433,7 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_conta
 
                 for i in range(0, total, _EMAIL_BATCH):
                     batch   = email_rows[i : i + _EMAIL_BATCH]
-                    results = asyncio.run(_generate_email_batch(batch, openai_async, anth_async))
+                    results = asyncio.run(_generate_email_batch(batch, openai_key, anth_key))
                     for idx, subject, body in results:
                         matches.at[idx, 'subject_line'] = subject
                         matches.at[idx, 'ai_message']   = body
