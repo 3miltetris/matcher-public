@@ -346,7 +346,7 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_conta
                 contact_row = df.iloc[ci]
                 for gi in top_indices:
                     row = {
-                        'companyName':     str(contact_row.get('companyName',    '') or ''),
+                        'companyName':     str(contact_row.get('companyName', '') or contact_row.get('company_name', '') or ''),
                         'companyWebsite':  str(contact_row.get('companyWebsite', '') or ''),
                         'firstName':       str(contact_row.get('firstName',      '') or ''),
                         'lastName':        str(contact_row.get('lastName',       '') or ''),

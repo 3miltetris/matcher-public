@@ -46,8 +46,8 @@ _SUMMARISE_SYSTEM = (
 )
 
 _STANDARD_RENAMES = {
-    'company':              'company_name',
-    'Company':              'company_name',
+    'company':              'companyName',
+    'Company':              'companyName',
     'industry':             'segment',
     'website':              'companyWebsite',
     'Website':              'companyWebsite',
