@@ -1,9 +1,10 @@
+import asyncio
 import hashlib
-import time
 import random
+import time
 
-from anthropic import Anthropic, InternalServerError
-from openai import OpenAI
+from anthropic import Anthropic, AsyncAnthropic, InternalServerError
+from openai import AsyncOpenAI, OpenAI
 
 
 # ── In-memory subject line cache (persists for the duration of the session) ──
@@ -141,6 +142,99 @@ def generate_tech_summary(
         max_tokens=max_tokens,
         system=system,
         messages=[{"role": "user", "content": [{"type": "text", "text": text}]}],
+    )
+    return message.content[0].text
+
+
+async def async_generate_subject_line(
+    company_summary: str,
+    agency: str,
+    openai_client: AsyncOpenAI,
+    anth_client: AsyncAnthropic,
+    word_limit: int = 15,
+    max_retries: int = 3,
+) -> str:
+    """Async version of generate_subject_line — OpenAI first, Anthropic fallback."""
+    cache_key = hashlib.md5(f"{company_summary}||{agency}".encode()).hexdigest()
+    if cache_key in _subject_line_cache:
+        return _subject_line_cache[cache_key]
+
+    system = (
+        f"Generate a subject line for a cold email that is no more than {word_limit} words "
+        f"that summarizes what this company's area of research, products, etc. is. "
+        f"Just focus on the technologies and research areas. Ignore investing, finance, etc. "
+        f'The format should be like this: "Grant for {{summary}} - {{agency}}"'
+    )
+    text = f"company summary:{company_summary}, agency: {agency}"
+
+    for attempt in range(max_retries):
+        try:
+            completion = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": text},
+                ],
+            )
+            result = completion.choices[0].message.content
+            _subject_line_cache[cache_key] = result
+            return result
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "rate_limit" in err.lower():
+                break
+            await asyncio.sleep((2 ** attempt) + random.random())
+
+    for attempt in range(max_retries):
+        try:
+            message = await anth_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=60,
+                system=system,
+                messages=[{"role": "user", "content": text}],
+            )
+            result = message.content[0].text
+            _subject_line_cache[cache_key] = result
+            return result
+        except Exception as e:
+            await asyncio.sleep((2 ** attempt) + random.random())
+
+    raise RuntimeError(f"async_generate_subject_line failed for agency={agency}")
+
+
+async def async_josiah_copy(
+    company_summary: str,
+    grant_summary: str,
+    word_limit: int,
+    anth_client: AsyncAnthropic,
+    model: str = "claude-sonnet-4-20250514",
+) -> str:
+    """Async version of josiah_copy."""
+    system = (
+        f"You're a human grants consultant writing a personalized cold email. "
+        f"Write ONE natural sentence ({word_limit} words max) using this structure:\n\n"
+        f'"They are looking for [specific grant focus] and [natural connection to company]"\n\n'
+        f"CRITICAL: The first part states what they're looking for (can be a list). "
+        f"The second part connects to the company naturally WITHOUT parallel structure.\n\n"
+        f"Human writing rules for the second part:\n"
+        f"- Don't mirror the list structure from the first part\n"
+        f"- Use specific product/tech names, not generic categories\n"
+        f'- Add natural language: "looks like", "seems like", "from what I can tell", "it appears"\n'
+        f"- Use dashes or parentheses to break up rhythm\n"
+        f"- Focus on the strongest overlap, not everything\n\n"
+        f'Bad (robotic parallel): "They are looking for X, Y, and Z and it seems you are doing A, B, and C"\n'
+        f'Good (natural): "They are looking for autonomous UAS operations, payload capabilities, and powertrain '
+        f"enhancements and it looks like your heavy-lift platform with the modular engine system is exactly that\"\n"
+        f'Good (natural): "They are looking for COTS UAS modifications including ruggedization and secure software '
+        f"and from what I can tell, you're doing custom UAS builds - particularly the ruggedized variants for "
+        f'defense applications"'
+    )
+    message = await anth_client.messages.create(
+        model=model,
+        max_tokens=500,
+        temperature=0.7,
+        system=system,
+        messages=[{"role": "user", "content": [{"type": "text", "text": f"Company: {company_summary}\nGrant: {grant_summary}"}]}],
     )
     return message.content[0].text
 

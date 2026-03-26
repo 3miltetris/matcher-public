@@ -5,25 +5,32 @@ Query Pinecone with grant-topic embeddings to find matching contacts,
 optionally validate with Claude AI and pre-write email copy, then export to CSV.
 """
 
+import asyncio
 import io
 import traceback
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from google.cloud import storage
 from google.oauth2 import service_account
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-from src.modules.email_generator import generate_subject_line, josiah_copy
+from src.modules.email_generator import async_generate_subject_line, async_josiah_copy
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-_BUCKET          = 'cc-matcher-bucket-jeg-v1'
-_CONTACTS_PREFIX = 'data/all-contacts/'
-_TOPICS_PREFIX   = 'data/all-topics/processed/'
-_MIN_THRESHOLD   = 0.82
+_BUCKET             = 'cc-matcher-bucket-jeg-v1'
+_CONTACTS_PREFIX    = 'data/all-contacts/'
+_TOPICS_PREFIX      = 'data/all-topics/processed/'
+_MIN_THRESHOLD      = 0.82
+_VALIDATION_BATCH   = 20   # concurrent Claude calls during validation
+_EMAIL_BATCH        = 10   # rows per batch for email generation (2 API calls each)
+_VALIDATION_SYSTEM  = (
+    'Tell me if this company summary and grant summary are aligned. '
+    'Only give a one-word answer. Either "yes" or "no".'
+)
 
 
 # ── GCS helpers ──────────────────────────────────────────────────────────────
@@ -85,6 +92,58 @@ def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
         )
         mask = (mask & m) if f['operator'] == 'AND' else (mask | m)
     return df[mask]
+
+
+# ── Async helpers ─────────────────────────────────────────────────────────────
+
+async def _validate_rows(
+    rows: list[tuple[int, dict]],
+    anth_client: AsyncAnthropic,
+) -> list[tuple[int, str]]:
+    """Run validation for a batch of (df_index, row_dict) pairs concurrently."""
+    async def _one(idx: int, row: dict) -> tuple[int, str]:
+        msg = await anth_client.messages.create(
+            model='claude-3-haiku-20240307',
+            max_tokens=15,
+            temperature=0,
+            system=_VALIDATION_SYSTEM,
+            messages=[{
+                'role': 'user',
+                'content': (
+                    f"company summary: {row.get('company_summary', '')}\n\n"
+                    f"grant summary: {row.get('grant_summary', '')}"
+                ),
+            }],
+        )
+        return idx, msg.content[0].text.strip().lower()
+
+    return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
+
+
+async def _generate_email_batch(
+    rows: list[tuple[int, dict]],
+    openai_client: AsyncOpenAI,
+    anth_client: AsyncAnthropic,
+) -> list[tuple[int, str, str]]:
+    """Generate subject line + body concurrently for a batch of rows."""
+    async def _one(idx: int, row: dict) -> tuple[int, str, str]:
+        subject, body = await asyncio.gather(
+            async_generate_subject_line(
+                company_summary=str(row.get('company_summary', '') or ''),
+                agency=str(row.get('agency', row.get('broad_agency', '')) or ''),
+                openai_client=openai_client,
+                anth_client=anth_client,
+            ),
+            async_josiah_copy(
+                company_summary=str(row.get('company_summary', '') or ''),
+                grant_summary=str(row.get('grant_summary', '') or ''),
+                word_limit=50,
+                anth_client=anth_client,
+            ),
+        )
+        return idx, subject, body
+
+    return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -296,81 +355,77 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_conta
         matches = pd.DataFrame(match_rows)
         st.success(f'Found **{len(matches):,}** candidate matches.')
 
-        # ── AI validation ─────────────────────────────────────────────────
+        # ── AI validation (async, deduplicated by website) ────────────────
         if ai_validation:
-            anth_client             = Anthropic(api_key=st.secrets['anthropic_api_key'])
-            matches['good_match']   = None
-            yes_websites: list[str] = []
+            anth_async            = AsyncAnthropic(api_key=st.secrets['anthropic_api_key'])
+            matches['good_match'] = None
+
+            # One API call per unique website; rows without a website each get their own call
+            website_map: dict[str, list[int]] = {}
+            no_site_rows: list[tuple[int, dict]] = []
+            for idx, row in matches.iterrows():
+                site = str(row.get('companyWebsite', '') or '').strip()
+                if site:
+                    website_map.setdefault(site, []).append(idx)
+                else:
+                    no_site_rows.append((idx, row.to_dict()))
+
+            unique_tasks = (
+                [(indices[0], matches.loc[indices[0]].to_dict()) for indices in website_map.values()]
+                + no_site_rows
+            )
+            total_tasks  = len(unique_tasks)
+            done         = 0
+            idx_to_result: dict[int, str] = {}
             bar = st.progress(0, text='AI validation…')
 
-            for i, (idx, row) in enumerate(matches.iterrows()):
-                website = str(row.get('companyWebsite', '') or '')
-                if website and website in yes_websites:
-                    matches.at[idx, 'good_match'] = 'yes'
-                else:
-                    msg    = anth_client.messages.create(
-                        model='claude-3-haiku-20240307',
-                        max_tokens=15,
-                        temperature=0,
-                        system=(
-                            'Tell me if this company summary and grant summary are aligned. '
-                            'Only give a one-word answer. Either "yes" or "no".'
-                        ),
-                        messages=[{
-                            'role': 'user',
-                            'content': (
-                                f"company summary: {row.get('company_summary', '')}\n\n"
-                                f"grant summary: {row.get('grant_summary', '')}"
-                            ),
-                        }],
-                    )
-                    result = msg.content[0].text.strip().lower()
-                    matches.at[idx, 'good_match'] = result
-                    if 'yes' in result and website:
-                        yes_websites.append(website)
-
-                bar.progress((i + 1) / len(matches), text=f'AI validation: {i + 1}/{len(matches)}')
+            for i in range(0, total_tasks, _VALIDATION_BATCH):
+                batch   = unique_tasks[i : i + _VALIDATION_BATCH]
+                results = asyncio.run(_validate_rows(batch, anth_async))
+                idx_to_result.update(results)
+                done += len(batch)
+                bar.progress(done / total_tasks, text=f'AI validation: {done}/{total_tasks} unique companies')
 
             bar.empty()
-            yes_count = matches['good_match'].str.contains('yes', na=False).sum()
+
+            # Broadcast results back to all rows
+            for site, indices in website_map.items():
+                result = idx_to_result.get(indices[0], 'no')
+                for idx in indices:
+                    matches.at[idx, 'good_match'] = result
+            for idx, _ in no_site_rows:
+                matches.at[idx, 'good_match'] = idx_to_result.get(idx, 'no')
+
+            # Keep only confirmed matches — drop "no" rows now so export is clean
+            matches   = matches[matches['good_match'].str.contains('yes', na=False)].reset_index(drop=True)
+            yes_count = len(matches)
             st.success(f'AI validation complete — **{yes_count}** good matches.')
 
-        # ── Pre-write email ───────────────────────────────────────────────
+        # ── Pre-write email (async, runs only on the surviving "yes" rows) ─
         if prewrite_email:
-            email_targets = (
-                matches[matches['good_match'].str.contains('yes', na=False)]
-                if ai_validation else matches
-            )
-
-            if email_targets.empty:
-                st.warning('No matches to generate emails for.')
+            if matches.empty:
+                st.warning('No confirmed matches to generate emails for.')
             else:
-                anth_client           = Anthropic(api_key=st.secrets['anthropic_api_key'])
-                openai_client         = OpenAI(api_key=st.secrets['openai_api_key'])
+                anth_async    = AsyncAnthropic(api_key=st.secrets['anthropic_api_key'])
+                openai_async  = AsyncOpenAI(api_key=st.secrets['openai_api_key'])
                 matches['subject_line'] = None
                 matches['ai_message']   = None
+                email_rows = [(idx, row.to_dict()) for idx, row in matches.iterrows()]
+                total      = len(email_rows)
+                done       = 0
                 bar = st.progress(0, text='Generating email copy…')
 
-                for i, (idx, row) in enumerate(email_targets.iterrows()):
-                    matches.at[idx, 'subject_line'] = generate_subject_line(
-                        company_summary=str(row.get('company_summary', '') or ''),
-                        agency=str(row.get('agency', row.get('broad_agency', '')) or ''),
-                        openai_client=openai_client,
-                        anth_client=anth_client,
-                    )
-                    matches.at[idx, 'ai_message'] = josiah_copy(
-                        company_summary=str(row.get('company_summary', '') or ''),
-                        grant_summary=str(row.get('grant_summary', '') or ''),
-                        word_limit=50,
-                        anth_client=anth_client,
-                    )
-                    bar.progress(
-                        (i + 1) / len(email_targets),
-                        text=f'Generating emails: {i + 1}/{len(email_targets)}'
-                    )
+                for i in range(0, total, _EMAIL_BATCH):
+                    batch   = email_rows[i : i + _EMAIL_BATCH]
+                    results = asyncio.run(_generate_email_batch(batch, openai_async, anth_async))
+                    for idx, subject, body in results:
+                        matches.at[idx, 'subject_line'] = subject
+                        matches.at[idx, 'ai_message']   = body
+                    done += len(batch)
+                    bar.progress(done / total, text=f'Generating emails: {done}/{total}')
 
                 bar.empty()
-                st.success(f'Email copy generated for **{len(email_targets)}** matches.')
+                st.success(f'Email copy generated for **{total}** matches.')
 
         st.session_state.bm_results_df = matches
 
