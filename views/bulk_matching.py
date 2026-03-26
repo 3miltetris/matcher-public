@@ -7,6 +7,7 @@ optionally validate with Claude AI and pre-write email copy, then export to CSV.
 
 import asyncio
 import io
+import random
 import traceback
 
 import numpy as np
@@ -25,8 +26,9 @@ _BUCKET             = 'cc-matcher-bucket-jeg-v1'
 _CONTACTS_PREFIX    = 'data/all-contacts/'
 _TOPICS_PREFIX      = 'data/all-topics/processed/'
 _MIN_THRESHOLD      = 0.82
-_VALIDATION_BATCH   = 20   # concurrent Claude calls during validation
-_EMAIL_BATCH        = 10   # rows per batch for email generation (2 API calls each)
+_VALIDATION_BATCH   = 10   # concurrent Claude calls during validation
+_EMAIL_BATCH        = 5    # rows per batch for email generation (2 API calls each)
+_MAX_RETRIES        = 5    # retries on overload / rate-limit
 _VALIDATION_SYSTEM  = (
     'Tell me if this company summary and grant summary are aligned. '
     'Only give a one-word answer. Either "yes" or "no".'
@@ -102,20 +104,29 @@ async def _validate_rows(
 ) -> list[tuple[int, str]]:
     """Run validation for a batch of (df_index, row_dict) pairs concurrently."""
     async def _one(idx: int, row: dict) -> tuple[int, str]:
-        msg = await anth_client.messages.create(
-            model='claude-3-haiku-20240307',
-            max_tokens=15,
-            temperature=0,
-            system=_VALIDATION_SYSTEM,
-            messages=[{
-                'role': 'user',
-                'content': (
-                    f"company summary: {row.get('company_summary', '')}\n\n"
-                    f"grant summary: {row.get('grant_summary', '')}"
-                ),
-            }],
-        )
-        return idx, msg.content[0].text.strip().lower()
+        for attempt in range(_MAX_RETRIES):
+            try:
+                msg = await anth_client.messages.create(
+                    model='claude-3-haiku-20240307',
+                    max_tokens=15,
+                    temperature=0,
+                    system=_VALIDATION_SYSTEM,
+                    messages=[{
+                        'role': 'user',
+                        'content': (
+                            f"company summary: {row.get('company_summary', '')}\n\n"
+                            f"grant summary: {row.get('grant_summary', '')}"
+                        ),
+                    }],
+                )
+                return idx, msg.content[0].text.strip().lower()
+            except Exception as e:
+                err = str(e)
+                if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):
+                    await asyncio.sleep((2 ** attempt) + random.random())
+                else:
+                    raise
+        return idx, 'no'  # give up after retries — treat as non-match
 
     return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
 

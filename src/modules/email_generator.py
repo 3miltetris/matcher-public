@@ -229,14 +229,23 @@ async def async_josiah_copy(
         f"and from what I can tell, you're doing custom UAS builds - particularly the ruggedized variants for "
         f'defense applications"'
     )
-    message = await anth_client.messages.create(
-        model=model,
-        max_tokens=500,
-        temperature=0.7,
-        system=system,
-        messages=[{"role": "user", "content": [{"type": "text", "text": f"Company: {company_summary}\nGrant: {grant_summary}"}]}],
-    )
-    return message.content[0].text
+    for attempt in range(5):
+        try:
+            message = await anth_client.messages.create(
+                model=model,
+                max_tokens=500,
+                temperature=0.7,
+                system=system,
+                messages=[{"role": "user", "content": [{"type": "text", "text": f"Company: {company_summary}\nGrant: {grant_summary}"}]}],
+            )
+            return message.content[0].text
+        except Exception as e:
+            err = str(e)
+            if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):
+                await asyncio.sleep((2 ** attempt) + random.random())
+            else:
+                raise
+    raise RuntimeError('async_josiah_copy failed after all retries')
 
 
 def josiah_copy(
