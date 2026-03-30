@@ -6,9 +6,11 @@ optionally validate with Claude AI and pre-write email copy, then export to CSV.
 """
 
 import asyncio
+import gc
 import io
 import random
 import traceback
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -65,7 +67,12 @@ def _load_topics(agencies: list[str]) -> pd.DataFrame:
                 df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
                 df['broad_agency'] = agency
                 frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', FutureWarning)
+        return pd.concat(frames, ignore_index=True)
 
 
 def _list_contact_blobs(sources: list[str]) -> list[tuple]:
@@ -164,7 +171,7 @@ async def _generate_email_batch(
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
-for _k in ['bm_topics_df', 'bm_results_df']:
+for _k in ['bm_topics_df', 'bm_results_df', 'bm_grant_embeddings']:
     if _k not in st.session_state:
         st.session_state[_k] = None
 if 'bm_filters' not in st.session_state:
@@ -218,6 +225,13 @@ if st.button('Load Topics', type='primary', disabled=not selected_agencies):
         # Normalise grant description column to 'grant_summary'
         if 'grant_summary' not in _df.columns and 'description' in _df.columns:
             _df = _df.rename(columns={'description': 'grant_summary'})
+        # Store embeddings as a compact numpy array — much cheaper than a pandas
+        # column of Python lists, and frees the per-row list overhead from session state
+        if 'embeddings' in _df.columns:
+            st.session_state.bm_grant_embeddings = np.stack(_df['embeddings'].values)
+            _df = _df.drop(columns=['embeddings'])
+        else:
+            st.session_state.bm_grant_embeddings = None
         st.session_state.bm_topics_df  = _df
         st.session_state.bm_filters    = [{'column': None, 'keyword': '', 'operator': 'AND'}]
         st.session_state.bm_results_df = None
@@ -287,9 +301,13 @@ with opt_mid:
     ai_validation  = st.checkbox('AI validation',  value=True)
     prewrite_email = st.checkbox('Pre-write email', value=False)
 
-can_run = bool(selected_sources) and st.session_state.bm_topics_df is not None
+can_run = (
+    bool(selected_sources)
+    and st.session_state.bm_topics_df is not None
+    and st.session_state.bm_grant_embeddings is not None
+)
 
-if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_container_width=False):
+if st.button('▶ Run Matching', type='primary', disabled=not can_run):
     try:
         # ── Prepare filtered grants ───────────────────────────────────────
         grants = _apply_filters(st.session_state.bm_topics_df, st.session_state.bm_filters)
@@ -298,18 +316,17 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_conta
             st.error('No grant topics after applying filters.')
             st.stop()
 
-        if 'embeddings' not in grants.columns:
-            st.error('Grant topics are missing an `embeddings` column.')
-            st.stop()
+        # ── Build grant matrix from the pre-stacked numpy array ────────────
+        # bm_grant_embeddings rows correspond 1-to-1 with bm_topics_df rows
+        all_embeddings = st.session_state.bm_grant_embeddings  # (n_all_topics, 1536)
+        filtered_indices = grants.index.tolist()
+        grant_embeddings = all_embeddings[filtered_indices]     # (n_filtered, 1536)
+        del all_embeddings
 
-        grants = grants[grants['embeddings'].notna()].reset_index(drop=True)
-
-        if grants.empty:
+        if grant_embeddings.shape[0] == 0:
             st.error('All grant topics have null embeddings after filtering.')
             st.stop()
 
-        # ── Build grant matrix (small — stays in memory throughout) ────────
-        grant_embeddings = np.stack(grants['embeddings'].values)  # (n_grants, 1536)
         grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'grant_summary']
         grant_meta = grants[[c for c in grant_cols if c in grants.columns]].reset_index(drop=True)
 
@@ -359,16 +376,26 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run, use_conta
                         row[col] = grant_meta.iloc[gi].get(col, '')
                     match_rows.append(row)
 
+            del contact_embeddings, scores
             bar.progress((file_i + 1) / len(blob_list),
                          text=f'File {file_i + 1}/{len(blob_list)}: {blob.name.split("/")[-1]}')
 
         bar.empty()
+        del grant_embeddings, grant_meta
 
         if not match_rows:
             st.warning(f'No matches found above {threshold} similarity threshold.')
             st.stop()
 
         matches = pd.DataFrame(match_rows)
+        del match_rows
+        gc.collect()
+
+        # Parquets store date columns as Timestamps; cast to str so Arrow can serialize them
+        for _col in ('scraped_at', 'open_date', 'close_date'):
+            if _col in matches.columns:
+                matches[_col] = matches[_col].astype(str)
+
         st.success(f'Found **{len(matches):,}** candidate matches.')
 
         # ── AI validation (async, deduplicated by website) ────────────────
