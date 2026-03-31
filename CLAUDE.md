@@ -289,6 +289,97 @@ Pass this client into `BucketManager` — never rely on the `GOOGLE_APPLICATION_
 
 ---
 
+## Cloud Run Job Setup
+
+The bulk matching pipeline runs as a Cloud Run Job (`jobs/matching_job.py`) to avoid
+Streamlit memory limits. Streamlit triggers the job and polls GCS for results.
+
+### GCP details
+- **Project:** `cc-matcher-v1`
+- **Region:** `us-central1`
+- **Artifact Registry repo:** `matcher`
+- **Job name:** `matching-job`
+- **Job service account:** `matching-job@cc-matcher-v1.iam.gserviceaccount.com`
+- **Secret Manager secrets:** `anthropic-api-key`, `openai-api-key`
+
+### One-time setup (already done — skip if job exists)
+
+```bash
+# Enable APIs
+gcloud services enable \
+  run.googleapis.com \
+  artifactregistry.googleapis.com \
+  secretmanager.googleapis.com \
+  cloudbuild.googleapis.com
+
+# Create Artifact Registry repo
+gcloud artifacts repositories create matcher \
+  --repository-format=docker \
+  --location=us-central1
+
+# Create job service account
+gcloud iam service-accounts create matching-job \
+  --display-name="Matching Job Runner"
+
+# Grant GCS access
+gcloud projects add-iam-policy-binding cc-matcher-v1 \
+  --member="serviceAccount:matching-job@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+
+# Grant Secret Manager access
+gcloud projects add-iam-policy-binding cc-matcher-v1 \
+  --member="serviceAccount:matching-job@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+### Build and deploy (run this every time job code changes)
+
+Run from the repo root (`~/matcher` in Cloud Shell):
+
+```bash
+# Step 1 — write cloudbuild.yaml (only needed once or after deleting it)
+printf 'steps:\n- name: "gcr.io/cloud-builders/docker"\n  args: ["build", "-t", "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matching-job:latest", "-f", "jobs/Dockerfile", "."]\nimages:\n- "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matching-job:latest"\n' > cloudbuild.yaml
+
+# Step 2 — build image and push to Artifact Registry
+gcloud builds submit --config cloudbuild.yaml .
+
+# Step 3 — first deploy (only needed once)
+gcloud run jobs create matching-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matching-job:latest \
+  --region us-central1 \
+  --memory 4Gi \
+  --cpu 2 \
+  --task-timeout 3600 \
+  --max-retries 0 \
+  --service-account matching-job@cc-matcher-v1.iam.gserviceaccount.com
+
+# Step 3 (subsequent deploys — use update instead of create)
+gcloud run jobs update matching-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matching-job:latest \
+  --region us-central1
+```
+
+### Verify the job exists
+
+```bash
+gcloud run jobs list --region us-central1
+```
+
+### Trigger a test run manually
+
+```bash
+gcloud run jobs execute matching-job --region us-central1
+```
+
+### View logs
+
+```bash
+gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=matching-job" \
+  --limit 50 --format "value(textPayload)"
+```
+
+---
+
 ## Common Patterns
 
 ### Loading parquet files from GCS prefix
