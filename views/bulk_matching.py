@@ -1,31 +1,21 @@
 """
 Bulk Matching
 -------------
-Query grant-topic embeddings to find matching contacts,
-optionally validate with Claude AI and pre-write email copy,
-then save results in 1 000-row segments to GCS.
+Writes a job config to GCS, triggers the Cloud Run matching job, then polls
+GCS for status.json until the job completes.
 
-Memory model: match rows are flushed to GCS as soon as 1 000 accumulate,
-so the buffer never exceeds _SEGMENT_SIZE + top_k rows at any point.
+The heavy lifting (scoring, AI validation, email pre-write) happens entirely
+inside the Cloud Run job — this page is config + monitoring only.
 """
 
-import asyncio
-import gc
-import io
-import random
+import json
+import time
 import traceback
-import warnings
 from datetime import datetime
 
-import numpy as np
-import pandas as pd
 import streamlit as st
-from anthropic import AsyncAnthropic
-from google.cloud import storage
+from google.cloud import run_v2, storage
 from google.oauth2 import service_account
-from openai import AsyncOpenAI
-
-from src.modules.email_generator import async_generate_subject_line, async_josiah_copy
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -33,30 +23,27 @@ _BUCKET            = 'cc-matcher-bucket-jeg-v1'
 _CONTACTS_PREFIX   = 'data/all-contacts/'
 _TOPICS_PREFIX     = 'data/all-topics/processed/'
 _RESULTS_PREFIX    = 'matching-results/'
+_JOB_CONFIGS_PREFIX = 'job-configs/'
 _MIN_THRESHOLD     = 0.82
-_SEGMENT_SIZE      = 1000   # rows flushed end-to-end before freeing memory
-_VALIDATION_BATCH  = 10     # concurrent Claude calls per asyncio.run()
-_EMAIL_BATCH       = 5      # rows per email-generation batch
-_MAX_RETRIES       = 5
-_VALIDATION_SYSTEM = (
-    'Tell me if this company summary and grant summary are aligned. '
-    'Only give a one-word answer. Either "yes" or "no".'
-)
+_JOB_NAME          = 'projects/cc-matcher-v1/locations/us-central1/jobs/matching-job'
+_POLL_INTERVAL     = 8  # seconds between status checks
 
 
-# ── GCS helpers ──────────────────────────────────────────────────────────────
+# ── GCS / auth helpers ────────────────────────────────────────────────────────
 
-def _get_storage_client() -> storage.Client:
-    creds = service_account.Credentials.from_service_account_info(
+def _get_credentials():
+    return service_account.Credentials.from_service_account_info(
         st.secrets['gcp_service_account']
     )
-    return storage.Client(credentials=creds)
 
 
-def _list_prefixes(prefix: str) -> list[str]:
+def _get_storage_client() -> storage.Client:
+    return storage.Client(credentials=_get_credentials())
+
+
+def _list_prefixes(client: storage.Client, prefix: str) -> list[str]:
     try:
-        client = _get_storage_client()
-        blobs  = client.list_blobs(_BUCKET, prefix=prefix, delimiter='/')
+        blobs = client.list_blobs(_BUCKET, prefix=prefix, delimiter='/')
         list(blobs)
         return sorted(p.replace(prefix, '').strip('/') for p in blobs.prefixes)
     except Exception as e:
@@ -64,256 +51,106 @@ def _list_prefixes(prefix: str) -> list[str]:
         return []
 
 
-def _load_topics(agencies: list[str]) -> pd.DataFrame:
-    client = _get_storage_client()
-    frames = []
-    for agency in agencies:
-        prefix = f'{_TOPICS_PREFIX}{agency}/'
-        for blob in client.list_blobs(_BUCKET, prefix=prefix):
-            if blob.name.endswith('.parquet'):
-                df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-                df['broad_agency'] = agency
-                frames.append(df)
-    frames = [f for f in frames if not f.empty]
-    if not frames:
-        return pd.DataFrame()
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', FutureWarning)
-        return pd.concat(frames, ignore_index=True)
+# ── Job helpers ───────────────────────────────────────────────────────────────
 
-
-def _list_contact_blobs(sources: list[str]) -> list[tuple]:
-    """Return (source, blob) pairs without downloading data."""
-    client = _get_storage_client()
-    result = []
-    for source in sources:
-        for blob in client.list_blobs(_BUCKET, prefix=f'{_CONTACTS_PREFIX}{source}/'):
-            if blob.name.endswith('.parquet'):
-                result.append((source, blob))
-    return result
-
-
-def _upload_csv(df: pd.DataFrame, blob_path: str, client: storage.Client) -> None:
-    blob = client.bucket(_BUCKET).blob(blob_path)
-    blob.upload_from_string(df.to_csv(index=False).encode('utf-8'), content_type='text/csv')
-
-
-# ── Filter helpers ────────────────────────────────────────────────────────────
-
-def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
-    active = [f for f in filters if f['keyword'].strip() and f['column']]
-    if not active:
-        return df
-    mask = df[active[0]['column']].astype(str).str.lower().str.contains(
-        active[0]['keyword'].lower(), na=False
+def _write_job_config(client: storage.Client, config: dict) -> str:
+    """Upload config JSON to GCS, return blob path."""
+    blob_path = f'{_JOB_CONFIGS_PREFIX}{config["run_id"]}.json'
+    client.bucket(_BUCKET).blob(blob_path).upload_from_string(
+        json.dumps(config), content_type='application/json'
     )
-    for f in active[1:]:
-        m = df[f['column']].astype(str).str.lower().str.contains(
-            f['keyword'].lower(), na=False
-        )
-        mask = (mask & m) if f['operator'] == 'AND' else (mask | m)
-    return df[mask]
+    return blob_path
 
 
-# ── Async helpers ─────────────────────────────────────────────────────────────
-
-async def _validate_rows(
-    rows: list[tuple[int, dict]],
-    anth_key: str,
-) -> list[tuple[int, str]]:
-    async with AsyncAnthropic(api_key=anth_key) as anth_client:
-        async def _one(idx: int, row: dict) -> tuple[int, str]:
-            for attempt in range(_MAX_RETRIES):
-                try:
-                    msg = await anth_client.messages.create(
-                        model='claude-3-haiku-20240307',
-                        max_tokens=15,
-                        temperature=0,
-                        system=_VALIDATION_SYSTEM,
-                        messages=[{
-                            'role': 'user',
-                            'content': (
-                                f"company summary: {row.get('company_summary', '')}\n\n"
-                                f"grant summary: {row.get('grant_summary', '')}"
-                            ),
-                        }],
+def _trigger_job(credentials, config_blob_path: str) -> None:
+    """Fire-and-forget: start the Cloud Run job with the config blob path as arg."""
+    job_client = run_v2.JobsClient(credentials=credentials)
+    job_client.run_job(
+        request=run_v2.RunJobRequest(
+            name=_JOB_NAME,
+            overrides=run_v2.RunJobRequest.Overrides(
+                container_overrides=[
+                    run_v2.RunJobRequest.Overrides.ContainerOverride(
+                        args=[config_blob_path]
                     )
-                    return idx, msg.content[0].text.strip().lower()
-                except Exception as e:
-                    err = str(e)
-                    if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):
-                        await asyncio.sleep((2 ** attempt) + random.random())
-                    else:
-                        raise
-            return idx, 'no'
-
-        return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
+                ]
+            ),
+        )
+    )
 
 
-async def _generate_email_batch(
-    rows: list[tuple[int, dict]],
-    openai_key: str,
-    anth_key: str,
-) -> list[tuple[int, str, str]]:
-    async with AsyncOpenAI(api_key=openai_key) as openai_client, \
-               AsyncAnthropic(api_key=anth_key) as anth_client:
-        async def _one(idx: int, row: dict) -> tuple[int, str, str]:
-            subject, body = await asyncio.gather(
-                async_generate_subject_line(
-                    company_summary=str(row.get('company_summary', '') or ''),
-                    agency=str(row.get('agency', row.get('broad_agency', '')) or ''),
-                    openai_client=openai_client,
-                    anth_client=anth_client,
-                ),
-                async_josiah_copy(
-                    company_summary=str(row.get('company_summary', '') or ''),
-                    grant_summary=str(row.get('grant_summary', '') or ''),
-                    word_limit=50,
-                    anth_client=anth_client,
-                ),
-            )
-            return idx, subject, body
-
-        return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
-
-
-# ── Segment processor ─────────────────────────────────────────────────────────
-
-def _flush_segment(
-    rows: list[dict],
-    seg_num: int,
-    results_prefix: str,
-    gcs_client: storage.Client,
-    ai_validation: bool,
-    prewrite_email: bool,
-    anth_key: str,
-    openai_key: str,
-    seen_websites: dict[str, str],
-    status: st.delta_generator.DeltaGenerator,
-) -> dict | None:
-    """
-    Build a DataFrame from rows, run validation + email, upload to GCS, return
-    segment summary dict or None if everything was filtered out.
-
-    seen_websites is mutated in-place so results carry across segments.
-    """
-    segment = pd.DataFrame(rows)
-
-    for col in ('scraped_at', 'open_date', 'close_date'):
-        if col in segment.columns:
-            segment[col] = segment[col].astype(str)
-
-    # ── AI validation ─────────────────────────────────────────────────────
-    if ai_validation:
-        segment = segment.copy()
-        segment['good_match'] = None
-
-        website_map:  dict[str, list[int]] = {}
-        unique_tasks: list[tuple[int, dict]] = []
-
-        for idx, row in segment.iterrows():
-            site = str(row.get('companyWebsite', '') or '').strip()
-            if site and site in seen_websites:
-                segment.at[idx, 'good_match'] = seen_websites[site]
-                continue
-            slim = {
-                'company_summary': row.get('company_summary', ''),
-                'grant_summary':   row.get('grant_summary',   ''),
-            }
-            if site:
-                if site not in website_map:
-                    website_map[site] = []
-                    unique_tasks.append((idx, slim))
-                website_map[site].append(idx)
-            else:
-                unique_tasks.append((idx, slim))
-
-        total_tasks   = len(unique_tasks)
-        idx_to_result: dict[int, str] = {}
-
-        for i in range(0, total_tasks, _VALIDATION_BATCH):
-            batch   = unique_tasks[i : i + _VALIDATION_BATCH]
-            results = asyncio.run(_validate_rows(batch, anth_key))
-            idx_to_result.update(results)
-            done = i + len(batch)
-            status.progress(
-                done / max(total_tasks, 1),
-                text=f'Segment {seg_num} · validating {done}/{total_tasks} new companies',
-            )
-
-        for site, indices in website_map.items():
-            result = idx_to_result.get(indices[0], 'no')
-            seen_websites[site] = result
-            for idx in indices:
-                segment.at[idx, 'good_match'] = result
-        for idx in segment.index:
-            if segment.at[idx, 'good_match'] is None:
-                segment.at[idx, 'good_match'] = idx_to_result.get(idx, 'no')
-
-        del unique_tasks, website_map, idx_to_result
-        gc.collect()
-
-        segment = segment[
-            segment['good_match'].str.contains('yes', na=False)
-        ].reset_index(drop=True)
-
-    if segment.empty:
+def _poll_status(client: storage.Client, run_id: str) -> dict | None:
+    """Return status dict if status.json exists, else None."""
+    blob = client.bucket(_BUCKET).blob(f'{_RESULTS_PREFIX}{run_id}/status.json')
+    if not blob.exists():
         return None
-
-    # ── Pre-write email ───────────────────────────────────────────────────
-    if prewrite_email:
-        segment = segment.copy()
-        segment['subject_line'] = None
-        segment['ai_message']   = None
-
-        email_rows = [(idx, row.to_dict()) for idx, row in segment.iterrows()]
-        total      = len(email_rows)
-
-        for i in range(0, total, _EMAIL_BATCH):
-            batch   = email_rows[i : i + _EMAIL_BATCH]
-            results = asyncio.run(_generate_email_batch(batch, openai_key, anth_key))
-            for idx, subject, body in results:
-                segment.at[idx, 'subject_line'] = subject
-                segment.at[idx, 'ai_message']   = body
-            done = i + len(batch)
-            status.progress(
-                done / max(total, 1),
-                text=f'Segment {seg_num} · writing emails {done}/{total}',
-            )
-
-        del email_rows
-        gc.collect()
-
-    # ── Upload ────────────────────────────────────────────────────────────
-    blob_path = f'{results_prefix}segment_{seg_num:03d}.csv'
-    _upload_csv(segment, blob_path, gcs_client)
-    row_count = len(segment)
-
-    del segment
-    gc.collect()
-
-    return {'path': blob_path, 'rows': row_count}
+    return json.loads(blob.download_as_text())
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
-for _k in ['bm_topics_df', 'bm_grant_embeddings', 'bm_run_summary']:
+for _k in ['bm_active_run', 'bm_run_summary']:
     if _k not in st.session_state:
         st.session_state[_k] = None
-if 'bm_filters' not in st.session_state:
-    st.session_state.bm_filters = [{'column': None, 'keyword': '', 'operator': 'AND'}]
 
 
 # ── Page ──────────────────────────────────────────────────────────────────────
 
 st.title('⚙️ Bulk Matching')
-st.caption('Match grant-topic embeddings to contacts, validate with AI, and save results to GCS.')
+st.caption('Configure a matching run, trigger the Cloud Run job, and monitor progress here.')
+
+# ── Active run: polling UI (blocks the rest of the page) ─────────────────────
+
+if st.session_state.bm_active_run:
+    active = st.session_state.bm_active_run
+    run_id = active['run_id']
+
+    st.subheader('🔄 Run in progress')
+    st.caption(f'Run ID: `{run_id}`')
+
+    try:
+        gcs    = _get_storage_client()
+        status = _poll_status(gcs, run_id)
+
+        if status is None:
+            st.info(f'Job is running… checking again in {_POLL_INTERVAL}s.')
+            if st.button('Cancel monitoring (job keeps running)'):
+                st.session_state.bm_active_run = None
+                st.rerun()
+            time.sleep(_POLL_INTERVAL)
+            st.rerun()
+
+        elif status.get('error'):
+            st.error('Job failed.')
+            st.code(status['error'])
+            st.session_state.bm_active_run = None
+
+        else:
+            st.success(
+                f'Run complete — **{status["total_saved"]:,}** rows saved across '
+                f'**{status["segments"]}** segment(s) '
+                f'(from {status["total_candidates"]:,} candidates)'
+            )
+            st.session_state.bm_run_summary = status
+            st.session_state.bm_active_run  = None
+
+    except Exception as e:
+        st.error(f'Error polling status: {e}')
+        st.code(traceback.format_exc())
+        if st.button('Stop monitoring'):
+            st.session_state.bm_active_run = None
+            st.rerun()
+
+    st.stop()
+
 
 # ── Section 1 · Contact sources ───────────────────────────────────────────────
 
 st.subheader('1 · Select contact sources')
 
-contact_sources = _list_prefixes(_CONTACTS_PREFIX)
+gcs_client = _get_storage_client()
+
+contact_sources = _list_prefixes(gcs_client, _CONTACTS_PREFIX)
 if not contact_sources:
     st.warning('No contact sources found in GCS.')
     st.stop()
@@ -325,12 +162,12 @@ selected_sources = [
     if src_cols[i % len(src_cols)].checkbox(src, value=True, key=f'bm_src_{src}')
 ]
 
-# ── Section 2 · Grant topics ──────────────────────────────────────────────────
+# ── Section 2 · Grant agencies ────────────────────────────────────────────────
 
 st.divider()
-st.subheader('2 · Select grant topics')
+st.subheader('2 · Select grant agencies')
 
-grant_agencies = _list_prefixes(_TOPICS_PREFIX)
+grant_agencies = _list_prefixes(gcs_client, _TOPICS_PREFIX)
 if not grant_agencies:
     st.warning('No grant agencies found in GCS.')
     st.stop()
@@ -341,67 +178,6 @@ selected_agencies = [
     for i, ag in enumerate(grant_agencies)
     if ag_cols[i % len(ag_cols)].checkbox(ag, value=True, key=f'bm_agency_{ag}')
 ]
-
-if st.button('Load Topics', type='primary', disabled=not selected_agencies):
-    with st.spinner('Loading grant topics…'):
-        _df = _load_topics(selected_agencies)
-    if _df.empty:
-        st.warning('No topics found for the selected agencies.')
-    else:
-        if 'grant_summary' not in _df.columns and 'description' in _df.columns:
-            _df = _df.rename(columns={'description': 'grant_summary'})
-        if 'embeddings' in _df.columns:
-            st.session_state.bm_grant_embeddings = np.stack(_df['embeddings'].values).astype(np.float32)
-            _df = _df.drop(columns=['embeddings'])
-        else:
-            st.session_state.bm_grant_embeddings = None
-        st.session_state.bm_topics_df  = _df
-        st.session_state.bm_filters    = [{'column': None, 'keyword': '', 'operator': 'AND'}]
-        st.session_state.bm_run_summary = None
-        st.success(f'Loaded **{len(_df):,}** grant topics.')
-
-if st.session_state.bm_topics_df is not None:
-    _topics_df      = st.session_state.bm_topics_df
-    filterable_cols = [c for c in _topics_df.columns if c != 'embeddings']
-
-    for f in st.session_state.bm_filters:
-        if f['column'] not in filterable_cols:
-            f['column'] = filterable_cols[0] if filterable_cols else None
-
-    for i, f in enumerate(st.session_state.bm_filters):
-        if i == 0:
-            col_sel, kw_input, _, remove_col = st.columns([2, 3, 1, 0.5])
-        else:
-            op_col, col_sel, kw_input, remove_col = st.columns([1, 2, 3, 0.5])
-            f['operator'] = op_col.radio(
-                'op', ['AND', 'OR'],
-                index=0 if f['operator'] == 'AND' else 1,
-                key=f'bm_op_{i}', horizontal=True, label_visibility='collapsed'
-            )
-        f['column'] = col_sel.selectbox(
-            'Column', filterable_cols,
-            index=filterable_cols.index(f['column']) if f['column'] in filterable_cols else 0,
-            key=f'bm_col_{i}', label_visibility='collapsed'
-        )
-        f['keyword'] = kw_input.text_input(
-            'Keyword', value=f['keyword'],
-            placeholder=f'Filter by {f["column"]}…',
-            key=f'bm_kw_{i}', label_visibility='collapsed'
-        )
-        if remove_col.button('✕', key=f'bm_rm_{i}', disabled=len(st.session_state.bm_filters) == 1):
-            st.session_state.bm_filters.pop(i)
-            st.rerun()
-
-    if st.button('+ Add filter', key='bm_add_filter'):
-        st.session_state.bm_filters.append(
-            {'column': filterable_cols[0], 'keyword': '', 'operator': 'AND'}
-        )
-        st.rerun()
-
-    _filtered_preview = _apply_filters(_topics_df, st.session_state.bm_filters)
-    _display_cols     = [c for c in _filtered_preview.columns if c != 'embeddings']
-    st.caption(f'**{len(_filtered_preview):,}** topics match — showing first 50')
-    st.dataframe(_filtered_preview[_display_cols].head(50), width='stretch', hide_index=True)
 
 # ── Section 3 · Run options ───────────────────────────────────────────────────
 
@@ -424,190 +200,45 @@ with opt_mid:
     ai_validation  = st.checkbox('AI validation',  value=True)
     prewrite_email = st.checkbox('Pre-write email', value=False)
 
-can_run = (
-    bool(selected_sources)
-    and st.session_state.bm_topics_df is not None
-    and st.session_state.bm_grant_embeddings is not None
-)
+can_run = bool(selected_sources) and bool(selected_agencies)
 
 if st.button('▶ Run Matching', type='primary', disabled=not can_run):
+    run_id = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    config = {
+        'run_id':         run_id,
+        'threshold':      float(threshold),
+        'top_k':          int(top_k),
+        'sources':        selected_sources,
+        'agencies':       selected_agencies,
+        'ai_validation':  ai_validation,
+        'prewrite_email': prewrite_email,
+    }
     try:
-        anth_key   = st.secrets['anthropic_api_key']
-        openai_key = st.secrets.get('openai_api_key', '')
+        with st.spinner('Uploading job config to GCS…'):
+            config_blob = _write_job_config(gcs_client, config)
 
-        # ── Prepare filtered grant matrix ─────────────────────────────────
-        grants = _apply_filters(st.session_state.bm_topics_df, st.session_state.bm_filters)
-        if grants.empty:
-            st.error('No grant topics after applying filters.')
-            st.stop()
+        with st.spinner('Triggering Cloud Run job…'):
+            _trigger_job(_get_credentials(), config_blob)
 
-        all_embeddings   = st.session_state.bm_grant_embeddings
-        filtered_indices = grants.index.tolist()
-        grant_embeddings = all_embeddings[filtered_indices]
-        del all_embeddings
-
-        if grant_embeddings.shape[0] == 0:
-            st.error('All grant topics have null embeddings after filtering.')
-            st.stop()
-
-        grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'grant_summary']
-        grant_meta = grants[[c for c in grant_cols if c in grants.columns]].reset_index(drop=True)
-
-        with st.spinner('Listing contact files…'):
-            blob_list = _list_contact_blobs(selected_sources)
-
-        if not blob_list:
-            st.error('No contact parquet files found for the selected sources.')
-            st.stop()
-
-        # ── Stream contacts, flush segments inline ────────────────────────
-        # match_buffer never exceeds _SEGMENT_SIZE + top_k rows — no global
-        # accumulation of all matches before processing begins.
-        run_id        = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        results_prefix = f'{_RESULTS_PREFIX}{run_id}/'
-        gcs_client    = _get_storage_client()
-
-        match_buffer:  list[dict]       = []
-        seen_websites: dict[str, str]   = {}
-        saved_segments: list[dict]      = []
-        seg_num        = 0
-        total_candidates = 0
-
-        contact_bar = st.progress(0, text='Matching contacts…')
-        seg_status  = st.empty()
-
-        for file_i, (source, blob) in enumerate(blob_list):
-            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-            df = df[df['embeddings'].notna()].reset_index(drop=True)
-            if df.empty:
-                continue
-
-            if 'company_summary' not in df.columns and 'summary' in df.columns:
-                df = df.rename(columns={'summary': 'company_summary'})
-
-            # Score and process in row-chunks so the scores matrix stays bounded:
-            # _SCORE_CHUNK contacts × n_topics × 4 bytes — never the full file at once.
-            _SCORE_CHUNK = 2000
-            for chunk_start in range(0, len(df), _SCORE_CHUNK):
-                chunk = df.iloc[chunk_start : chunk_start + _SCORE_CHUNK]
-                chunk_embeddings = np.stack(chunk['embeddings'].values).astype(np.float32)
-                scores = np.dot(chunk_embeddings, grant_embeddings.T)
-                del chunk_embeddings
-
-                for ci in range(len(chunk)):
-                    contact_scores = scores[ci]
-                    above = np.where(contact_scores >= threshold)[0]
-                    if len(above) == 0:
-                        continue
-                    top_indices = above[np.argsort(contact_scores[above])[::-1][:int(top_k)]]
-                    contact_row = chunk.iloc[ci]
-                    for gi in top_indices:
-                        row = {
-                            'companyName':     str(contact_row.get('companyName', '') or contact_row.get('company_name', '') or ''),
-                            'companyWebsite':  str(contact_row.get('companyWebsite', '') or ''),
-                            'firstName':       str(contact_row.get('firstName',      '') or ''),
-                            'lastName':        str(contact_row.get('lastName',       '') or ''),
-                            'email':           str(contact_row.get('email',          '') or ''),
-                            'company_summary': str(contact_row.get('company_summary', '') or ''),
-                            'source':          source,
-                        }
-                        for col in grant_meta.columns:
-                            row[col] = grant_meta.iloc[gi].get(col, '')
-                        match_buffer.append(row)
-                        total_candidates += 1
-
-                del scores
-
-                # Flush as soon as the buffer is full
-                if len(match_buffer) >= _SEGMENT_SIZE:
-                    seg_num += 1
-                    result = _flush_segment(
-                        rows           = match_buffer[:_SEGMENT_SIZE],
-                        seg_num        = seg_num,
-                        results_prefix = results_prefix,
-                        gcs_client     = gcs_client,
-                        ai_validation  = ai_validation,
-                        prewrite_email = prewrite_email,
-                        anth_key       = anth_key,
-                        openai_key     = openai_key,
-                        seen_websites  = seen_websites,
-                        status         = seg_status,
-                    )
-                    if result:
-                        saved_segments.append(result)
-                    match_buffer = match_buffer[_SEGMENT_SIZE:]
-
-            del df
-            contact_bar.progress(
-                (file_i + 1) / len(blob_list),
-                text=f'File {file_i + 1}/{len(blob_list)}: {blob.name.split("/")[-1]}  |  {total_candidates:,} candidates so far',
-            )
-
-        # Flush any remaining rows
-        if match_buffer:
-            seg_num += 1
-            result = _flush_segment(
-                rows           = match_buffer,
-                seg_num        = seg_num,
-                results_prefix = results_prefix,
-                gcs_client     = gcs_client,
-                ai_validation  = ai_validation,
-                prewrite_email = prewrite_email,
-                anth_key       = anth_key,
-                openai_key     = openai_key,
-                seen_websites  = seen_websites,
-                status         = seg_status,
-            )
-            if result:
-                saved_segments.append(result)
-            match_buffer = []
-
-        contact_bar.empty()
-        seg_status.empty()
-        del grant_embeddings, grant_meta, seen_websites
-        gc.collect()
-
-        total_saved = sum(s['rows'] for s in saved_segments)
-        st.session_state.bm_run_summary = {
-            'run_id':     run_id,
-            'prefix':     results_prefix,
-            'segments':   saved_segments,
-            'total_candidates': total_candidates,
-            'total_saved': total_saved,
-        }
-
-        if not saved_segments:
-            st.warning('No matches passed filters — nothing saved.')
-        else:
-            st.success(
-                f'Run complete — **{total_saved:,}** rows saved across '
-                f'**{len(saved_segments)}** segment(s)  '
-                f'(from {total_candidates:,} candidates) → `{results_prefix}`'
-            )
+        st.session_state.bm_active_run  = {'run_id': run_id, 'config_blob': config_blob}
+        st.session_state.bm_run_summary = None
+        st.rerun()
 
     except Exception as e:
-        st.error(f'**Error:** {e}')
+        st.error(f'Failed to trigger job: {e}')
         st.code(traceback.format_exc())
 
-# ── Section 4 · Results ───────────────────────────────────────────────────────
+# ── Section 4 · Last run results ─────────────────────────────────────────────
 
-if st.session_state.bm_run_summary is not None:
+if st.session_state.bm_run_summary:
     summary = st.session_state.bm_run_summary
     st.divider()
-    st.subheader('4 · Results')
-    st.caption(f'Run ID: `{summary["run_id"]}` · GCS prefix: `{summary["prefix"]}`')
-
-    if not summary['segments']:
-        st.info('No segments were saved (all candidates filtered out).')
-    else:
-        seg_df = pd.DataFrame(summary['segments'])
-        seg_df.index = seg_df.index + 1
-        seg_df.index.name = 'Segment'
-        st.dataframe(
-            seg_df.rename(columns={'path': 'GCS path', 'rows': 'Rows saved'}),
-            hide_index=False,
-        )
-        st.caption(
-            f'**{summary["total_saved"]:,}** rows saved from '
-            f'**{summary["total_candidates"]:,}** candidates.'
-        )
+    st.subheader('4 · Last run results')
+    st.caption(
+        f'Run ID: `{summary["run_id"]}` · '
+        f'GCS prefix: `{_RESULTS_PREFIX}{summary["run_id"]}/`'
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric('Rows saved',        f'{summary["total_saved"]:,}')
+    c2.metric('Total candidates',  f'{summary["total_candidates"]:,}')
+    c3.metric('Segments',          summary['segments'])
