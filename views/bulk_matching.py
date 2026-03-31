@@ -485,30 +485,38 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             if 'company_summary' not in df.columns and 'summary' in df.columns:
                 df = df.rename(columns={'summary': 'company_summary'})
 
-            contact_embeddings = np.stack(df['embeddings'].values).astype(np.float32)
-            scores = np.dot(contact_embeddings, grant_embeddings.T)
+            # Score and process in row-chunks so the scores matrix stays bounded:
+            # _SCORE_CHUNK contacts × n_topics × 4 bytes — never the full file at once.
+            _SCORE_CHUNK = 2000
+            for chunk_start in range(0, len(df), _SCORE_CHUNK):
+                chunk = df.iloc[chunk_start : chunk_start + _SCORE_CHUNK]
+                chunk_embeddings = np.stack(chunk['embeddings'].values).astype(np.float32)
+                scores = np.dot(chunk_embeddings, grant_embeddings.T)
+                del chunk_embeddings
 
-            for ci in range(len(df)):
-                contact_scores = scores[ci]
-                above = np.where(contact_scores >= threshold)[0]
-                if len(above) == 0:
-                    continue
-                top_indices  = above[np.argsort(contact_scores[above])[::-1][:int(top_k)]]
-                contact_row  = df.iloc[ci]
-                for gi in top_indices:
-                    row = {
-                        'companyName':     str(contact_row.get('companyName', '') or contact_row.get('company_name', '') or ''),
-                        'companyWebsite':  str(contact_row.get('companyWebsite', '') or ''),
-                        'firstName':       str(contact_row.get('firstName',      '') or ''),
-                        'lastName':        str(contact_row.get('lastName',       '') or ''),
-                        'email':           str(contact_row.get('email',          '') or ''),
-                        'company_summary': str(contact_row.get('company_summary', '') or ''),
-                        'source':          source,
-                    }
-                    for col in grant_meta.columns:
-                        row[col] = grant_meta.iloc[gi].get(col, '')
-                    match_buffer.append(row)
-                    total_candidates += 1
+                for ci in range(len(chunk)):
+                    contact_scores = scores[ci]
+                    above = np.where(contact_scores >= threshold)[0]
+                    if len(above) == 0:
+                        continue
+                    top_indices = above[np.argsort(contact_scores[above])[::-1][:int(top_k)]]
+                    contact_row = chunk.iloc[ci]
+                    for gi in top_indices:
+                        row = {
+                            'companyName':     str(contact_row.get('companyName', '') or contact_row.get('company_name', '') or ''),
+                            'companyWebsite':  str(contact_row.get('companyWebsite', '') or ''),
+                            'firstName':       str(contact_row.get('firstName',      '') or ''),
+                            'lastName':        str(contact_row.get('lastName',       '') or ''),
+                            'email':           str(contact_row.get('email',          '') or ''),
+                            'company_summary': str(contact_row.get('company_summary', '') or ''),
+                            'source':          source,
+                        }
+                        for col in grant_meta.columns:
+                            row[col] = grant_meta.iloc[gi].get(col, '')
+                        match_buffer.append(row)
+                        total_candidates += 1
+
+                del scores
 
                 # Flush as soon as the buffer is full
                 if len(match_buffer) >= _SEGMENT_SIZE:
@@ -529,7 +537,7 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
                         saved_segments.append(result)
                     match_buffer = match_buffer[_SEGMENT_SIZE:]
 
-            del contact_embeddings, scores
+            del df
             contact_bar.progress(
                 (file_i + 1) / len(blob_list),
                 text=f'File {file_i + 1}/{len(blob_list)}: {blob.name.split("/")[-1]}  |  {total_candidates:,} candidates so far',
