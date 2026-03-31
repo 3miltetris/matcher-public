@@ -228,7 +228,7 @@ if st.button('Load Topics', type='primary', disabled=not selected_agencies):
         # Store embeddings as a compact numpy array — much cheaper than a pandas
         # column of Python lists, and frees the per-row list overhead from session state
         if 'embeddings' in _df.columns:
-            st.session_state.bm_grant_embeddings = np.stack(_df['embeddings'].values)
+            st.session_state.bm_grant_embeddings = np.stack(_df['embeddings'].values).astype(np.float32)
             _df = _df.drop(columns=['embeddings'])
         else:
             st.session_state.bm_grant_embeddings = None
@@ -351,8 +351,8 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             if 'company_summary' not in df.columns and 'summary' in df.columns:
                 df = df.rename(columns={'summary': 'company_summary'})
 
-            contact_embeddings = np.stack(df['embeddings'].values)  # (n_contacts, 1536)
-            scores = np.dot(contact_embeddings, grant_embeddings.T)  # (n_contacts, n_grants)
+            contact_embeddings = np.stack(df['embeddings'].values).astype(np.float32)  # (n_contacts, 1536)
+            scores = np.dot(contact_embeddings, grant_embeddings.T)  # (n_contacts, n_grants) float32
 
             for ci in range(len(df)):
                 contact_scores = scores[ci]
