@@ -409,22 +409,26 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             anth_key              = st.secrets['anthropic_api_key']
             matches['good_match'] = None
 
-            # One API call per unique website; rows without a website each get their own call
+            # One API call per unique website; rows without a website each get their own call.
+            # Only store the two fields _validate_rows actually uses — avoids holding full
+            # row dicts (with long text columns) for the entire 18k-task list.
+            _VALIDATION_FIELDS = ('company_summary', 'grant_summary')
             website_map: dict[str, list[int]] = {}
-            no_site_rows: list[tuple[int, dict]] = []
+            unique_tasks: list[tuple[int, dict]] = []
+
             for idx, row in matches.iterrows():
                 site = str(row.get('companyWebsite', '') or '').strip()
+                slim = {f: row.get(f, '') for f in _VALIDATION_FIELDS}
                 if site:
-                    website_map.setdefault(site, []).append(idx)
+                    if site not in website_map:
+                        website_map[site] = []
+                        unique_tasks.append((idx, slim))
+                    website_map[site].append(idx)
                 else:
-                    no_site_rows.append((idx, row.to_dict()))
+                    unique_tasks.append((idx, slim))
 
-            unique_tasks = (
-                [(indices[0], matches.loc[indices[0]].to_dict()) for indices in website_map.values()]
-                + no_site_rows
-            )
-            total_tasks  = len(unique_tasks)
-            done         = 0
+            total_tasks       = len(unique_tasks)
+            done              = 0
             idx_to_result: dict[int, str] = {}
             bar = st.progress(0, text='AI validation…')
 
@@ -433,17 +437,24 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
                 results = asyncio.run(_validate_rows(batch, anth_key))
                 idx_to_result.update(results)
                 done += len(batch)
+                if done % 200 == 0:
+                    gc.collect()
                 bar.progress(done / total_tasks, text=f'AI validation: {done}/{total_tasks} unique companies')
 
             bar.empty()
 
             # Broadcast results back to all rows
+            # Broadcast website results to all rows sharing that site
             for site, indices in website_map.items():
                 result = idx_to_result.get(indices[0], 'no')
                 for idx in indices:
                     matches.at[idx, 'good_match'] = result
-            for idx, _ in no_site_rows:
-                matches.at[idx, 'good_match'] = idx_to_result.get(idx, 'no')
+            # Rows without a website each had their own task entry keyed by their own idx
+            for idx in matches.index:
+                if matches.at[idx, 'good_match'] is None:
+                    matches.at[idx, 'good_match'] = idx_to_result.get(idx, 'no')
+            del unique_tasks, website_map, idx_to_result
+            gc.collect()
 
             # Keep only confirmed matches — drop "no" rows now so export is clean
             matches   = matches[matches['good_match'].str.contains('yes', na=False)].reset_index(drop=True)
