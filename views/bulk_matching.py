@@ -1,8 +1,9 @@
 """
 Bulk Matching
 -------------
-Query Pinecone with grant-topic embeddings to find matching contacts,
-optionally validate with Claude AI and pre-write email copy, then export to CSV.
+Query grant-topic embeddings to find matching contacts,
+optionally validate with Claude AI and pre-write email copy,
+then save results in 1 000-row segments to GCS.
 """
 
 import asyncio
@@ -11,6 +12,7 @@ import io
 import random
 import traceback
 import warnings
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -18,7 +20,7 @@ import streamlit as st
 from anthropic import AsyncAnthropic
 from google.cloud import storage
 from google.oauth2 import service_account
-from openai import AsyncOpenAI  # AsyncOpenAI used inside _generate_email_batch
+from openai import AsyncOpenAI
 
 from src.modules.email_generator import async_generate_subject_line, async_josiah_copy
 
@@ -27,10 +29,12 @@ from src.modules.email_generator import async_generate_subject_line, async_josia
 _BUCKET             = 'cc-matcher-bucket-jeg-v1'
 _CONTACTS_PREFIX    = 'data/all-contacts/'
 _TOPICS_PREFIX      = 'data/all-topics/processed/'
+_RESULTS_PREFIX     = 'matching-results/'
 _MIN_THRESHOLD      = 0.82
-_VALIDATION_BATCH   = 10   # concurrent Claude calls during validation
-_EMAIL_BATCH        = 5    # rows per batch for email generation (2 API calls each)
-_MAX_RETRIES        = 5    # retries on overload / rate-limit
+_SEGMENT_SIZE       = 1000  # rows processed end-to-end before freeing memory
+_VALIDATION_BATCH   = 10    # concurrent Claude calls during validation
+_EMAIL_BATCH        = 5     # rows per batch for email generation (2 API calls each)
+_MAX_RETRIES        = 5
 _VALIDATION_SYSTEM  = (
     'Tell me if this company summary and grant summary are aligned. '
     'Only give a one-word answer. Either "yes" or "no".'
@@ -86,6 +90,11 @@ def _list_contact_blobs(sources: list[str]) -> list[tuple]:
     return result
 
 
+def _upload_csv(df: pd.DataFrame, blob_path: str, client: storage.Client) -> None:
+    blob = client.bucket(_BUCKET).blob(blob_path)
+    blob.upload_from_string(df.to_csv(index=False).encode('utf-8'), content_type='text/csv')
+
+
 # ── Filter helpers ────────────────────────────────────────────────────────────
 
 def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
@@ -109,8 +118,6 @@ async def _validate_rows(
     rows: list[tuple[int, dict]],
     anth_key: str,
 ) -> list[tuple[int, str]]:
-    """Run validation for a batch of (df_index, row_dict) pairs concurrently.
-    Client is created inside the coroutine so it lives in the correct event loop."""
     async with AsyncAnthropic(api_key=anth_key) as anth_client:
         async def _one(idx: int, row: dict) -> tuple[int, str]:
             for attempt in range(_MAX_RETRIES):
@@ -135,7 +142,7 @@ async def _validate_rows(
                         await asyncio.sleep((2 ** attempt) + random.random())
                     else:
                         raise
-            return idx, 'no'  # give up after retries — treat as non-match
+            return idx, 'no'
 
         return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
 
@@ -145,8 +152,6 @@ async def _generate_email_batch(
     openai_key: str,
     anth_key: str,
 ) -> list[tuple[int, str, str]]:
-    """Generate subject line + body concurrently for a batch of rows.
-    Clients are created inside the coroutine so they live in the correct event loop."""
     async with AsyncOpenAI(api_key=openai_key) as openai_client, \
                AsyncAnthropic(api_key=anth_key) as anth_client:
         async def _one(idx: int, row: dict) -> tuple[int, str, str]:
@@ -169,9 +174,122 @@ async def _generate_email_batch(
         return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
 
 
+# ── Segment processor ─────────────────────────────────────────────────────────
+
+def _process_segment(
+    segment: pd.DataFrame,
+    seg_num: int,
+    n_segments: int,
+    ai_validation: bool,
+    prewrite_email: bool,
+    anth_key: str,
+    openai_key: str,
+    status_placeholder,
+    seen_websites: dict[str, str],  # mutated in-place; carries results across segments
+) -> pd.DataFrame:
+    """
+    Run AI validation and/or email pre-write on a single segment DataFrame.
+    Returns the processed (and filtered) segment. Frees intermediate objects.
+
+    seen_websites maps companyWebsite → 'yes'/'no' for every site already
+    validated in a prior segment, so the same company is never called twice.
+    """
+    seg_label = f'Segment {seg_num}/{n_segments}'
+
+    # ── AI validation ─────────────────────────────────────────────────────
+    if ai_validation:
+        segment = segment.copy()
+        segment['good_match'] = None
+
+        website_map: dict[str, list[int]] = {}   # site → row indices in this segment
+        unique_tasks: list[tuple[int, dict]] = [] # only NEW sites need API calls
+
+        for idx, row in segment.iterrows():
+            site = str(row.get('companyWebsite', '') or '').strip()
+            if site:
+                if site in seen_websites:
+                    # Already validated in a prior segment — apply directly
+                    segment.at[idx, 'good_match'] = seen_websites[site]
+                else:
+                    if site not in website_map:
+                        website_map[site] = []
+                        unique_tasks.append((idx, {
+                            'company_summary': row.get('company_summary', ''),
+                            'grant_summary':   row.get('grant_summary',   ''),
+                        }))
+                    website_map[site].append(idx)
+            else:
+                unique_tasks.append((idx, {
+                    'company_summary': row.get('company_summary', ''),
+                    'grant_summary':   row.get('grant_summary',   ''),
+                }))
+
+        total_tasks   = len(unique_tasks)
+        idx_to_result: dict[int, str] = {}
+
+        for i in range(0, total_tasks, _VALIDATION_BATCH):
+            batch   = unique_tasks[i : i + _VALIDATION_BATCH]
+            results = asyncio.run(_validate_rows(batch, anth_key))
+            idx_to_result.update(results)
+            done = i + len(batch)
+            status_placeholder.progress(
+                seg_num / n_segments,
+                text=f'{seg_label} · validating {done}/{total_tasks} new companies',
+            )
+            if done % 100 == 0:
+                gc.collect()
+
+        # Broadcast results for new sites and add to seen_websites
+        for site, indices in website_map.items():
+            result = idx_to_result.get(indices[0], 'no')
+            seen_websites[site] = result
+            for idx in indices:
+                segment.at[idx, 'good_match'] = result
+        # Rows without a website each got their own task entry
+        for idx in segment.index:
+            if segment.at[idx, 'good_match'] is None:
+                segment.at[idx, 'good_match'] = idx_to_result.get(idx, 'no')
+
+        del unique_tasks, website_map, idx_to_result
+        gc.collect()
+
+        segment = segment[
+            segment['good_match'].str.contains('yes', na=False)
+        ].reset_index(drop=True)
+
+    if segment.empty:
+        return segment
+
+    # ── Pre-write email ───────────────────────────────────────────────────
+    if prewrite_email:
+        segment = segment.copy()
+        segment['subject_line'] = None
+        segment['ai_message']   = None
+
+        email_rows = [(idx, row.to_dict()) for idx, row in segment.iterrows()]
+        total      = len(email_rows)
+
+        for i in range(0, total, _EMAIL_BATCH):
+            batch   = email_rows[i : i + _EMAIL_BATCH]
+            results = asyncio.run(_generate_email_batch(batch, openai_key, anth_key))
+            for idx, subject, body in results:
+                segment.at[idx, 'subject_line'] = subject
+                segment.at[idx, 'ai_message']   = body
+            done = i + len(batch)
+            status_placeholder.progress(
+                seg_num / n_segments,
+                text=f'{seg_label} · writing emails {done}/{total}',
+            )
+
+        del email_rows
+        gc.collect()
+
+    return segment
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
-for _k in ['bm_topics_df', 'bm_results_df', 'bm_grant_embeddings']:
+for _k in ['bm_topics_df', 'bm_grant_embeddings', 'bm_run_summary']:
     if _k not in st.session_state:
         st.session_state[_k] = None
 if 'bm_filters' not in st.session_state:
@@ -181,7 +299,7 @@ if 'bm_filters' not in st.session_state:
 # ── Page ──────────────────────────────────────────────────────────────────────
 
 st.title('⚙️ Bulk Matching')
-st.caption('Query Pinecone with grant-topic embeddings to find matching contacts.')
+st.caption('Match grant-topic embeddings to contacts, validate with AI, and save results to GCS.')
 
 # ── Section 1 · Contact sources ───────────────────────────────────────────────
 
@@ -222,11 +340,8 @@ if st.button('Load Topics', type='primary', disabled=not selected_agencies):
     if _df.empty:
         st.warning('No topics found for the selected agencies.')
     else:
-        # Normalise grant description column to 'grant_summary'
         if 'grant_summary' not in _df.columns and 'description' in _df.columns:
             _df = _df.rename(columns={'description': 'grant_summary'})
-        # Store embeddings as a compact numpy array — much cheaper than a pandas
-        # column of Python lists, and frees the per-row list overhead from session state
         if 'embeddings' in _df.columns:
             st.session_state.bm_grant_embeddings = np.stack(_df['embeddings'].values).astype(np.float32)
             _df = _df.drop(columns=['embeddings'])
@@ -234,11 +349,11 @@ if st.button('Load Topics', type='primary', disabled=not selected_agencies):
             st.session_state.bm_grant_embeddings = None
         st.session_state.bm_topics_df  = _df
         st.session_state.bm_filters    = [{'column': None, 'keyword': '', 'operator': 'AND'}]
-        st.session_state.bm_results_df = None
+        st.session_state.bm_run_summary = None
         st.success(f'Loaded **{len(_df):,}** grant topics.')
 
 if st.session_state.bm_topics_df is not None:
-    _topics_df     = st.session_state.bm_topics_df
+    _topics_df      = st.session_state.bm_topics_df
     filterable_cols = [c for c in _topics_df.columns if c != 'embeddings']
 
     for f in st.session_state.bm_filters:
@@ -278,7 +393,7 @@ if st.session_state.bm_topics_df is not None:
     _filtered_preview = _apply_filters(_topics_df, st.session_state.bm_filters)
     _display_cols     = [c for c in _filtered_preview.columns if c != 'embeddings']
     st.caption(f'**{len(_filtered_preview):,}** topics match — showing first 50')
-    st.dataframe(_filtered_preview[_display_cols].head(50), width="stretch", hide_index=True)
+    st.dataframe(_filtered_preview[_display_cols].head(50), width='stretch', hide_index=True)
 
 # ── Section 3 · Run options ───────────────────────────────────────────────────
 
@@ -309,18 +424,18 @@ can_run = (
 
 if st.button('▶ Run Matching', type='primary', disabled=not can_run):
     try:
-        # ── Prepare filtered grants ───────────────────────────────────────
-        grants = _apply_filters(st.session_state.bm_topics_df, st.session_state.bm_filters)
+        anth_key   = st.secrets['anthropic_api_key']
+        openai_key = st.secrets.get('openai_api_key', '')
 
+        # ── Prepare filtered grant matrix ─────────────────────────────────
+        grants = _apply_filters(st.session_state.bm_topics_df, st.session_state.bm_filters)
         if grants.empty:
             st.error('No grant topics after applying filters.')
             st.stop()
 
-        # ── Build grant matrix from the pre-stacked numpy array ────────────
-        # bm_grant_embeddings rows correspond 1-to-1 with bm_topics_df rows
-        all_embeddings = st.session_state.bm_grant_embeddings  # (n_all_topics, 1536)
+        all_embeddings   = st.session_state.bm_grant_embeddings
         filtered_indices = grants.index.tolist()
-        grant_embeddings = all_embeddings[filtered_indices]     # (n_filtered, 1536)
+        grant_embeddings = all_embeddings[filtered_indices]
         del all_embeddings
 
         if grant_embeddings.shape[0] == 0:
@@ -330,7 +445,7 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
         grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'grant_summary']
         grant_meta = grants[[c for c in grant_cols if c in grants.columns]].reset_index(drop=True)
 
-        # ── Stream contacts one file at a time — top-K topics per contact ─
+        # ── Stream contacts → collect match rows ──────────────────────────
         with st.spinner('Listing contact files…'):
             blob_list = _list_contact_blobs(selected_sources)
 
@@ -347,12 +462,11 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             if df.empty:
                 continue
 
-            # Normalise summary column
             if 'company_summary' not in df.columns and 'summary' in df.columns:
                 df = df.rename(columns={'summary': 'company_summary'})
 
-            contact_embeddings = np.stack(df['embeddings'].values).astype(np.float32)  # (n_contacts, 1536)
-            scores = np.dot(contact_embeddings, grant_embeddings.T)  # (n_contacts, n_grants) float32
+            contact_embeddings = np.stack(df['embeddings'].values).astype(np.float32)
+            scores = np.dot(contact_embeddings, grant_embeddings.T)
 
             for ci in range(len(df)):
                 contact_scores = scores[ci]
@@ -370,15 +484,16 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
                         'email':           str(contact_row.get('email',          '') or ''),
                         'company_summary': str(contact_row.get('company_summary', '') or ''),
                         'source':          source,
-                        'similarity_score': float(contact_scores[gi]),
                     }
                     for col in grant_meta.columns:
                         row[col] = grant_meta.iloc[gi].get(col, '')
                     match_rows.append(row)
 
             del contact_embeddings, scores
-            bar.progress((file_i + 1) / len(blob_list),
-                         text=f'File {file_i + 1}/{len(blob_list)}: {blob.name.split("/")[-1]}')
+            bar.progress(
+                (file_i + 1) / len(blob_list),
+                text=f'File {file_i + 1}/{len(blob_list)}: {blob.name.split("/")[-1]}',
+            )
 
         bar.empty()
         del grant_embeddings, grant_meta
@@ -387,135 +502,91 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             st.warning(f'No matches found above {threshold} similarity threshold.')
             st.stop()
 
-        matches = pd.DataFrame(match_rows)
+        total_candidates = len(match_rows)
+        st.success(f'Found **{total_candidates:,}** candidate matches — processing in segments of {_SEGMENT_SIZE:,}.')
+
+        # ── Process in 1 000-row segments ─────────────────────────────────
+        run_id         = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        results_prefix = f'{_RESULTS_PREFIX}{run_id}/'
+        gcs_client     = _get_storage_client()
+        n_segments     = (total_candidates + _SEGMENT_SIZE - 1) // _SEGMENT_SIZE
+        seg_status     = st.progress(0, text='Starting segments…')
+        saved_segments: list[dict] = []
+        seen_websites:  dict[str, str] = {}  # shared across segments for dedup
+
+        for seg_i in range(n_segments):
+            seg_num   = seg_i + 1
+            seg_start = seg_i * _SEGMENT_SIZE
+            seg_end   = min(seg_start + _SEGMENT_SIZE, total_candidates)
+
+            # Build segment DataFrame and immediately free the source rows
+            segment_rows = match_rows[seg_start:seg_end]
+            segment      = pd.DataFrame(segment_rows)
+            del segment_rows
+
+            # Cast date columns
+            for _col in ('scraped_at', 'open_date', 'close_date'):
+                if _col in segment.columns:
+                    segment[_col] = segment[_col].astype(str)
+
+            seg_status.progress(
+                seg_num / n_segments,
+                text=f'Segment {seg_num}/{n_segments} · {len(segment):,} rows',
+            )
+
+            segment = _process_segment(
+                segment        = segment,
+                seg_num        = seg_num,
+                n_segments     = n_segments,
+                ai_validation  = ai_validation,
+                prewrite_email = prewrite_email,
+                anth_key       = anth_key,
+                openai_key     = openai_key,
+                status_placeholder = seg_status,
+                seen_websites  = seen_websites,
+            )
+
+            if not segment.empty:
+                blob_path = f'{results_prefix}segment_{seg_num:03d}.csv'
+                _upload_csv(segment, blob_path, gcs_client)
+                saved_segments.append({'path': blob_path, 'rows': len(segment)})
+
+            del segment
+            gc.collect()
+
+        seg_status.empty()
         del match_rows
         gc.collect()
 
-        # Drop heavy columns that are no longer needed — frees memory before
-        # AI validation and email generation operate on the full matches frame.
-        _drop = [c for c in ('embeddings', 'similarity_score') if c in matches.columns]
-        if _drop:
-            matches = matches.drop(columns=_drop)
-
-        # Parquets store date columns as Timestamps; cast to str so Arrow can serialize them
-        for _col in ('scraped_at', 'open_date', 'close_date'):
-            if _col in matches.columns:
-                matches[_col] = matches[_col].astype(str)
-
-        st.success(f'Found **{len(matches):,}** candidate matches.')
-
-        # ── AI validation (async, deduplicated by website) ────────────────
-        if ai_validation:
-            anth_key              = st.secrets['anthropic_api_key']
-            matches['good_match'] = None
-
-            # One API call per unique website; rows without a website each get their own call.
-            # Only store the two fields _validate_rows actually uses — avoids holding full
-            # row dicts (with long text columns) for the entire 18k-task list.
-            _VALIDATION_FIELDS = ('company_summary', 'grant_summary')
-            website_map: dict[str, list[int]] = {}
-            unique_tasks: list[tuple[int, dict]] = []
-
-            for idx, row in matches.iterrows():
-                site = str(row.get('companyWebsite', '') or '').strip()
-                slim = {f: row.get(f, '') for f in _VALIDATION_FIELDS}
-                if site:
-                    if site not in website_map:
-                        website_map[site] = []
-                        unique_tasks.append((idx, slim))
-                    website_map[site].append(idx)
-                else:
-                    unique_tasks.append((idx, slim))
-
-            total_tasks       = len(unique_tasks)
-            done              = 0
-            idx_to_result: dict[int, str] = {}
-            bar = st.progress(0, text='AI validation…')
-
-            for i in range(0, total_tasks, _VALIDATION_BATCH):
-                batch   = unique_tasks[i : i + _VALIDATION_BATCH]
-                results = asyncio.run(_validate_rows(batch, anth_key))
-                idx_to_result.update(results)
-                done += len(batch)
-                if done % 200 == 0:
-                    gc.collect()
-                bar.progress(done / total_tasks, text=f'AI validation: {done}/{total_tasks} unique companies')
-
-            bar.empty()
-
-            # Broadcast results back to all rows
-            # Broadcast website results to all rows sharing that site
-            for site, indices in website_map.items():
-                result = idx_to_result.get(indices[0], 'no')
-                for idx in indices:
-                    matches.at[idx, 'good_match'] = result
-            # Rows without a website each had their own task entry keyed by their own idx
-            for idx in matches.index:
-                if matches.at[idx, 'good_match'] is None:
-                    matches.at[idx, 'good_match'] = idx_to_result.get(idx, 'no')
-            del unique_tasks, website_map, idx_to_result
-            gc.collect()
-
-            # Keep only confirmed matches — drop "no" rows now so export is clean
-            matches   = matches[matches['good_match'].str.contains('yes', na=False)].reset_index(drop=True)
-            yes_count = len(matches)
-            st.success(f'AI validation complete — **{yes_count}** good matches.')
-
-        # ── Pre-write email (async, runs only on the surviving "yes" rows) ─
-        if prewrite_email:
-            if matches.empty:
-                st.warning('No confirmed matches to generate emails for.')
-            else:
-                anth_key     = st.secrets['anthropic_api_key']
-                openai_key   = st.secrets['openai_api_key']
-                matches['subject_line'] = None
-                matches['ai_message']   = None
-                email_rows = [(idx, row.to_dict()) for idx, row in matches.iterrows()]
-                total      = len(email_rows)
-                done       = 0
-                bar = st.progress(0, text='Generating email copy…')
-
-                for i in range(0, total, _EMAIL_BATCH):
-                    batch   = email_rows[i : i + _EMAIL_BATCH]
-                    results = asyncio.run(_generate_email_batch(batch, openai_key, anth_key))
-                    for idx, subject, body in results:
-                        matches.at[idx, 'subject_line'] = subject
-                        matches.at[idx, 'ai_message']   = body
-                    done += len(batch)
-                    bar.progress(done / total, text=f'Generating emails: {done}/{total}')
-
-                bar.empty()
-                st.success(f'Email copy generated for **{total}** matches.')
-
-        st.session_state.bm_results_df = matches
+        total_saved = sum(s['rows'] for s in saved_segments)
+        st.session_state.bm_run_summary = {
+            'run_id':    run_id,
+            'prefix':    results_prefix,
+            'segments':  saved_segments,
+            'total_rows': total_saved,
+        }
+        st.success(
+            f'Run complete — **{total_saved:,}** rows saved across '
+            f'**{len(saved_segments)}** segment(s) to `{results_prefix}`'
+        )
 
     except Exception as e:
         st.error(f'**Error:** {e}')
         st.code(traceback.format_exc())
 
-# ── Section 4 · Results & export ──────────────────────────────────────────────
+# ── Section 4 · Results ───────────────────────────────────────────────────────
 
-if st.session_state.bm_results_df is not None:
-    results = st.session_state.bm_results_df
+if st.session_state.bm_run_summary is not None:
+    summary = st.session_state.bm_run_summary
     st.divider()
-    st.subheader('4 · Results & export')
+    st.subheader('4 · Results')
+    st.caption(f'Run ID: `{summary["run_id"]}` · GCS prefix: `{summary["prefix"]}`')
 
-    export_cols   = [c for c in results.columns if c != 'embeddings']
-    selected_cols = st.multiselect(
-        'Columns to export',
-        options=export_cols,
-        default=export_cols,
-    )
-
-    if selected_cols:
-        preview = results[selected_cols]
-        st.dataframe(preview, width="stretch", hide_index=True)
-
-        csv_bytes = preview.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            '⬇ Download CSV',
-            data=csv_bytes,
-            file_name='matches.csv',
-            mime='text/csv',
-            type='primary',
-        )
+    if not summary['segments']:
+        st.info('No segments were saved (all candidates filtered out).')
+    else:
+        seg_df = pd.DataFrame(summary['segments'])
+        seg_df.index = seg_df.index + 1
+        seg_df.index.name = 'Segment'
+        st.dataframe(seg_df.rename(columns={'path': 'GCS path', 'rows': 'Rows'}), hide_index=False)
+        st.caption(f'Total rows saved: **{summary["total_rows"]:,}**')
