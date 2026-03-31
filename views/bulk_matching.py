@@ -391,6 +391,12 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
         del match_rows
         gc.collect()
 
+        # Drop heavy columns that are no longer needed — frees memory before
+        # AI validation and email generation operate on the full matches frame.
+        _drop = [c for c in ('embeddings', 'similarity_score') if c in matches.columns]
+        if _drop:
+            matches = matches.drop(columns=_drop)
+
         # Parquets store date columns as Timestamps; cast to str so Arrow can serialize them
         for _col in ('scraped_at', 'open_date', 'close_date'):
             if _col in matches.columns:
