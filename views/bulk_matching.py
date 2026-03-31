@@ -4,6 +4,9 @@ Bulk Matching
 Query grant-topic embeddings to find matching contacts,
 optionally validate with Claude AI and pre-write email copy,
 then save results in 1 000-row segments to GCS.
+
+Memory model: match rows are flushed to GCS as soon as 1 000 accumulate,
+so the buffer never exceeds _SEGMENT_SIZE + top_k rows at any point.
 """
 
 import asyncio
@@ -26,16 +29,16 @@ from src.modules.email_generator import async_generate_subject_line, async_josia
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-_BUCKET             = 'cc-matcher-bucket-jeg-v1'
-_CONTACTS_PREFIX    = 'data/all-contacts/'
-_TOPICS_PREFIX      = 'data/all-topics/processed/'
-_RESULTS_PREFIX     = 'matching-results/'
-_MIN_THRESHOLD      = 0.82
-_SEGMENT_SIZE       = 1000  # rows processed end-to-end before freeing memory
-_VALIDATION_BATCH   = 10    # concurrent Claude calls during validation
-_EMAIL_BATCH        = 5     # rows per batch for email generation (2 API calls each)
-_MAX_RETRIES        = 5
-_VALIDATION_SYSTEM  = (
+_BUCKET            = 'cc-matcher-bucket-jeg-v1'
+_CONTACTS_PREFIX   = 'data/all-contacts/'
+_TOPICS_PREFIX     = 'data/all-topics/processed/'
+_RESULTS_PREFIX    = 'matching-results/'
+_MIN_THRESHOLD     = 0.82
+_SEGMENT_SIZE      = 1000   # rows flushed end-to-end before freeing memory
+_VALIDATION_BATCH  = 10     # concurrent Claude calls per asyncio.run()
+_EMAIL_BATCH       = 5      # rows per email-generation batch
+_MAX_RETRIES       = 5
+_VALIDATION_SYSTEM = (
     'Tell me if this company summary and grant summary are aligned. '
     'Only give a one-word answer. Either "yes" or "no".'
 )
@@ -176,53 +179,54 @@ async def _generate_email_batch(
 
 # ── Segment processor ─────────────────────────────────────────────────────────
 
-def _process_segment(
-    segment: pd.DataFrame,
+def _flush_segment(
+    rows: list[dict],
     seg_num: int,
-    n_segments: int,
+    results_prefix: str,
+    gcs_client: storage.Client,
     ai_validation: bool,
     prewrite_email: bool,
     anth_key: str,
     openai_key: str,
-    status_placeholder,
-    seen_websites: dict[str, str],  # mutated in-place; carries results across segments
-) -> pd.DataFrame:
+    seen_websites: dict[str, str],
+    status: st.delta_generator.DeltaGenerator,
+) -> dict | None:
     """
-    Run AI validation and/or email pre-write on a single segment DataFrame.
-    Returns the processed (and filtered) segment. Frees intermediate objects.
+    Build a DataFrame from rows, run validation + email, upload to GCS, return
+    segment summary dict or None if everything was filtered out.
 
-    seen_websites maps companyWebsite → 'yes'/'no' for every site already
-    validated in a prior segment, so the same company is never called twice.
+    seen_websites is mutated in-place so results carry across segments.
     """
-    seg_label = f'Segment {seg_num}/{n_segments}'
+    segment = pd.DataFrame(rows)
+
+    for col in ('scraped_at', 'open_date', 'close_date'):
+        if col in segment.columns:
+            segment[col] = segment[col].astype(str)
 
     # ── AI validation ─────────────────────────────────────────────────────
     if ai_validation:
         segment = segment.copy()
         segment['good_match'] = None
 
-        website_map: dict[str, list[int]] = {}   # site → row indices in this segment
-        unique_tasks: list[tuple[int, dict]] = [] # only NEW sites need API calls
+        website_map:  dict[str, list[int]] = {}
+        unique_tasks: list[tuple[int, dict]] = []
 
         for idx, row in segment.iterrows():
             site = str(row.get('companyWebsite', '') or '').strip()
+            if site and site in seen_websites:
+                segment.at[idx, 'good_match'] = seen_websites[site]
+                continue
+            slim = {
+                'company_summary': row.get('company_summary', ''),
+                'grant_summary':   row.get('grant_summary',   ''),
+            }
             if site:
-                if site in seen_websites:
-                    # Already validated in a prior segment — apply directly
-                    segment.at[idx, 'good_match'] = seen_websites[site]
-                else:
-                    if site not in website_map:
-                        website_map[site] = []
-                        unique_tasks.append((idx, {
-                            'company_summary': row.get('company_summary', ''),
-                            'grant_summary':   row.get('grant_summary',   ''),
-                        }))
-                    website_map[site].append(idx)
+                if site not in website_map:
+                    website_map[site] = []
+                    unique_tasks.append((idx, slim))
+                website_map[site].append(idx)
             else:
-                unique_tasks.append((idx, {
-                    'company_summary': row.get('company_summary', ''),
-                    'grant_summary':   row.get('grant_summary',   ''),
-                }))
+                unique_tasks.append((idx, slim))
 
         total_tasks   = len(unique_tasks)
         idx_to_result: dict[int, str] = {}
@@ -232,20 +236,16 @@ def _process_segment(
             results = asyncio.run(_validate_rows(batch, anth_key))
             idx_to_result.update(results)
             done = i + len(batch)
-            status_placeholder.progress(
-                seg_num / n_segments,
-                text=f'{seg_label} · validating {done}/{total_tasks} new companies',
+            status.progress(
+                done / max(total_tasks, 1),
+                text=f'Segment {seg_num} · validating {done}/{total_tasks} new companies',
             )
-            if done % 100 == 0:
-                gc.collect()
 
-        # Broadcast results for new sites and add to seen_websites
         for site, indices in website_map.items():
             result = idx_to_result.get(indices[0], 'no')
             seen_websites[site] = result
             for idx in indices:
                 segment.at[idx, 'good_match'] = result
-        # Rows without a website each got their own task entry
         for idx in segment.index:
             if segment.at[idx, 'good_match'] is None:
                 segment.at[idx, 'good_match'] = idx_to_result.get(idx, 'no')
@@ -258,7 +258,7 @@ def _process_segment(
         ].reset_index(drop=True)
 
     if segment.empty:
-        return segment
+        return None
 
     # ── Pre-write email ───────────────────────────────────────────────────
     if prewrite_email:
@@ -276,15 +276,23 @@ def _process_segment(
                 segment.at[idx, 'subject_line'] = subject
                 segment.at[idx, 'ai_message']   = body
             done = i + len(batch)
-            status_placeholder.progress(
-                seg_num / n_segments,
-                text=f'{seg_label} · writing emails {done}/{total}',
+            status.progress(
+                done / max(total, 1),
+                text=f'Segment {seg_num} · writing emails {done}/{total}',
             )
 
         del email_rows
         gc.collect()
 
-    return segment
+    # ── Upload ────────────────────────────────────────────────────────────
+    blob_path = f'{results_prefix}segment_{seg_num:03d}.csv'
+    _upload_csv(segment, blob_path, gcs_client)
+    row_count = len(segment)
+
+    del segment
+    gc.collect()
+
+    return {'path': blob_path, 'rows': row_count}
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -400,7 +408,7 @@ if st.session_state.bm_topics_df is not None:
 st.divider()
 st.subheader('3 · Run options')
 
-opt_left, opt_mid, opt_right = st.columns([1, 1, 2])
+opt_left, opt_mid, _ = st.columns([1, 1, 2])
 with opt_left:
     threshold = st.slider(
         'Similarity threshold',
@@ -445,7 +453,6 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
         grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'grant_summary']
         grant_meta = grants[[c for c in grant_cols if c in grants.columns]].reset_index(drop=True)
 
-        # ── Stream contacts → collect match rows ──────────────────────────
         with st.spinner('Listing contact files…'):
             blob_list = _list_contact_blobs(selected_sources)
 
@@ -453,8 +460,21 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             st.error('No contact parquet files found for the selected sources.')
             st.stop()
 
-        match_rows: list[dict] = []
-        bar = st.progress(0, text='Matching contacts…')
+        # ── Stream contacts, flush segments inline ────────────────────────
+        # match_buffer never exceeds _SEGMENT_SIZE + top_k rows — no global
+        # accumulation of all matches before processing begins.
+        run_id        = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        results_prefix = f'{_RESULTS_PREFIX}{run_id}/'
+        gcs_client    = _get_storage_client()
+
+        match_buffer:  list[dict]       = []
+        seen_websites: dict[str, str]   = {}
+        saved_segments: list[dict]      = []
+        seg_num        = 0
+        total_candidates = 0
+
+        contact_bar = st.progress(0, text='Matching contacts…')
+        seg_status  = st.empty()
 
         for file_i, (source, blob) in enumerate(blob_list):
             df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
@@ -473,8 +493,8 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
                 above = np.where(contact_scores >= threshold)[0]
                 if len(above) == 0:
                     continue
-                top_indices = above[np.argsort(contact_scores[above])[::-1][:int(top_k)]]
-                contact_row = df.iloc[ci]
+                top_indices  = above[np.argsort(contact_scores[above])[::-1][:int(top_k)]]
+                contact_row  = df.iloc[ci]
                 for gi in top_indices:
                     row = {
                         'companyName':     str(contact_row.get('companyName', '') or contact_row.get('company_name', '') or ''),
@@ -487,88 +507,75 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
                     }
                     for col in grant_meta.columns:
                         row[col] = grant_meta.iloc[gi].get(col, '')
-                    match_rows.append(row)
+                    match_buffer.append(row)
+                    total_candidates += 1
+
+                # Flush as soon as the buffer is full
+                if len(match_buffer) >= _SEGMENT_SIZE:
+                    seg_num += 1
+                    result = _flush_segment(
+                        rows           = match_buffer[:_SEGMENT_SIZE],
+                        seg_num        = seg_num,
+                        results_prefix = results_prefix,
+                        gcs_client     = gcs_client,
+                        ai_validation  = ai_validation,
+                        prewrite_email = prewrite_email,
+                        anth_key       = anth_key,
+                        openai_key     = openai_key,
+                        seen_websites  = seen_websites,
+                        status         = seg_status,
+                    )
+                    if result:
+                        saved_segments.append(result)
+                    match_buffer = match_buffer[_SEGMENT_SIZE:]
 
             del contact_embeddings, scores
-            bar.progress(
+            contact_bar.progress(
                 (file_i + 1) / len(blob_list),
-                text=f'File {file_i + 1}/{len(blob_list)}: {blob.name.split("/")[-1]}',
+                text=f'File {file_i + 1}/{len(blob_list)}: {blob.name.split("/")[-1]}  |  {total_candidates:,} candidates so far',
             )
 
-        bar.empty()
-        del grant_embeddings, grant_meta
-
-        if not match_rows:
-            st.warning(f'No matches found above {threshold} similarity threshold.')
-            st.stop()
-
-        total_candidates = len(match_rows)
-        st.success(f'Found **{total_candidates:,}** candidate matches — processing in segments of {_SEGMENT_SIZE:,}.')
-
-        # ── Process in 1 000-row segments ─────────────────────────────────
-        run_id         = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        results_prefix = f'{_RESULTS_PREFIX}{run_id}/'
-        gcs_client     = _get_storage_client()
-        n_segments     = (total_candidates + _SEGMENT_SIZE - 1) // _SEGMENT_SIZE
-        seg_status     = st.progress(0, text='Starting segments…')
-        saved_segments: list[dict] = []
-        seen_websites:  dict[str, str] = {}  # shared across segments for dedup
-
-        for seg_i in range(n_segments):
-            seg_num   = seg_i + 1
-            seg_start = seg_i * _SEGMENT_SIZE
-            seg_end   = min(seg_start + _SEGMENT_SIZE, total_candidates)
-
-            # Build segment DataFrame and immediately free the source rows
-            segment_rows = match_rows[seg_start:seg_end]
-            segment      = pd.DataFrame(segment_rows)
-            del segment_rows
-
-            # Cast date columns
-            for _col in ('scraped_at', 'open_date', 'close_date'):
-                if _col in segment.columns:
-                    segment[_col] = segment[_col].astype(str)
-
-            seg_status.progress(
-                seg_num / n_segments,
-                text=f'Segment {seg_num}/{n_segments} · {len(segment):,} rows',
-            )
-
-            segment = _process_segment(
-                segment        = segment,
+        # Flush any remaining rows
+        if match_buffer:
+            seg_num += 1
+            result = _flush_segment(
+                rows           = match_buffer,
                 seg_num        = seg_num,
-                n_segments     = n_segments,
+                results_prefix = results_prefix,
+                gcs_client     = gcs_client,
                 ai_validation  = ai_validation,
                 prewrite_email = prewrite_email,
                 anth_key       = anth_key,
                 openai_key     = openai_key,
-                status_placeholder = seg_status,
                 seen_websites  = seen_websites,
+                status         = seg_status,
             )
+            if result:
+                saved_segments.append(result)
+            match_buffer = []
 
-            if not segment.empty:
-                blob_path = f'{results_prefix}segment_{seg_num:03d}.csv'
-                _upload_csv(segment, blob_path, gcs_client)
-                saved_segments.append({'path': blob_path, 'rows': len(segment)})
-
-            del segment
-            gc.collect()
-
+        contact_bar.empty()
         seg_status.empty()
-        del match_rows
+        del grant_embeddings, grant_meta, seen_websites
         gc.collect()
 
         total_saved = sum(s['rows'] for s in saved_segments)
         st.session_state.bm_run_summary = {
-            'run_id':    run_id,
-            'prefix':    results_prefix,
-            'segments':  saved_segments,
-            'total_rows': total_saved,
+            'run_id':     run_id,
+            'prefix':     results_prefix,
+            'segments':   saved_segments,
+            'total_candidates': total_candidates,
+            'total_saved': total_saved,
         }
-        st.success(
-            f'Run complete — **{total_saved:,}** rows saved across '
-            f'**{len(saved_segments)}** segment(s) to `{results_prefix}`'
-        )
+
+        if not saved_segments:
+            st.warning('No matches passed filters — nothing saved.')
+        else:
+            st.success(
+                f'Run complete — **{total_saved:,}** rows saved across '
+                f'**{len(saved_segments)}** segment(s)  '
+                f'(from {total_candidates:,} candidates) → `{results_prefix}`'
+            )
 
     except Exception as e:
         st.error(f'**Error:** {e}')
@@ -588,5 +595,11 @@ if st.session_state.bm_run_summary is not None:
         seg_df = pd.DataFrame(summary['segments'])
         seg_df.index = seg_df.index + 1
         seg_df.index.name = 'Segment'
-        st.dataframe(seg_df.rename(columns={'path': 'GCS path', 'rows': 'Rows'}), hide_index=False)
-        st.caption(f'Total rows saved: **{summary["total_rows"]:,}**')
+        st.dataframe(
+            seg_df.rename(columns={'path': 'GCS path', 'rows': 'Rows saved'}),
+            hide_index=False,
+        )
+        st.caption(
+            f'**{summary["total_saved"]:,}** rows saved from '
+            f'**{summary["total_candidates"]:,}** candidates.'
+        )
