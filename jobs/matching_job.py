@@ -54,12 +54,11 @@ _VALIDATION_SYSTEM = (
 
 # ── Secret Manager ────────────────────────────────────────────────────────────
 
+_PROJECT = 'cc-matcher-v1'
+
 def _get_secret(secret_id: str) -> str:
     client = secretmanager.SecretManagerServiceClient()
-    # Project is inferred from the service account's ADC
-    import google.auth
-    _, project = google.auth.default()
-    name = f'projects/{project}/secrets/{secret_id}/versions/latest'
+    name = f'projects/{_PROJECT}/secrets/{secret_id}/versions/latest'
     return client.access_secret_version(request={'name': name}).payload.data.decode()
 
 
