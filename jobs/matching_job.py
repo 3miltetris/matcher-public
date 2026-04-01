@@ -63,6 +63,23 @@ def _get_secret(secret_id: str) -> str:
     return client.access_secret_version(request={'name': name}).payload.data.decode()
 
 
+# ── Filter helper ────────────────────────────────────────────────────────────
+
+def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+    active = [f for f in filters if f.get('keyword', '').strip() and f.get('column')]
+    if not active:
+        return df
+    mask = df[active[0]['column']].astype(str).str.lower().str.contains(
+        active[0]['keyword'].lower(), na=False
+    )
+    for f in active[1:]:
+        m = df[f['column']].astype(str).str.lower().str.contains(
+            f['keyword'].lower(), na=False
+        )
+        mask = (mask & m) if f.get('operator', 'AND') == 'AND' else (mask | m)
+    return df[mask]
+
+
 # ── GCS helpers ───────────────────────────────────────────────────────────────
 
 def _gcs() -> storage.Client:
@@ -296,6 +313,7 @@ def main(config_blob_path: str) -> None:
     top_k           = int(config['top_k'])
     sources         = config['sources']
     agencies        = config['agencies']
+    topic_filters   = config.get('topic_filters', [])
     ai_validation   = bool(config.get('ai_validation', True))
     prewrite_email  = bool(config.get('prewrite_email', False))
     results_prefix  = f'{_RESULTS_PREFIX}{run_id}/'
@@ -312,6 +330,12 @@ def main(config_blob_path: str) -> None:
 
     if 'grant_summary' not in topics_df.columns and 'description' in topics_df.columns:
         topics_df = topics_df.rename(columns={'description': 'grant_summary'})
+
+    if topic_filters:
+        topics_df = _apply_filters(topics_df, topic_filters)
+        if topics_df.empty:
+            raise RuntimeError('No topics remain after applying topic filters.')
+        print(f'  {len(topics_df):,} topics after filtering', flush=True)
 
     grant_embeddings = np.stack(topics_df['embeddings'].values).astype(np.float32)
     topics_df        = topics_df.drop(columns=['embeddings'])
