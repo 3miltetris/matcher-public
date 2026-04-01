@@ -29,7 +29,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from anthropic import AsyncAnthropic
-from google.cloud import secretmanager, storage
+from google.cloud import storage
 from openai import AsyncOpenAI
 
 # ── src modules are on the path because the Dockerfile sets PYTHONPATH ────────
@@ -54,12 +54,14 @@ _VALIDATION_SYSTEM = (
 
 # ── Secret Manager ────────────────────────────────────────────────────────────
 
-_PROJECT = 'cc-matcher-v1'
-
 def _get_secret(secret_id: str) -> str:
-    client = secretmanager.SecretManagerServiceClient()
-    name = f'projects/{_PROJECT}/secrets/{secret_id}/versions/latest'
-    return client.access_secret_version(request={'name': name}).payload.data.decode()
+    """Read secret from environment variable (injected by Cloud Run at startup)."""
+    import os
+    env_var = secret_id.upper().replace('-', '_')
+    value = os.environ.get(env_var, '')
+    if not value:
+        raise RuntimeError(f'Environment variable {env_var} is not set.')
+    return value
 
 
 # ── Filter helper ────────────────────────────────────────────────────────────
