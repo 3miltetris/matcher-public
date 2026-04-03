@@ -84,7 +84,7 @@ def _extract_topics(text: str, anth_key: str) -> list[dict]:
     if not text:
         raise ValueError('Document text is empty — nothing to extract.')
     client = Anthropic(api_key=anth_key)
-    response = client.messages.create(
+    with client.messages.stream(
         model=_EXTRACT_MODEL,
         max_tokens=64000,
         system=_EXTRACTION_PROMPT,
@@ -92,14 +92,15 @@ def _extract_topics(text: str, anth_key: str) -> list[dict]:
             'role': 'user',
             'content': text,
         }],
-    )
-    if response.stop_reason == 'max_tokens':
+    ) as stream:
+        final = stream.get_final_message()
+    if final.stop_reason == 'max_tokens':
         raise ValueError(
             'Claude hit the output token limit before finishing — the document '
             'is too large to process in one pass. Try splitting it into smaller '
             'sections (e.g. one agency or one batch of topics at a time).'
         )
-    raw = response.content[0].text.strip()
+    raw = final.content[0].text.strip()
     # Strip markdown code fences if Claude wrapped the output anyway
     if raw.startswith('```'):
         raw = raw.split('\n', 1)[-1]
