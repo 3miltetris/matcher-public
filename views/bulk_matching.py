@@ -305,7 +305,9 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
             if f.get('keyword', '').strip() and f.get('column')
         ]
 
-    run_id = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    ag_tag  = '-'.join(selected_agencies) if selected_agencies else 'none'
+    src_tag = '-'.join(selected_sources)  if selected_sources  else 'none'
+    run_id  = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_ag-{ag_tag}_src-{src_tag}"
     config = {
         'run_id':         run_id,
         'threshold':      float(threshold),
