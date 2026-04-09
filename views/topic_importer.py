@@ -7,6 +7,7 @@ Review, set the agency, then save with embeddings to the processed store.
 """
 
 import json
+import secrets
 from datetime import datetime
 
 import fitz  # PyMuPDF
@@ -54,7 +55,7 @@ If the document has a single global due date, apply it to all topics. Extract AL
 
 _EXTRACT_MODEL = 'claude-sonnet-4-6'
 _EMBED_MODEL   = 'text-embedding-ada-002'
-_COL_ORDER     = ['topic_number', 'title', 'agency', 'due_date', 'scraped_at', 'description']
+_COL_ORDER     = ['topic_number', 'title', 'agency', 'source', 'due_date', 'scraped_at', 'description']
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -108,12 +109,13 @@ def _extract_topics(text: str, anth_key: str) -> list[dict]:
     return json.loads(raw)
 
 
-def _build_df(topics: list[dict], sub_agency: str) -> pd.DataFrame:
+def _build_df(topics: list[dict], sub_agency: str, source: str = '') -> pd.DataFrame:
     df = pd.DataFrame(topics)
     for col in ['topic_number', 'title', 'description', 'due_date']:
         if col not in df.columns:
             df[col] = None
     df['agency']     = sub_agency
+    df['source']     = source
     df['scraped_at'] = datetime.today().strftime('%Y-%m-%d')
     present = [c for c in _COL_ORDER if c in df.columns]
     extra   = [c for c in df.columns if c not in _COL_ORDER]
@@ -136,7 +138,8 @@ def _embed_and_save(df: pd.DataFrame, broad_agency: str, oai_key: str) -> list[s
         group['embeddings'] = embeddings
         progress.empty()
 
-        gcs_path = f'{_TOPICS_PREFIX}{broad_agency}/{sub_agency}_{today}.parquet'
+        hex_suffix = secrets.token_hex(3)  # 6-char hex, e.g. "a3f9c1"
+        gcs_path = f'{_TOPICS_PREFIX}{broad_agency}/{sub_agency}_{today}_{hex_suffix}.parquet'
         bm.upload_file(gcs_path, group)
         saved.append(gcs_path)
 
@@ -178,10 +181,17 @@ with text_tab:
         label_visibility='collapsed',
     )
 
-sub_agency_input = st.text_input(
-    'Sub-agency',
-    placeholder='e.g. ARMY, USSOCOM, NCI — pre-fills the agency column for all extracted topics',
-)
+input_col1, input_col2 = st.columns(2)
+with input_col1:
+    sub_agency_input = st.text_input(
+        'Sub-agency',
+        placeholder='e.g. ARMY, USSOCOM, NCI — pre-fills the agency column for all extracted topics',
+    )
+with input_col2:
+    source_input = st.text_input(
+        'Source',
+        placeholder='e.g. SAM.gov, Agency website — pre-fills the source column for all extracted topics',
+    )
 
 extract_btn = st.button('⚡ Extract Topics', type='primary')
 
@@ -218,7 +228,7 @@ if extract_btn:
         if not topics:
             st.warning('No topics found in the document.')
         else:
-            st.session_state.topics_df   = _build_df(topics, sub_agency_input.strip())
+            st.session_state.topics_df   = _build_df(topics, sub_agency_input.strip(), source_input.strip())
             st.session_state.save_results = []
             st.success(f'Extracted **{len(topics)}** topic(s). Review and edit below.')
 
@@ -239,9 +249,26 @@ if st.session_state.topics_df is not None:
             key='agency_fill_input',
         )
     with fill_right:
-        if st.button('Apply to all rows', width='stretch'):
+        if st.button('Apply to all rows', key='apply_agency', width='stretch'):
             df = st.session_state.topics_df.copy()
             df['agency'] = fill_value.strip()
+            st.session_state.topics_df = df
+            st.rerun()
+
+    # Source quick-fill bar
+    src_left, src_right, _ = st.columns([2, 1, 3])
+    with src_left:
+        source_fill_value = st.text_input(
+            'Source',
+            value=source_input.strip(),
+            placeholder='e.g. SAM.gov, Agency website…',
+            label_visibility='collapsed',
+            key='source_fill_input',
+        )
+    with src_right:
+        if st.button('Apply to all rows', key='apply_source', width='stretch'):
+            df = st.session_state.topics_df.copy()
+            df['source'] = source_fill_value.strip()
             st.session_state.topics_df = df
             st.rerun()
 
@@ -254,6 +281,7 @@ if st.session_state.topics_df is not None:
             'topic_number': st.column_config.TextColumn('Topic #',      width='small'),
             'title':        st.column_config.TextColumn('Title',        width='medium'),
             'agency':       st.column_config.TextColumn('Agency',       width='small'),
+            'source':       st.column_config.TextColumn('Source',       width='small'),
             'due_date':     st.column_config.TextColumn('Due Date',     width='small'),
             'scraped_at':   st.column_config.TextColumn('Scraped At',   width='small'),
             'description':  st.column_config.TextColumn('Description',  width='large'),
@@ -296,7 +324,7 @@ if st.session_state.topics_df is not None:
 
     st.caption(
         f'**{n_topics}** topic(s) across **{n_agencies}** {agency_word} → {dest_label}  '
-        f'— one parquet per unique sub-agency, named `{{sub_agency}}_{{date}}.parquet`'
+        f'— one parquet per unique sub-agency, named `{{sub_agency}}_{{date}}_{{hex}}.parquet`'
     )
 
     save_disabled = not broad_agency
