@@ -75,7 +75,7 @@ with st.expander('Submit a new suggestion', expanded=st.session_state.sug_submit
         suggestion = st.text_area(
             'Suggestion',
             height=100,
-            placeholder='Describe the feature you'd like to see…',
+            placeholder="Describe the feature you'd like to see…",
         )
         submitted = st.form_submit_button('Submit', type='primary')
 
