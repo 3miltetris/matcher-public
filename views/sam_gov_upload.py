@@ -217,7 +217,11 @@ if files:
     frames = []
     for f in files:
         try:
-            frames.append(pd.read_csv(f, dtype=str))
+            try:
+                frames.append(pd.read_csv(f, dtype=str, encoding='utf-8'))
+            except UnicodeDecodeError:
+                f.seek(0)
+                frames.append(pd.read_csv(f, dtype=str, encoding='latin-1'))
         except Exception as e:
             st.error(f'Could not read **{f.name}**: {e}')
     if frames:
