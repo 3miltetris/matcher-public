@@ -23,7 +23,7 @@ from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 # ── GCS ────────────────────────────────────────────────────────────────────
 
 _BUCKET     = 'cc-matcher-bucket-jeg-v1'
-_SAM_PREFIX = 'data/all-topics/sam-gov/'
+_SAM_PREFIX = 'data/all-topics/processed/SAM-GOV/'
 
 _SCREEN_MODEL     = 'claude-haiku-4-5-20251001'
 _SCREEN_WORKERS   = 8
@@ -76,6 +76,55 @@ OUTPUT FORMAT:
 Respond only with valid JSON. No preamble, no markdown, no explanation outside the JSON.
 {"import": true, "confidence": "high", "reason": "One or two sentences explaining the decision."}\
 """
+
+
+# ── Summarization prompt ──────────────────────────────────────────────────
+
+_SUMMARY_SYSTEM = """\
+You are preparing a federal contract opportunity for semantic matching against startup and R&D company profiles.
+
+Summarize the opportunity in 3–5 sentences. Focus exclusively on:
+- The specific technical problem, research area, or capability being sought
+- Key deliverables or desired technical outcomes
+- Relevant domain, technology, or sector (e.g., AI/ML, biotech, defense electronics, advanced manufacturing)
+
+Strip out all procurement boilerplate: FAR clauses, set-aside language, submission deadlines, page limits, administrative instructions, and points of contact. Write in plain technical language. If the description is already short and technical, return it as-is.\
+"""
+
+
+def _summarize_one(title: str, desc: str, anth_key: str) -> str:
+    client   = Anthropic(api_key=anth_key)
+    user_msg = f"Title: {title}\n\nDescription:\n{str(desc)[:5000]}"
+    resp = client.messages.create(
+        model=_SCREEN_MODEL,
+        max_tokens=400,
+        system=_SUMMARY_SYSTEM,
+        messages=[{'role': 'user', 'content': user_msg}],
+    )
+    return resp.content[0].text.strip()
+
+
+def _summarize_descriptions(titles: list[str], descs: list[str], anth_key: str) -> list[str]:
+    results  = [''] * len(descs)
+    progress = st.progress(0, text='Summarizing descriptions…')
+
+    with ThreadPoolExecutor(max_workers=_SCREEN_WORKERS) as pool:
+        futures = {
+            pool.submit(_summarize_one, titles[i], descs[i], anth_key): i
+            for i in range(len(descs))
+        }
+        done = 0
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                results[i] = future.result()
+            except Exception:
+                results[i] = descs[i]   # fall back to raw description on error
+            done += 1
+            progress.progress(done / len(descs), text=f'Summarizing… {done}/{len(descs)}')
+
+    progress.empty()
+    return results
 
 
 # ── Column auto-detection ──────────────────────────────────────────────────
@@ -174,7 +223,7 @@ def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
 
 # ── Embed + save ───────────────────────────────────────────────────────────
 
-def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str) -> str:
+def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str, anth_key: str) -> str:
     tp    = TextProcessor(api_key=oai_key)
     bm    = BucketManager(_BUCKET, client=_get_storage_client())
     today = datetime.today().strftime('%Y-%m-%d')
@@ -190,12 +239,19 @@ def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str) -> str:
     out['sam_confidence'] = df['_confidence'].values
     out['sam_reason']   = df['_reason'].values
 
-    descs    = out['description'].astype(str).tolist()
-    progress = st.progress(0, text='Generating embeddings…')
-    embeddings = []
-    for i, desc in enumerate(descs):
-        embeddings.append(tp.get_embedding(desc) if desc.strip() else None)
-        progress.progress((i + 1) / len(descs), text=f'Embedding {i + 1}/{len(descs)}…')
+    # ── Summarize descriptions before embedding ────────────────────────────
+    titles   = out['title'].tolist()
+    descs    = out['description'].tolist()
+    summaries = _summarize_descriptions(titles, descs, anth_key)
+    out['grant_summary'] = summaries
+
+    # ── Embed grant_summary (falls back to description if summary is blank) ─
+    embed_texts = [s if s.strip() else d for s, d in zip(summaries, descs)]
+    progress    = st.progress(0, text='Generating embeddings…')
+    embeddings  = []
+    for i, text in enumerate(embed_texts):
+        embeddings.append(tp.get_embedding(text) if text.strip() else None)
+        progress.progress((i + 1) / len(embed_texts), text=f'Embedding {i + 1}/{len(embed_texts)}…')
     progress.empty()
 
     out['embeddings'] = embeddings
@@ -435,9 +491,10 @@ st.caption(
 )
 
 if st.button('💾 Embed & Save', type='primary'):
-    oai_key = st.secrets['openai_api_key']
+    oai_key  = st.secrets['openai_api_key']
+    anth_key = st.secrets['anthropic_api_key']
     try:
-        path = _embed_and_save(new_rows.reset_index(drop=True), col_map, oai_key)
+        path = _embed_and_save(new_rows.reset_index(drop=True), col_map, oai_key, anth_key)
         st.success(f'Saved **{path}** — {len(new_rows)} topics ready for matching.')
         st.session_state.sam_raw_df       = None
         st.session_state.sam_screened_df  = None
