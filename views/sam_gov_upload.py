@@ -152,6 +152,26 @@ def _run_screening(df: pd.DataFrame, col_map: dict, anth_key: str) -> pd.DataFra
     return out
 
 
+# ── Existing-record keys (for dedup) ──────────────────────────────────────
+
+def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
+    """Return (notice_ids, lower_titles) already in the sam-gov prefix."""
+    notice_ids: set[str] = set()
+    titles:     set[str] = set()
+    blobs = client.list_blobs(_BUCKET, prefix=_SAM_PREFIX)
+    for blob in blobs:
+        if not blob.name.endswith('.parquet'):
+            continue
+        try:
+            import io
+            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()), columns=['topic_number', 'title'])
+            notice_ids.update(df['topic_number'].dropna().astype(str).str.strip())
+            titles.update(df['title'].dropna().astype(str).str.lower().str.strip())
+        except Exception:
+            pass
+    return notice_ids, titles
+
+
 # ── Embed + save ───────────────────────────────────────────────────────────
 
 def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str) -> str:
@@ -188,7 +208,7 @@ def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str) -> str:
 
 # ── Session state ──────────────────────────────────────────────────────────
 
-for _k in ['sam_raw_df', 'sam_screened_df']:
+for _k in ['sam_raw_df', 'sam_screened_df', 'sam_existing_keys']:
     if _k not in st.session_state:
         st.session_state[_k] = None
 
@@ -366,18 +386,62 @@ if passing.empty:
     st.warning('No passing rows to save — nothing to embed.')
     st.stop()
 
+# ── Load existing keys once per session ────────────────────────────────────
+
+if st.session_state.sam_existing_keys is None:
+    with st.spinner('Checking existing records for duplicates…'):
+        try:
+            existing_ids, existing_titles = _load_existing_keys(_get_storage_client())
+            st.session_state.sam_existing_keys = (existing_ids, existing_titles)
+        except Exception as e:
+            st.warning(f'Could not load existing records for dedup check: {e}')
+            st.session_state.sam_existing_keys = (set(), set())
+
+existing_ids, existing_titles = st.session_state.sam_existing_keys
+
+# ── Apply deduplication ────────────────────────────────────────────────────
+
+def _is_dup(row: pd.Series) -> bool:
+    if m_notice:
+        if str(row.get(m_notice, '')).strip() in existing_ids:
+            return True
+    if str(row.get(m_title, '')).strip().lower() in existing_titles:
+        return True
+    return False
+
+dup_mask = passing.apply(_is_dup, axis=1)
+dupes    = passing[dup_mask]
+new_rows = passing[~dup_mask]
+
+if not dupes.empty:
+    st.info(
+        f'**{len(dupes)}** row(s) skipped — notice ID or title already exists in the store.',
+        icon='ℹ️',
+    )
+    with st.expander(f'Skipped duplicates ({len(dupes)})', expanded=False):
+        st.dataframe(
+            dupes[[m_title] + ([m_notice] if m_notice else [])].reset_index(drop=True),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+if new_rows.empty:
+    st.success('All passing rows are already in the store — nothing new to save.')
+    st.stop()
+
 st.caption(
-    f'**{len(passing)}** rows will be embedded (`text-embedding-ada-002`) and saved to '
+    f'**{len(new_rows)}** new rows will be embedded (`text-embedding-ada-002`) and saved to '
     f'`{_SAM_PREFIX}sam_gov_{{date}}_{{hex}}.parquet`.'
 )
 
 if st.button('💾 Embed & Save', type='primary'):
     oai_key = st.secrets['openai_api_key']
     try:
-        path = _embed_and_save(passing.reset_index(drop=True), col_map, oai_key)
-        st.success(f'Saved **{path}** — {len(passing)} topics ready for matching.')
-        st.session_state.sam_raw_df      = None
-        st.session_state.sam_screened_df = None
+        path = _embed_and_save(new_rows.reset_index(drop=True), col_map, oai_key)
+        st.success(f'Saved **{path}** — {len(new_rows)} topics ready for matching.')
+        st.session_state.sam_raw_df       = None
+        st.session_state.sam_screened_df  = None
+        st.session_state.sam_existing_keys = None
         st.rerun()
     except Exception as e:
         st.error(f'Save failed: {e}')
