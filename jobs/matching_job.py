@@ -47,8 +47,10 @@ _EMAIL_BATCH      = 5
 _SCORE_CHUNK      = 2000
 _MAX_RETRIES      = 5
 _VALIDATION_SYSTEM = (
-    'Tell me if this company summary and grant summary are aligned. '
-    'Only give a one-word answer. Either "yes" or "no".'
+    'You are evaluating whether a company could potentially benefit from or be relevant to a government grant. '
+    'Answer "yes" if there is any reasonable connection, even if indirect. '
+    'Answer "no" only if there is clearly no connection. '
+    'Only respond with a single word: yes or no.'
 )
 
 
