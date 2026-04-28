@@ -19,6 +19,12 @@ if not st.session_state.get("authenticated"):
 
 pages = [
     st.Page("views/topic_importer.py", title="Topic Importer", icon="📄"),
+    st.Page("views/grant_search.py",   title="Grant Search",   icon="🔍"),
+    st.Page("views/bulk_matching.py",  title="Bulk Matching",  icon="⚙️"),
+
+    st.Page("views/sam_gov_upload.py",  title="SAM.gov Upload", icon="🏛️"),
+    st.Page("views/hubspot_import.py", title="HubSpot Import", icon="🔗"),
+    st.Page("views/suggestions.py",    title="Suggestions",    icon="💡"),
     # Uncomment as pages are built:
     # st.Page("views/contact_importer.py", title="Contact Importer", icon="👤"),
     # st.Page("views/matcher.py",          title="Matcher",          icon="🎯"),
