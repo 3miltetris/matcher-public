@@ -22,13 +22,30 @@ _RESULTS_PREFIX = 'matching-results/'
 _HS_BASE        = 'https://api.hubapi.com'
 _POLL_INTERVAL  = 3   # seconds between status polls
 
-# (CSV column name, HubSpot property name, idColumnType or None)
-_COL_MAP = [
-    ('companyWebsite', 'domain', 'HUBSPOT_ALTERNATE_ID'),
-    ('companyName',    'name',   None),
+_OBJECT_TYPE = 'COMPANY'
+
+# Standard HubSpot company properties — no creation needed
+# (csv_col, hs_property, idColumnType or None)
+_STANDARD_COLS = [
+    ('companyWebsite', 'domain',      'HUBSPOT_ALTERNATE_ID'),
+    ('companyName',    'name',        None),
+    ('company_summary','description', None),
 ]
 
-_OBJECT_TYPE = 'COMPANY'
+# Custom properties created automatically if missing
+# csv_col: (hs_internal_name, display_label, type, fieldType)
+_CUSTOM_PROPS: dict[str, tuple[str, str, str, str]] = {
+    'source':        ('matcher_source',        'Matcher Source',        'string', 'text'),
+    'topic_number':  ('matcher_topic_number',  'Matcher Topic Number',  'string', 'text'),
+    'title':         ('matcher_grant_title',   'Matcher Grant Title',   'string', 'text'),
+    'agency':        ('matcher_agency',        'Matcher Agency',        'string', 'text'),
+    'broad_agency':  ('matcher_broad_agency',  'Matcher Broad Agency',  'string', 'text'),
+    'due_date':      ('matcher_due_date',       'Matcher Due Date',      'string', 'text'),
+    'grant_summary': ('matcher_grant_summary', 'Matcher Grant Summary', 'string', 'textarea'),
+    'good_match':    ('matcher_good_match',    'Matcher Good Match',    'string', 'text'),
+    'subject_line':  ('matcher_subject_line',  'Matcher Subject Line',  'string', 'text'),
+    'ai_message':    ('matcher_ai_message',    'Matcher AI Message',    'string', 'textarea'),
+}
 
 for _k in ['hs_import_id', 'hs_import_rows', 'hs_df', 'hs_run_id']:
     if _k not in st.session_state:
@@ -86,7 +103,13 @@ def _submit_import(df: pd.DataFrame, run_id: str) -> tuple[str, int]:
     Build a deduplicated contacts CSV and submit to HubSpot imports API.
     Returns (import_id, row_count).
     """
-    present = [(src, hs, id_type) for src, hs, id_type in _COL_MAP if src in df.columns]
+    # Build full column map: standard props + any custom props present in the DataFrame
+    col_map = [(src, hs, id_type) for src, hs, id_type in _STANDARD_COLS if src in df.columns]
+    for csv_col, (hs_name, _label, _type, _field) in _CUSTOM_PROPS.items():
+        if csv_col in df.columns:
+            col_map.append((csv_col, hs_name, None))
+
+    present = col_map
     if not present:
         raise ValueError('Run CSV has none of the expected company columns (companyName, companyWebsite).')
 
@@ -138,6 +161,50 @@ def _submit_import(df: pd.DataFrame, run_id: str) -> tuple[str, int]:
         raise RuntimeError(f'HTTP {resp.status_code}: {resp.text[:400]}')
 
     return str(resp.json()['id']), len(export)
+
+
+def _ensure_properties() -> list[str]:
+    """
+    Create any missing custom company properties in HubSpot.
+    Returns a list of property names that were created.
+    Requires crm.schemas.companies.write scope on the Private App token.
+    """
+    resp = requests.get(
+        f'{_HS_BASE}/crm/v3/properties/companies',
+        headers=_hs_headers(),
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f'Could not read HubSpot company properties: HTTP {resp.status_code}: {resp.text[:200]}')
+
+    existing = {p['name'] for p in resp.json().get('results', [])}
+    created  = []
+
+    for _csv_col, (hs_name, label, prop_type, field_type) in _CUSTOM_PROPS.items():
+        if hs_name in existing:
+            continue
+        create_resp = requests.post(
+            f'{_HS_BASE}/crm/v3/properties/companies',
+            headers={**_hs_headers(), 'Content-Type': 'application/json'},
+            json={
+                'name':      hs_name,
+                'label':     label,
+                'type':      prop_type,
+                'fieldType': field_type,
+                'groupName': 'companyinformation',
+            },
+            timeout=15,
+        )
+        if create_resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f'Could not create property `{hs_name}`: '
+                f'HTTP {create_resp.status_code}: {create_resp.text[:200]}\n'
+                'Make sure your Private App token has the '
+                '`crm.schemas.companies.write` scope.'
+            )
+        created.append(hs_name)
+
+    return created
 
 
 def _poll_import(import_id: str) -> dict:
@@ -253,7 +320,11 @@ c1.metric('Total rows',              f'{len(df):,}')
 c2.metric('Unique websites',         f'{unique_sites:,}')
 c3.metric('Companies to import',     f'{unique_sites:,}')
 
-import_cols = [c[0] for c in _COL_MAP if c[0] in df.columns]
+all_mapped_cols = (
+    [src for src, _, _ in _STANDARD_COLS] +
+    list(_CUSTOM_PROPS.keys())
+)
+import_cols = [c for c in all_mapped_cols if c in df.columns]
 st.caption(f'Columns that will be imported: `{"`, `".join(import_cols)}`')
 st.dataframe(df[import_cols].head(50), use_container_width=True, hide_index=True)
 
@@ -264,6 +335,11 @@ if not st.button('▶ Import to HubSpot', type='primary'):
     st.stop()
 
 try:
+    with st.spinner('Ensuring HubSpot custom properties exist…'):
+        created_props = _ensure_properties()
+    if created_props:
+        st.info(f'Created {len(created_props)} new HubSpot property/ies: `{"`, `".join(created_props)}`')
+
     with st.spinner('Building CSV and submitting to HubSpot…'):
         import_id, row_count = _submit_import(df, run_id)
 
