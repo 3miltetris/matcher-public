@@ -24,12 +24,11 @@ _POLL_INTERVAL  = 3   # seconds between status polls
 
 # (CSV column name, HubSpot property name, idColumnType or None)
 _COL_MAP = [
-    ('email',          'email',     'HUBSPOT_ALTERNATE_ID'),
-    ('firstName',      'firstname', None),
-    ('lastName',       'lastname',  None),
-    ('companyName',    'company',   None),
-    ('companyWebsite', 'website',   None),
+    ('companyWebsite', 'domain', 'HUBSPOT_ALTERNATE_ID'),
+    ('companyName',    'name',   None),
 ]
+
+_OBJECT_TYPE = 'COMPANY'
 
 for _k in ['hs_import_id', 'hs_import_rows', 'hs_df', 'hs_run_id']:
     if _k not in st.session_state:
@@ -87,25 +86,25 @@ def _submit_import(df: pd.DataFrame, run_id: str) -> tuple[str, int]:
     Build a deduplicated contacts CSV and submit to HubSpot imports API.
     Returns (import_id, row_count).
     """
-    if 'email' not in df.columns:
-        raise ValueError('Run CSV has no email column.')
-
     present = [(src, hs, id_type) for src, hs, id_type in _COL_MAP if src in df.columns]
+    if not present:
+        raise ValueError('Run CSV has none of the expected company columns (companyName, companyWebsite).')
 
     export = df[[c[0] for c in present]].copy()
-    export = export[
-        export['email'].notna() &
-        (export['email'].astype(str).str.strip() != '') &
-        (export['email'].astype(str).str.strip().str.lower() != 'nan')
-    ]
-    export = export.drop_duplicates(subset=['email']).reset_index(drop=True)
+
+    # Deduplicate by website when present; rows without a website are kept as-is
+    if 'companyWebsite' in export.columns:
+        has_site  = export['companyWebsite'].notna() & (export['companyWebsite'].astype(str).str.strip() != '') & (export['companyWebsite'].astype(str).str.strip().str.lower() != 'nan')
+        with_site = export[has_site].drop_duplicates(subset=['companyWebsite'])
+        no_site   = export[~has_site]
+        export    = pd.concat([with_site, no_site], ignore_index=True)
 
     if export.empty:
-        raise ValueError('No rows with valid email addresses to import.')
+        raise ValueError('No rows to import.')
 
     column_mappings = []
     for src, hs_prop, id_type in present:
-        mapping = {'columnObjectType': 'CONTACT', 'columnName': src, 'propertyName': hs_prop}
+        mapping = {'columnObjectType': _OBJECT_TYPE, 'columnName': src, 'propertyName': hs_prop}
         if id_type:
             mapping['idColumnType'] = id_type
         column_mappings.append(mapping)
@@ -153,7 +152,7 @@ def _poll_import(import_id: str) -> dict:
 # ── Page ──────────────────────────────────────────────────────────────────────
 
 st.title('🔗 HubSpot Import')
-st.caption('Load a completed matching run and import contacts to HubSpot via the Imports API.')
+st.caption('Load a completed matching run and import companies to HubSpot via the Imports API.')
 
 if 'hubspot_api_key' not in st.secrets:
     st.info(
@@ -239,17 +238,18 @@ if df is None:
 
 st.divider()
 
-valid_emails = (
-    df['email'].dropna()
+unique_sites = (
+    df['companyWebsite'].dropna()
     .astype(str).str.strip()
     .pipe(lambda s: s[s != ''])
     .pipe(lambda s: s[s.str.lower() != 'nan'])
-) if 'email' in df.columns else pd.Series(dtype=str)
+    .nunique()
+) if 'companyWebsite' in df.columns else 0
 
 c1, c2, c3 = st.columns(3)
-c1.metric('Total rows',             f'{len(df):,}')
-c2.metric('Unique valid emails',    f'{valid_emails.nunique():,}')
-c3.metric('Contacts to import',     f'{valid_emails.nunique():,}')
+c1.metric('Total rows',              f'{len(df):,}')
+c2.metric('Unique websites',         f'{unique_sites:,}')
+c3.metric('Companies to import',     f'{len(df):,}')
 
 import_cols = [c[0] for c in _COL_MAP if c[0] in df.columns]
 st.caption(f'Columns that will be imported: `{"`, `".join(import_cols)}`')
