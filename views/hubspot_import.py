@@ -92,15 +92,17 @@ def _submit_import(df: pd.DataFrame, run_id: str) -> tuple[str, int]:
 
     export = df[[c[0] for c in present]].copy()
 
-    # Deduplicate by website when present; rows without a website are kept as-is
+    # Require a website — domain is the HubSpot dedup key, rows without one can't be imported
     if 'companyWebsite' in export.columns:
-        has_site  = export['companyWebsite'].notna() & (export['companyWebsite'].astype(str).str.strip() != '') & (export['companyWebsite'].astype(str).str.strip().str.lower() != 'nan')
-        with_site = export[has_site].drop_duplicates(subset=['companyWebsite'])
-        no_site   = export[~has_site]
-        export    = pd.concat([with_site, no_site], ignore_index=True)
+        valid_site = (
+            export['companyWebsite'].notna() &
+            (export['companyWebsite'].astype(str).str.strip() != '') &
+            (export['companyWebsite'].astype(str).str.strip().str.lower() != 'nan')
+        )
+        export = export[valid_site].drop_duplicates(subset=['companyWebsite']).reset_index(drop=True)
 
     if export.empty:
-        raise ValueError('No rows to import.')
+        raise ValueError('No rows with a valid companyWebsite to import.')
 
     column_mappings = []
     for src, hs_prop, id_type in present:
@@ -249,7 +251,7 @@ unique_sites = (
 c1, c2, c3 = st.columns(3)
 c1.metric('Total rows',              f'{len(df):,}')
 c2.metric('Unique websites',         f'{unique_sites:,}')
-c3.metric('Companies to import',     f'{len(df):,}')
+c3.metric('Companies to import',     f'{unique_sites:,}')
 
 import_cols = [c[0] for c in _COL_MAP if c[0] in df.columns]
 st.caption(f'Columns that will be imported: `{"`, `".join(import_cols)}`')
