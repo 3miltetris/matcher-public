@@ -1,19 +1,27 @@
 """
 SAM.gov Upload
 --------------
-Upload SAM.gov contract opportunity CSVs.
-Claude Haiku screens each row for relevance to deep tech / R&D small businesses.
-Passing rows are embedded and saved to GCS under data/all-topics/sam-gov/.
+Two input modes:
+  - Upload CSV     : Upload SAM.gov contract opportunity CSVs (original behaviour).
+  - Fetch from API : Query the SAM.gov Opportunities API directly by date range,
+                     notice type, and optional keyword — no manual export needed.
+
+In both modes Claude Haiku screens each row for relevance to deep tech / R&D small
+businesses, then passing rows are embedded and saved to GCS under
+data/all-topics/processed/SAM-GOV/.
 """
 
+import io
 import json
 import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
+import requests
 import streamlit as st
 from anthropic import Anthropic
+from bs4 import BeautifulSoup
 from google.cloud import storage
 from google.oauth2 import service_account
 
@@ -27,8 +35,25 @@ _SAM_PREFIX = 'data/all-topics/processed/SAM-GOV/'
 
 _SCREEN_MODEL     = 'claude-haiku-4-5-20251001'
 _SCREEN_WORKERS   = 8
-_SCREEN_MAX_CHARS = 3000   # truncate description to keep prompt cost low
+_SCREEN_MAX_CHARS = 3000
 
+# ── SAM.gov API ────────────────────────────────────────────────────────────
+
+_SAM_API_BASE  = 'https://api.sam.gov/opportunities/v2/search'
+_SAM_DESC_BASE = 'https://api.sam.gov/opportunities/v2/noticedesc'
+_SAM_PAGE_SIZE = 1000
+_DESC_WORKERS  = 10
+
+_NOTICE_TYPE_OPTIONS = {
+    'Presolicitation':                'p',
+    'Solicitation':                   'o',
+    'Combined Synopsis/Solicitation': 'k',
+    'Sources Sought':                 'r',
+    'Special Notice':                 's',
+}
+
+
+# ── Storage client ─────────────────────────────────────────────────────────
 
 def _get_storage_client() -> storage.Client:
     creds = service_account.Credentials.from_service_account_info(
@@ -119,7 +144,7 @@ def _summarize_descriptions(titles: list[str], descs: list[str], anth_key: str) 
             try:
                 results[i] = future.result()
             except Exception:
-                results[i] = descs[i]   # fall back to raw description on error
+                results[i] = descs[i]
             done += 1
             progress.progress(done / len(descs), text=f'Summarizing… {done}/{len(descs)}')
 
@@ -127,7 +152,7 @@ def _summarize_descriptions(titles: list[str], descs: list[str], anth_key: str) 
     return results
 
 
-# ── Column auto-detection ──────────────────────────────────────────────────
+# ── Column auto-detection (CSV path) ──────────────────────────────────────
 
 _CANDIDATES: dict[str, list[str]] = {
     'title':        ['title', 'opportunity title', 'solicitation title'],
@@ -146,6 +171,125 @@ def _detect_col(columns: list[str], field: str) -> str | None:
         if candidate in lower:
             return lower[candidate]
     return None
+
+
+# ── SAM.gov API helpers ────────────────────────────────────────────────────
+
+def _fetch_one_desc(notice_id: str, api_key: str) -> str:
+    """Fetch and strip HTML from a single SAM.gov opportunity description."""
+    try:
+        r = requests.get(
+            _SAM_DESC_BASE,
+            params={'noticeid': notice_id, 'api_key': api_key},
+            timeout=20,
+        )
+        r.raise_for_status()
+        content = r.text
+        if '<' in content:
+            soup = BeautifulSoup(content, 'html.parser')
+            return soup.get_text(separator=' ', strip=True)
+        return content.strip()
+    except Exception:
+        return ''
+
+
+def _fetch_descriptions_batch(notice_ids: list[str], api_key: str) -> list[str]:
+    results  = [''] * len(notice_ids)
+    progress = st.progress(0, text='Fetching full descriptions…')
+    with ThreadPoolExecutor(max_workers=_DESC_WORKERS) as pool:
+        futures = {
+            pool.submit(_fetch_one_desc, nid, api_key): i
+            for i, nid in enumerate(notice_ids)
+        }
+        done = 0
+        for future in as_completed(futures):
+            i        = futures[future]
+            results[i] = future.result()
+            done    += 1
+            progress.progress(done / len(notice_ids), text=f'Fetching descriptions… {done}/{len(notice_ids)}')
+    progress.empty()
+    return results
+
+
+def _search_sam(
+    api_key:      str,
+    date_from:    str,
+    date_to:      str,
+    notice_types: list[str],
+    keyword:      str,
+    max_results:  int,
+) -> tuple[list[dict], int]:
+    """Paginated SAM.gov opportunity search. Returns (items, total_records)."""
+    all_items: list[dict] = []
+    offset = 0
+    total  = None
+
+    with st.spinner('Querying SAM.gov…'):
+        while True:
+            params: dict = {
+                'api_key':    api_key,
+                'postedFrom': date_from,
+                'postedTo':   date_to,
+                'limit':      _SAM_PAGE_SIZE,
+                'offset':     offset,
+                'active':     'Yes',
+            }
+            if notice_types:
+                params['ntype'] = ','.join(notice_types)
+            if keyword:
+                params['keyword'] = keyword
+
+            r = requests.get(_SAM_API_BASE, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+
+            if total is None:
+                total = int(data.get('totalRecords', 0))
+
+            page_items = data.get('opportunitiesData') or []
+            all_items.extend(page_items)
+
+            if not page_items:
+                break
+            if max_results and len(all_items) >= max_results:
+                all_items = all_items[:max_results]
+                break
+            offset += len(page_items)
+            if offset >= total:
+                break
+
+    return all_items, total or 0
+
+
+def _items_to_df(items: list[dict], api_key: str, fetch_desc: bool) -> tuple[pd.DataFrame, dict]:
+    """Convert raw SAM.gov API items to a DataFrame + col_map ready for screening."""
+    notice_ids = [item.get('noticeId', '') for item in items]
+
+    if fetch_desc and notice_ids:
+        descriptions = _fetch_descriptions_batch(notice_ids, api_key)
+    else:
+        descriptions = ['' for _ in items]
+
+    df = pd.DataFrame({
+        'title':       [item.get('title', '')                                          for item in items],
+        'description': descriptions,
+        'naics_desc':  [item.get('naicsCode', '')                                      for item in items],
+        'notice_id':   [(item.get('solicitationNumber') or item.get('noticeId', ''))   for item in items],
+        'agency':      [(item.get('subTier') or item.get('department', ''))            for item in items],
+        'posted_date': [item.get('postedDate', '')                                     for item in items],
+        'deadline':    [(item.get('responseDeadLine') or '')[:10]                      for item in items],
+    })
+
+    col_map = {
+        'title':       'title',
+        'description': 'description',
+        'naics_desc':  'naics_desc',
+        'notice_id':   'notice_id',
+        'agency':      'agency',
+        'posted_date': 'posted_date',
+        'deadline':    'deadline',
+    }
+    return df, col_map
 
 
 # ── Screening ─────────────────────────────────────────────────────────────
@@ -201,7 +345,7 @@ def _run_screening(df: pd.DataFrame, col_map: dict, anth_key: str) -> pd.DataFra
     return out
 
 
-# ── Existing-record keys (for dedup) ──────────────────────────────────────
+# ── Existing-record dedup ──────────────────────────────────────────────────
 
 def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
     """Return (notice_ids, lower_titles) already in the sam-gov prefix."""
@@ -212,7 +356,6 @@ def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
         if not blob.name.endswith('.parquet'):
             continue
         try:
-            import io
             df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()), columns=['topic_number', 'title'])
             notice_ids.update(df['topic_number'].dropna().astype(str).str.strip())
             titles.update(df['title'].dropna().astype(str).str.lower().str.strip())
@@ -229,23 +372,21 @@ def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str, anth_key: str
     today = datetime.today().strftime('%Y-%m-%d')
 
     out = pd.DataFrame()
-    out['topic_number'] = df[col_map['notice_id']].astype(str)   if col_map.get('notice_id')    else ''
-    out['agency']       = df[col_map['agency']].astype(str)       if col_map.get('agency')       else 'SAM-GOV'
+    out['topic_number'] = df[col_map['notice_id']].astype(str)   if col_map.get('notice_id')   else ''
+    out['agency']       = df[col_map['agency']].astype(str)       if col_map.get('agency')      else 'SAM-GOV'
     out['title']        = df[col_map['title']].astype(str)
     out['description']  = df[col_map['description']].astype(str)
-    out['open_date']    = df[col_map['posted_date']].astype(str)  if col_map.get('posted_date')  else ''
-    out['close_date']   = df[col_map['deadline']].astype(str)     if col_map.get('deadline')     else ''
+    out['open_date']    = df[col_map['posted_date']].astype(str)  if col_map.get('posted_date') else ''
+    out['close_date']   = df[col_map['deadline']].astype(str)     if col_map.get('deadline')    else ''
     out['scraped_at']   = today
     out['sam_confidence'] = df['_confidence'].values
     out['sam_reason']   = df['_reason'].values
 
-    # ── Summarize descriptions before embedding ────────────────────────────
-    titles   = out['title'].tolist()
-    descs    = out['description'].tolist()
+    titles    = out['title'].tolist()
+    descs     = out['description'].tolist()
     summaries = _summarize_descriptions(titles, descs, anth_key)
     out['grant_summary'] = summaries
 
-    # ── Embed grant_summary (falls back to description if summary is blank) ─
     embed_texts = [s if s.strip() else d for s, d in zip(summaries, descs)]
     progress    = st.progress(0, text='Generating embeddings…')
     embeddings  = []
@@ -264,7 +405,7 @@ def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str, anth_key: str
 
 # ── Session state ──────────────────────────────────────────────────────────
 
-for _k in ['sam_raw_df', 'sam_screened_df', 'sam_existing_keys']:
+for _k in ['sam_raw_df', 'sam_screened_df', 'sam_existing_keys', 'sam_col_map', 'sam_from_api']:
     if _k not in st.session_state:
         st.session_state[_k] = None
 
@@ -273,107 +414,213 @@ for _k in ['sam_raw_df', 'sam_screened_df', 'sam_existing_keys']:
 
 st.title('🏛️ SAM.gov Upload')
 st.caption(
-    'Upload SAM.gov contract opportunity CSVs. '
-    'Claude screens each row for relevance to deep tech / R&D small businesses, '
-    'then you save passing rows to the topic store with embeddings.'
+    'Screen and embed SAM.gov contract opportunities for the matching pipeline. '
+    'Upload exported CSVs or fetch directly from the SAM.gov Opportunities API.'
 )
 
-# ── Section 1 · Upload ─────────────────────────────────────────────────────
+# ── Section 1 · Load ───────────────────────────────────────────────────────
 
-st.subheader('1 · Upload CSVs')
+st.subheader('1 · Load opportunities')
 
-files = st.file_uploader(
-    'SAM.gov export CSV(s)',
-    type='csv',
-    accept_multiple_files=True,
-    label_visibility='collapsed',
-)
+tab_csv, tab_api = st.tabs(['📄 Upload CSV', '🔌 Fetch from API'])
 
-if files:
-    frames = []
-    for f in files:
-        try:
+# ── Tab: Upload CSV ────────────────────────────────────────────────────────
+
+with tab_csv:
+    files = st.file_uploader(
+        'SAM.gov export CSV(s)',
+        type='csv',
+        accept_multiple_files=True,
+        label_visibility='collapsed',
+    )
+    if files:
+        frames = []
+        for f in files:
             try:
-                frames.append(pd.read_csv(f, dtype=str, encoding='utf-8'))
-            except UnicodeDecodeError:
-                f.seek(0)
-                frames.append(pd.read_csv(f, dtype=str, encoding='latin-1'))
-        except Exception as e:
-            st.error(f'Could not read **{f.name}**: {e}')
-    if frames:
-        combined = pd.concat(frames, ignore_index=True).dropna(how='all')
-        # Reset downstream state whenever the upload changes
-        if (
-            st.session_state.sam_raw_df is None
-            or len(combined) != len(st.session_state.sam_raw_df)
-        ):
-            st.session_state.sam_raw_df      = combined
-            st.session_state.sam_screened_df = None
+                try:
+                    frames.append(pd.read_csv(f, dtype=str, encoding='utf-8'))
+                except UnicodeDecodeError:
+                    f.seek(0)
+                    frames.append(pd.read_csv(f, dtype=str, encoding='latin-1'))
+            except Exception as e:
+                st.error(f'Could not read **{f.name}**: {e}')
+        if frames:
+            combined = pd.concat(frames, ignore_index=True).dropna(how='all')
+            if (
+                st.session_state.sam_raw_df is None
+                or st.session_state.sam_from_api
+                or len(combined) != len(st.session_state.sam_raw_df)
+            ):
+                st.session_state.sam_raw_df        = combined
+                st.session_state.sam_screened_df   = None
+                st.session_state.sam_col_map       = None
+                st.session_state.sam_from_api      = False
+                st.session_state.sam_existing_keys = None
+
+# ── Tab: Fetch from API ────────────────────────────────────────────────────
+
+with tab_api:
+    sam_key = st.secrets.get('sam_gov_api_key')
+    if not sam_key:
+        st.warning(
+            'Add `sam_gov_api_key` to `.streamlit/secrets.toml` to use API fetch. '
+            'Register for a free key at **beta.sam.gov → Account Settings → API Keys**.'
+        )
+    else:
+        today_date   = datetime.today().date()
+        default_from = today_date - timedelta(days=30)
+
+        col_l, col_r = st.columns(2)
+        with col_l:
+            api_date_from = st.date_input('Posted from', value=default_from, key='sam_api_date_from')
+        with col_r:
+            api_date_to = st.date_input('Posted to', value=today_date, key='sam_api_date_to')
+
+        selected_type_labels = st.multiselect(
+            'Notice types',
+            list(_NOTICE_TYPE_OPTIONS.keys()),
+            default=['Solicitation', 'Presolicitation', 'Sources Sought'],
+            key='sam_api_notice_types',
+        )
+        selected_type_codes = [_NOTICE_TYPE_OPTIONS[lbl] for lbl in selected_type_labels]
+
+        api_keyword = st.text_input(
+            'Keyword filter (optional)',
+            placeholder='e.g. AI, biotech, cybersecurity',
+            key='sam_api_keyword',
+        )
+
+        col_l2, col_r2 = st.columns(2)
+        with col_l2:
+            api_max = st.number_input(
+                'Max results (0 = no cap)',
+                min_value=0,
+                value=500,
+                step=100,
+                key='sam_api_max',
+            )
+        with col_r2:
+            api_fetch_desc = st.checkbox(
+                'Fetch full descriptions',
+                value=True,
+                key='sam_api_fetch_desc',
+                help=(
+                    'Makes one additional API call per opportunity to retrieve the full '
+                    'synopsis text. Slower but significantly improves screening accuracy.'
+                ),
+            )
+
+        if api_date_from > api_date_to:
+            st.error('"Posted from" must be on or before "Posted to".')
+        elif st.button('🔍 Fetch from SAM.gov', type='primary', key='sam_api_fetch_btn'):
+            try:
+                items, total = _search_sam(
+                    api_key      = sam_key,
+                    date_from    = api_date_from.strftime('%m/%d/%Y'),
+                    date_to      = api_date_to.strftime('%m/%d/%Y'),
+                    notice_types = selected_type_codes,
+                    keyword      = api_keyword.strip(),
+                    max_results  = int(api_max),
+                )
+                if not items:
+                    st.warning(f'No active opportunities found for those filters (total records: {total:,}).')
+                else:
+                    st.caption(f'Found **{total:,}** total records; fetched **{len(items):,}**.')
+                    df_api, col_map_api = _items_to_df(items, sam_key, bool(api_fetch_desc))
+                    st.session_state.sam_raw_df        = df_api
+                    st.session_state.sam_col_map       = col_map_api
+                    st.session_state.sam_from_api      = True
+                    st.session_state.sam_screened_df   = None
+                    st.session_state.sam_existing_keys = None
+                    st.rerun()
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else '?'
+                if status == 403:
+                    st.error('SAM.gov API returned 403 — check that your API key is correct and active.')
+                elif status == 429:
+                    st.error('SAM.gov API rate limit reached — wait a moment and try again.')
+                else:
+                    st.error(f'SAM.gov API HTTP {status}: {exc}')
+            except Exception as exc:
+                st.error(f'Fetch failed: {exc}')
+
 
 if st.session_state.sam_raw_df is None:
     st.stop()
 
-df_raw = st.session_state.sam_raw_df
-file_count = len(files) if files else '(previously loaded)'
-st.caption(f'**{len(df_raw):,}** rows loaded from {file_count} file(s).')
+df_raw   = st.session_state.sam_raw_df
+from_api = bool(st.session_state.sam_from_api)
+src_label = 'API fetch' if from_api else (f'{len(files)} file(s)' if files else '(previously loaded)')
+st.caption(f'**{len(df_raw):,}** rows loaded from {src_label}.')
 st.dataframe(df_raw.head(5), hide_index=True, use_container_width=True)
 
-# ── Section 2 · Column mapping ─────────────────────────────────────────────
 
-st.divider()
-st.subheader('2 · Column mapping')
-st.caption('Confirm which columns map to each field — auto-detected where possible.')
+# ── Section 2 · Column mapping (CSV path only) ─────────────────────────────
 
-cols     = df_raw.columns.tolist()
-none_opt = '— none —'
-col_opts = [none_opt] + cols
+if not from_api:
+    st.divider()
+    st.subheader('2 · Column mapping')
+    st.caption('Confirm which columns map to each field — auto-detected where possible.')
 
+    cols     = df_raw.columns.tolist()
+    none_opt = '— none —'
+    col_opts = [none_opt] + cols
 
-def _sel(field: str, label: str, required: bool = False) -> str | None:
-    detected = _detect_col(cols, field)
-    idx      = col_opts.index(detected) if detected in col_opts else 0
-    val      = st.selectbox(
-        label + (' *' if required else ''),
-        col_opts,
-        index=idx,
-        key=f'sam_map_{field}',
-    )
-    return val if val != none_opt else None
+    def _sel(field: str, label: str, required: bool = False) -> str | None:
+        detected = _detect_col(cols, field)
+        idx      = col_opts.index(detected) if detected in col_opts else 0
+        val      = st.selectbox(
+            label + (' *' if required else ''),
+            col_opts,
+            index=idx,
+            key=f'sam_map_{field}',
+        )
+        return val if val != none_opt else None
 
+    left_col, right_col = st.columns(2)
+    with left_col:
+        m_title  = _sel('title',       'Title',              required=True)
+        m_desc   = _sel('description', 'Description',        required=True)
+        m_naics  = _sel('naics_desc',  'NAICS Descriptor')
+        m_notice = _sel('notice_id',   'Notice ID')
+    with right_col:
+        m_agency = _sel('agency',      'Agency / Department')
+        m_posted = _sel('posted_date', 'Posted Date')
+        m_dl     = _sel('deadline',    'Response Deadline')
 
-left_col, right_col = st.columns(2)
-with left_col:
-    m_title   = _sel('title',       'Title',              required=True)
-    m_desc    = _sel('description', 'Description',        required=True)
-    m_naics   = _sel('naics_desc',  'NAICS Descriptor')
-    m_notice  = _sel('notice_id',   'Notice ID')
-with right_col:
-    m_agency  = _sel('agency',      'Agency / Department')
-    m_posted  = _sel('posted_date', 'Posted Date')
-    m_dl      = _sel('deadline',    'Response Deadline')
+    col_map = {
+        'title':       m_title,
+        'description': m_desc,
+        'naics_desc':  m_naics,
+        'notice_id':   m_notice,
+        'agency':      m_agency,
+        'posted_date': m_posted,
+        'deadline':    m_dl,
+    }
 
-col_map = {
-    'title':       m_title,
-    'description': m_desc,
-    'naics_desc':  m_naics,
-    'notice_id':   m_notice,
-    'agency':      m_agency,
-    'posted_date': m_posted,
-    'deadline':    m_dl,
-}
+    if not m_title or not m_desc:
+        st.warning('Title and Description columns are required before proceeding.')
+        st.stop()
 
-if not m_title or not m_desc:
-    st.warning('Title and Description columns are required before proceeding.')
-    st.stop()
+else:
+    col_map  = st.session_state.sam_col_map
+    m_title  = col_map['title']
+    m_desc   = col_map['description']
+    m_naics  = col_map.get('naics_desc')
+    m_notice = col_map.get('notice_id')
+    m_agency = col_map.get('agency')
+    m_posted = col_map.get('posted_date')
+    m_dl     = col_map.get('deadline')
+
 
 # ── Section 3 · Screening ──────────────────────────────────────────────────
 
 st.divider()
 st.subheader('3 · Screen with Claude')
 
-n_rows    = len(df_raw)
-est_mins  = max(1, n_rows // 60)
-screened  = st.session_state.sam_screened_df
+n_rows   = len(df_raw)
+est_mins = max(1, n_rows // 60)
+screened = st.session_state.sam_screened_df
 
 if screened is None:
     st.caption(
@@ -389,9 +636,8 @@ if screened is None:
             st.error(f'Screening failed: {e}')
     st.stop()
 
-# Results are ready
-passing = screened[screened['_import'] == True].copy()
-failing = screened[screened['_import'] == False].copy()
+passing  = screened[screened['_import'] == True].copy()
+failing  = screened[screened['_import'] == False].copy()
 pass_pct = len(passing) / len(screened) * 100 if len(screened) > 0 else 0
 
 m1, m2, m3 = st.columns(3)
@@ -405,10 +651,10 @@ if st.button('↺ Re-run screening'):
 
 _display = [c for c in [m_title, m_desc, '_confidence', '_reason'] if c]
 _cfg = {
-    m_title:        st.column_config.TextColumn('Title',       width='medium'),
-    m_desc:         st.column_config.TextColumn('Description', width='large'),
-    '_confidence':  st.column_config.TextColumn('Confidence',  width='small'),
-    '_reason':      st.column_config.TextColumn('Reason',      width='large'),
+    m_title:       st.column_config.TextColumn('Title',       width='medium'),
+    m_desc:        st.column_config.TextColumn('Description', width='large'),
+    '_confidence': st.column_config.TextColumn('Confidence',  width='small'),
+    '_reason':     st.column_config.TextColumn('Reason',      width='large'),
 }
 
 with st.expander(f'✅ Passing ({len(passing)})', expanded=True):
@@ -433,6 +679,7 @@ with st.expander(f'❌ Filtered out ({len(failing)})', expanded=False):
             column_config=_cfg,
         )
 
+
 # ── Section 4 · Save ──────────────────────────────────────────────────────
 
 st.divider()
@@ -441,8 +688,6 @@ st.subheader('4 · Save to topic store')
 if passing.empty:
     st.warning('No passing rows to save — nothing to embed.')
     st.stop()
-
-# ── Load existing keys once per session ────────────────────────────────────
 
 if st.session_state.sam_existing_keys is None:
     with st.spinner('Checking existing records for duplicates…'):
@@ -455,7 +700,6 @@ if st.session_state.sam_existing_keys is None:
 
 existing_ids, existing_titles = st.session_state.sam_existing_keys
 
-# ── Apply deduplication ────────────────────────────────────────────────────
 
 def _is_dup(row: pd.Series) -> bool:
     if m_notice:
@@ -464,6 +708,7 @@ def _is_dup(row: pd.Series) -> bool:
     if str(row.get(m_title, '')).strip().lower() in existing_titles:
         return True
     return False
+
 
 dup_mask = passing.apply(_is_dup, axis=1)
 dupes    = passing[dup_mask]
@@ -496,9 +741,11 @@ if st.button('💾 Embed & Save', type='primary'):
     try:
         path = _embed_and_save(new_rows.reset_index(drop=True), col_map, oai_key, anth_key)
         st.success(f'Saved **{path}** — {len(new_rows)} topics ready for matching.')
-        st.session_state.sam_raw_df       = None
-        st.session_state.sam_screened_df  = None
+        st.session_state.sam_raw_df        = None
+        st.session_state.sam_screened_df   = None
         st.session_state.sam_existing_keys = None
+        st.session_state.sam_col_map       = None
+        st.session_state.sam_from_api      = None
         st.rerun()
     except Exception as e:
         st.error(f'Save failed: {e}')
