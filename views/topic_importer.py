@@ -43,19 +43,20 @@ For each topic, extract:
 - title: The verbatim title of the topic. If no explicit title exists, create a concise 8-10 word snippet from the start of the description.
 - description: The full verbatim description text for that topic. Include all technical requirements, objectives, and scope language. Do not truncate.
 - due_date: Any due date, close date, or submission deadline associated with the topic. Null if not present. Use ISO format YYYY-MM-DD if possible.
+- funding_amount: The award amount or funding range for this topic. Include the dollar sign and use the exact wording from the document (e.g., "$150,000", "$50,000-$250,000", "Up to $2,000,000"). Null if not stated.
 
 Return ONLY a valid JSON array. No preamble, no markdown, no backticks.
 CRITICAL: All string values must be properly JSON-escaped. Do NOT include literal newline characters inside JSON string values, use \\n instead.
 
 Example:
-[{"topic_number":"A24-001","title":"Autonomous UUV Navigation Systems","description":"Full verbatim description here.","due_date":"2024-09-15"}]
+[{"topic_number":"A24-001","title":"Autonomous UUV Navigation Systems","description":"Full verbatim description here.","due_date":"2024-09-15","funding_amount":"$150,000"}]
 
-If the document has a single global due date, apply it to all topics. Extract ALL topics.\
+If the document has a single global due date or funding amount, apply it to all topics. Extract ALL topics.\
 """
 
 _EXTRACT_MODEL = 'claude-sonnet-4-6'
 _EMBED_MODEL   = 'text-embedding-ada-002'
-_COL_ORDER     = ['topic_number', 'title', 'agency', 'source', 'due_date', 'scraped_at', 'description']
+_COL_ORDER     = ['topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount', 'scraped_at', 'description']
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -282,8 +283,9 @@ if st.session_state.topics_df is not None:
             'title':        st.column_config.TextColumn('Title',        width='medium'),
             'agency':       st.column_config.TextColumn('Agency',       width='small'),
             'source':       st.column_config.TextColumn('Source',       width='small'),
-            'due_date':     st.column_config.TextColumn('Due Date',     width='small'),
-            'scraped_at':   st.column_config.TextColumn('Scraped At',   width='small'),
+            'due_date':     st.column_config.TextColumn('Due Date',       width='small'),
+            'funding_amount':st.column_config.TextColumn('Funding Amount', width='small'),
+            'scraped_at':   st.column_config.TextColumn('Scraped At',    width='small'),
             'description':  st.column_config.TextColumn('Description',  width='large'),
         },
         hide_index=True,

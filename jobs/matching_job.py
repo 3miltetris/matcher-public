@@ -343,7 +343,7 @@ def main(config_blob_path: str) -> None:
     grant_embeddings = np.stack(topics_df['embeddings'].values).astype(np.float32)
     topics_df        = topics_df.drop(columns=['embeddings'])
 
-    grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'grant_summary']
+    grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'funding_amount', 'grant_summary']
     grant_meta = topics_df[[c for c in grant_cols if c in topics_df.columns]].reset_index(drop=True)
     del topics_df
     gc.collect()
