@@ -128,7 +128,7 @@ def generate_tech_summary(
     word_limit: int,
     anth_client: Anthropic,
     max_tokens: int = 50,
-    model: str = "claude-3-haiku-20240307",
+    model: str = "claude-haiku-4-5-20251001",
 ) -> str:
     system = (
         f"Generate a summary of no more than {str(word_limit)} words about what this company "
@@ -207,7 +207,7 @@ async def async_josiah_copy(
     grant_summary: str,
     word_limit: int,
     anth_client: AsyncAnthropic,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-haiku-4-5-20251001",
 ) -> str:
     """Async version of josiah_copy."""
     system = (
@@ -253,7 +253,7 @@ def josiah_copy(
     grant_summary: str,
     word_limit: int,
     anth_client: Anthropic,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-haiku-4-5-20251001",
 ) -> str:
     system = (
         f"You're a human grants consultant writing a personalized cold email. "
