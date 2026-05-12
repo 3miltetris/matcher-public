@@ -112,7 +112,7 @@ def _extract_topics(text: str, anth_key: str) -> list[dict]:
 
 def _build_df(topics: list[dict], sub_agency: str, source: str = '') -> pd.DataFrame:
     df = pd.DataFrame(topics)
-    for col in ['topic_number', 'title', 'description', 'due_date']:
+    for col in ['topic_number', 'title', 'description', 'due_date', 'funding_amount']:
         if col not in df.columns:
             df[col] = None
     df['agency']     = sub_agency
