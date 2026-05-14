@@ -57,7 +57,7 @@ def _build_prompt(row: pd.Series, source: str = 'grant') -> tuple[str, str]:
 def analyze_matches_anthropic(
     matches: pd.DataFrame,
     anth_client: Anthropic,
-    model: str = 'claude-3-haiku-20240307',
+    model: str = 'claude-haiku-4-5-20251001',
     source: str = 'grant',
 ) -> pd.DataFrame:
     """
@@ -140,7 +140,7 @@ def analyze_matches_dual(
     matches: pd.DataFrame,
     anth_client: Anthropic,
     openai_client: OpenAI,
-    anthropic_model: str = 'claude-3-haiku-20240307',
+    anthropic_model: str = 'claude-haiku-4-5-20251001',
     openai_model: str = 'gpt-4o-2024-05-13',
     source: str = 'grant',
 ) -> pd.DataFrame:
@@ -189,7 +189,7 @@ def analyze_matches_dual(
 async def analyze_matches_async(
     matches: pd.DataFrame,
     anth_client_async: AsyncAnthropic,
-    model: str = 'claude-3-haiku-20240307',
+    model: str = 'claude-haiku-4-5-20251001',
     source: str = 'grant',
     batch_size: int = 100,
     max_retries: int = 10_000,
@@ -315,7 +315,7 @@ PIVOT_NOTE_SYSTEM = (
 async def analyze_pivot_async(
     matches: pd.DataFrame,
     anth_client_async: AsyncAnthropic,
-    model: str = 'claude-3-haiku-20240307',
+    model: str = 'claude-haiku-4-5-20251001',
     batch_size: int = 100,
     max_retries: int = 10_000,
     inter_batch_delay: float = 2.0,

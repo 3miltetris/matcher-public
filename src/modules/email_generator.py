@@ -7,6 +7,36 @@ from anthropic import Anthropic, AsyncAnthropic, InternalServerError
 from openai import AsyncOpenAI, OpenAI
 
 
+# ── Default system prompt templates (use {word_limit} as a placeholder) ───────
+
+DEFAULT_SUBJECT_SYSTEM = (
+    "Generate a subject line for a cold email that is no more than {word_limit} words "
+    "that summarizes what this company's area of research, products, etc. is. "
+    "Just focus on the technologies and research areas. Ignore investing, finance, etc. "
+    'The format should be like this: "Grant for {summary} - {agency}"'
+)
+
+DEFAULT_JOSIAH_SYSTEM = (
+    "You're a human grants consultant writing a personalized cold email. "
+    "Write ONE natural sentence ({word_limit} words max) using this structure:\n\n"
+    '"They are looking for [specific grant focus] and [natural connection to company]"\n\n'
+    "CRITICAL: The first part states what they're looking for (can be a list). "
+    "The second part connects to the company naturally WITHOUT parallel structure.\n\n"
+    "Human writing rules for the second part:\n"
+    "- Don't mirror the list structure from the first part\n"
+    "- Use specific product/tech names, not generic categories\n"
+    '- Add natural language: "looks like", "seems like", "from what I can tell", "it appears"\n'
+    "- Use dashes or parentheses to break up rhythm\n"
+    "- Focus on the strongest overlap, not everything\n\n"
+    'Bad (robotic parallel): "They are looking for X, Y, and Z and it seems you are doing A, B, and C"\n'
+    'Good (natural): "They are looking for autonomous UAS operations, payload capabilities, and powertrain '
+    'enhancements and it looks like your heavy-lift platform with the modular engine system is exactly that"\n'
+    'Good (natural): "They are looking for COTS UAS modifications including ruggedization and secure software '
+    "and from what I can tell, you're doing custom UAS builds - particularly the ruggedized variants for "
+    'defense applications"'
+)
+
+
 # ── In-memory subject line cache (persists for the duration of the session) ──
 # Key: md5(company_summary + agency), Value: generated subject line string
 _subject_line_cache: dict[str, str] = {}
@@ -153,18 +183,15 @@ async def async_generate_subject_line(
     anth_client: AsyncAnthropic,
     word_limit: int = 15,
     max_retries: int = 3,
+    system_override: str | None = None,
 ) -> str:
     """Async version of generate_subject_line — OpenAI first, Anthropic fallback."""
     cache_key = hashlib.md5(f"{company_summary}||{agency}".encode()).hexdigest()
     if cache_key in _subject_line_cache:
         return _subject_line_cache[cache_key]
 
-    system = (
-        f"Generate a subject line for a cold email that is no more than {word_limit} words "
-        f"that summarizes what this company's area of research, products, etc. is. "
-        f"Just focus on the technologies and research areas. Ignore investing, finance, etc. "
-        f'The format should be like this: "Grant for {{summary}} - {{agency}}"'
-    )
+    template = system_override if system_override else DEFAULT_SUBJECT_SYSTEM
+    system = template.replace('{word_limit}', str(word_limit))
     text = f"company summary:{company_summary}, agency: {agency}"
 
     for attempt in range(max_retries):
@@ -208,27 +235,11 @@ async def async_josiah_copy(
     word_limit: int,
     anth_client: AsyncAnthropic,
     model: str = "claude-haiku-4-5-20251001",
+    system_override: str | None = None,
 ) -> str:
     """Async version of josiah_copy."""
-    system = (
-        f"You're a human grants consultant writing a personalized cold email. "
-        f"Write ONE natural sentence ({word_limit} words max) using this structure:\n\n"
-        f'"They are looking for [specific grant focus] and [natural connection to company]"\n\n'
-        f"CRITICAL: The first part states what they're looking for (can be a list). "
-        f"The second part connects to the company naturally WITHOUT parallel structure.\n\n"
-        f"Human writing rules for the second part:\n"
-        f"- Don't mirror the list structure from the first part\n"
-        f"- Use specific product/tech names, not generic categories\n"
-        f'- Add natural language: "looks like", "seems like", "from what I can tell", "it appears"\n'
-        f"- Use dashes or parentheses to break up rhythm\n"
-        f"- Focus on the strongest overlap, not everything\n\n"
-        f'Bad (robotic parallel): "They are looking for X, Y, and Z and it seems you are doing A, B, and C"\n'
-        f'Good (natural): "They are looking for autonomous UAS operations, payload capabilities, and powertrain '
-        f"enhancements and it looks like your heavy-lift platform with the modular engine system is exactly that\"\n"
-        f'Good (natural): "They are looking for COTS UAS modifications including ruggedization and secure software '
-        f"and from what I can tell, you're doing custom UAS builds - particularly the ruggedized variants for "
-        f'defense applications"'
-    )
+    template = system_override if system_override else DEFAULT_JOSIAH_SYSTEM
+    system = template.replace('{word_limit}', str(word_limit))
     for attempt in range(5):
         try:
             message = await anth_client.messages.create(
@@ -246,6 +257,33 @@ async def async_josiah_copy(
             else:
                 raise
     raise RuntimeError('async_josiah_copy failed after all retries')
+
+
+async def async_custom_prompt(
+    text: str,
+    system: str,
+    anth_client: AsyncAnthropic,
+    model: str = 'claude-haiku-4-5-20251001',
+    max_tokens: int = 500,
+) -> str:
+    """Run a custom system prompt against assembled column text."""
+    for attempt in range(5):
+        try:
+            message = await anth_client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=0.7,
+                system=system,
+                messages=[{'role': 'user', 'content': [{'type': 'text', 'text': text}]}],
+            )
+            return message.content[0].text
+        except Exception as e:
+            err = str(e)
+            if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):
+                await asyncio.sleep((2 ** attempt) + random.random())
+            else:
+                raise
+    raise RuntimeError('async_custom_prompt failed after all retries')
 
 
 def josiah_copy(

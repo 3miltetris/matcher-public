@@ -22,6 +22,8 @@ import streamlit as st
 from google.cloud import run_v2, storage
 from google.oauth2 import service_account
 
+from src.modules.email_generator import DEFAULT_SUBJECT_SYSTEM, DEFAULT_JOSIAH_SYSTEM
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 _BUCKET             = 'cc-matcher-bucket-jeg-v1'
@@ -32,6 +34,14 @@ _JOB_CONFIGS_PREFIX = 'job-configs/'
 _MIN_THRESHOLD      = 0.82
 _JOB_NAME           = 'projects/cc-matcher-v1/locations/us-central1/jobs/matching-job'
 _POLL_INTERVAL      = 8  # seconds between status checks
+
+# All columns available in a matched row — used for custom prompt column picker
+_ALL_COLUMNS = [
+    'company_summary', 'companyName', 'companyWebsite',
+    'firstName', 'lastName', 'email', 'source',
+    'grant_summary', 'title', 'topic_number',
+    'agency', 'broad_agency', 'due_date', 'funding_amount',
+]
 
 
 # ── GCS / auth helpers ────────────────────────────────────────────────────────
@@ -130,6 +140,8 @@ for _k in ['bm_active_run', 'bm_run_summary', 'bm_topics_df']:
         st.session_state[_k] = None
 if 'bm_filters' not in st.session_state:
     st.session_state.bm_filters = [{'column': None, 'keyword': '', 'operator': 'AND'}]
+if 'bm_custom_prompts' not in st.session_state:
+    st.session_state.bm_custom_prompts = []
 
 
 # ── Page ──────────────────────────────────────────────────────────────────────
@@ -288,11 +300,130 @@ with opt_left:
     top_k = st.number_input(
         'Top-K topics per contact',
         min_value=1, max_value=50,
-        value=5, step=1,
+        value=1, step=1,
     )
 with opt_mid:
     ai_validation  = st.checkbox('AI validation',  value=True)
     prewrite_email = st.checkbox('Pre-write email', value=False)
+
+# ── Email pre-write settings ──────────────────────────────────────────────────
+
+email_config: dict = {}
+
+if prewrite_email:
+    with st.expander('Email pre-write settings', expanded=True):
+
+        # ── Subject line ──────────────────────────────────────────────────
+        st.markdown('**Subject line**')
+        st.caption('Input columns used: `company_summary`, `agency`')
+        sl_left, sl_right = st.columns([4, 1])
+        with sl_left:
+            subj_prompt = st.text_area(
+                'Prompt template',
+                value=DEFAULT_SUBJECT_SYSTEM,
+                height=110,
+                key='bm_subj_prompt',
+                help='Use `{word_limit}` anywhere in the prompt — it will be replaced with the word count at runtime.',
+            )
+        with sl_right:
+            subj_word_limit = st.number_input(
+                'Word limit', min_value=1, max_value=200,
+                value=15, step=1, key='bm_subj_wl',
+            )
+
+        st.divider()
+
+        # ── AI message ────────────────────────────────────────────────────
+        st.markdown('**AI message**')
+        st.caption('Input columns used: `company_summary`, `grant_summary`')
+        msg_left, msg_right = st.columns([4, 1])
+        with msg_left:
+            msg_prompt = st.text_area(
+                'Prompt template',
+                value=DEFAULT_JOSIAH_SYSTEM,
+                height=160,
+                key='bm_msg_prompt',
+                help='Use `{word_limit}` anywhere in the prompt — it will be replaced with the word count at runtime.',
+            )
+        with msg_right:
+            msg_word_limit = st.number_input(
+                'Word limit', min_value=1, max_value=500,
+                value=50, step=1, key='bm_msg_wl',
+            )
+
+        st.divider()
+
+        # ── Custom prompts ────────────────────────────────────────────────
+        st.markdown('**Custom prompts**')
+
+        for ci, cp in enumerate(st.session_state.bm_custom_prompts):
+            with st.container(border=True):
+                hdr_a, hdr_b, hdr_c = st.columns([2, 1, 0.3])
+                with hdr_a:
+                    cp['output_column'] = st.text_input(
+                        'Output column name',
+                        value=cp.get('output_column', f'custom_{ci + 1}'),
+                        key=f'bm_cp_name_{ci}',
+                        placeholder='e.g. tech_summary',
+                    )
+                with hdr_b:
+                    cp['word_limit'] = st.number_input(
+                        'Word limit', min_value=1, max_value=500,
+                        value=cp.get('word_limit', 30), step=1,
+                        key=f'bm_cp_wl_{ci}',
+                    )
+                with hdr_c:
+                    st.write('')
+                    if st.button('✕', key=f'bm_cp_rm_{ci}'):
+                        st.session_state.bm_custom_prompts.pop(ci)
+                        st.rerun()
+
+                cp['columns'] = st.multiselect(
+                    'Input columns',
+                    options=_ALL_COLUMNS,
+                    default=cp.get('columns', ['company_summary', 'grant_summary']),
+                    key=f'bm_cp_cols_{ci}',
+                )
+                cp['system'] = st.text_area(
+                    'Prompt template',
+                    value=cp.get('system', ''),
+                    height=120,
+                    key=f'bm_cp_sys_{ci}',
+                    placeholder='Describe what you want the AI to write…',
+                    help='Use `{word_limit}` anywhere in the prompt — it will be replaced with the word count at runtime.',
+                )
+
+        if st.button('+ Add custom prompt', key='bm_add_cp'):
+            st.session_state.bm_custom_prompts.append({
+                'output_column': f'custom_{len(st.session_state.bm_custom_prompts) + 1}',
+                'columns': ['company_summary', 'grant_summary'],
+                'system': '',
+                'word_limit': 30,
+            })
+            st.rerun()
+
+    email_config = {
+        'subject_line': {
+            'system':     subj_prompt,
+            'word_limit': int(subj_word_limit),
+        },
+        'ai_message': {
+            'system':     msg_prompt,
+            'word_limit': int(msg_word_limit),
+        },
+        'custom_prompts': [
+            {
+                'output_column': cp['output_column'],
+                'columns':       cp['columns'],
+                'system':        cp['system'],
+                'word_limit':    int(cp['word_limit']),
+            }
+            for cp in st.session_state.bm_custom_prompts
+            if cp.get('output_column', '').strip() and cp.get('system', '').strip()
+        ],
+    }
+
+# ── Run button ────────────────────────────────────────────────────────────────
 
 can_run = bool(selected_sources) and bool(selected_agencies)
 
@@ -317,6 +448,7 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
         'topic_filters':  active_filters,
         'ai_validation':  ai_validation,
         'prewrite_email': prewrite_email,
+        'email_config':   email_config,
     }
     try:
         with st.spinner('Uploading job config to GCS…'):

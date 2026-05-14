@@ -33,7 +33,7 @@ from google.cloud import storage
 from openai import AsyncOpenAI
 
 # ── src modules are on the path because the Dockerfile sets PYTHONPATH ────────
-from src.modules.email_generator import async_generate_subject_line, async_josiah_copy
+from src.modules.email_generator import async_generate_subject_line, async_josiah_copy, async_custom_prompt
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -166,25 +166,44 @@ async def _generate_email_batch(
     rows: list[tuple[int, dict]],
     openai_key: str,
     anth_key: str,
-) -> list[tuple[int, str, str]]:
+    email_config: dict,
+) -> list[tuple[int, dict]]:
+    subject_cfg    = email_config.get('subject_line', {})
+    message_cfg    = email_config.get('ai_message', {})
+    custom_prompts = email_config.get('custom_prompts', [])
+
     async with AsyncOpenAI(api_key=openai_key) as oai, \
                AsyncAnthropic(api_key=anth_key) as anth:
-        async def _one(idx: int, row: dict) -> tuple[int, str, str]:
+        async def _one(idx: int, row: dict) -> tuple[int, dict]:
             subject, body = await asyncio.gather(
                 async_generate_subject_line(
                     company_summary=str(row.get('company_summary', '') or ''),
                     agency=str(row.get('agency', row.get('broad_agency', '')) or ''),
                     openai_client=oai,
                     anth_client=anth,
+                    word_limit=subject_cfg.get('word_limit', 15),
+                    system_override=subject_cfg.get('system') or None,
                 ),
                 async_josiah_copy(
                     company_summary=str(row.get('company_summary', '') or ''),
                     grant_summary=str(row.get('grant_summary', '') or ''),
-                    word_limit=50,
+                    word_limit=message_cfg.get('word_limit', 50),
                     anth_client=anth,
+                    system_override=message_cfg.get('system') or None,
                 ),
             )
-            return idx, subject, body
+            outputs: dict = {'subject_line': subject, 'ai_message': body}
+            for cp in custom_prompts:
+                col_text = '\n'.join(
+                    f"{col}: {str(row.get(col, '') or '')}"
+                    for col in cp.get('columns', [])
+                )
+                outputs[cp['output_column']] = await async_custom_prompt(
+                    text=col_text,
+                    system=cp['system'],
+                    anth_client=anth,
+                )
+            return idx, outputs
 
         return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
 
@@ -201,6 +220,7 @@ def _flush_segment(
     anth_key: str,
     openai_key: str,
     seen_websites: dict[str, str],
+    email_config: dict,
 ) -> int:
     """
     Build DataFrame from rows, validate, optionally generate emails,
@@ -271,18 +291,19 @@ def _flush_segment(
     # ── Email pre-write ────────────────────────────────────────────────────
     if prewrite_email:
         segment = segment.copy()
-        segment['subject_line'] = None
-        segment['ai_message']   = None
+        custom_cols = [cp['output_column'] for cp in email_config.get('custom_prompts', [])]
+        for col in ['subject_line', 'ai_message'] + custom_cols:
+            segment[col] = None
 
         email_rows = [(idx, row.to_dict()) for idx, row in segment.iterrows()]
         total      = len(email_rows)
 
         for i in range(0, total, _EMAIL_BATCH):
             batch   = email_rows[i : i + _EMAIL_BATCH]
-            results = asyncio.run(_generate_email_batch(batch, openai_key, anth_key))
-            for idx, subject, body in results:
-                segment.at[idx, 'subject_line'] = subject
-                segment.at[idx, 'ai_message']   = body
+            results = asyncio.run(_generate_email_batch(batch, openai_key, anth_key, email_config))
+            for idx, outputs in results:
+                for col, val in outputs.items():
+                    segment.at[idx, col] = val
             done = i + len(batch)
             print(f'  segment {seg_num} · emails {done}/{total}', flush=True)
 
@@ -319,6 +340,7 @@ def main(config_blob_path: str) -> None:
     topic_filters   = config.get('topic_filters', [])
     ai_validation   = bool(config.get('ai_validation', True))
     prewrite_email  = bool(config.get('prewrite_email', False))
+    email_config    = config.get('email_config', {})
     results_prefix  = f'{_RESULTS_PREFIX}{run_id}/'
 
     # ── Secrets ────────────────────────────────────────────────────────────
@@ -414,6 +436,7 @@ def main(config_blob_path: str) -> None:
                         anth_key       = anth_key,
                         openai_key     = openai_key,
                         seen_websites  = seen_websites,
+                        email_config   = email_config,
                     )
                     total_saved  += saved
                     match_buffer  = match_buffer[_SEGMENT_SIZE:]
@@ -437,6 +460,7 @@ def main(config_blob_path: str) -> None:
             anth_key       = anth_key,
             openai_key     = openai_key,
             seen_websites  = seen_websites,
+            email_config   = email_config,
         )
         total_saved += saved
 
