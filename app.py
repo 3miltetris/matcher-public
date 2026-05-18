@@ -22,7 +22,8 @@ pages = [
     st.Page("views/grant_search.py",   title="Grant Search",   icon="🔍"),
     st.Page("views/bulk_matching.py",  title="Bulk Matching",  icon="⚙️"),
 
-    st.Page("views/sam_gov_upload.py",  title="SAM.gov Upload", icon="🏛️"),
+    st.Page("views/sam_gov_upload.py",    title="SAM.gov Upload",   icon="🏛️"),
+    st.Page("views/grants_gov_fetch.py", title="Grants.gov Fetch", icon="🏦"),
     st.Page("views/hubspot_import.py", title="HubSpot Import", icon="🔗"),
     st.Page("views/suggestions.py",    title="Suggestions",    icon="💡"),
     # Uncomment as pages are built:
