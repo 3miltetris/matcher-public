@@ -48,6 +48,14 @@ _CUSTOM_PROPS: dict[str, tuple[str, str, str, str]] = {
     'ai_message':    ('matcher_ai_message',    'Matcher AI Message',    'string', 'textarea'),
 }
 
+_KNOWN_COLS    = frozenset([src for src, _, _ in _STANDARD_COLS] + list(_CUSTOM_PROPS.keys()))
+_IMPORT_EXCLUDE = frozenset({'embeddings', 'uuid'})
+
+
+def _col_to_label(col: str) -> str:
+    return col.replace('_', ' ').title()
+
+
 for _k in ['hs_import_id', 'hs_import_rows', 'hs_df', 'hs_run_id']:
     if _k not in st.session_state:
         st.session_state[_k] = None
@@ -99,7 +107,11 @@ def _load_run(client: storage.Client, run_id: str) -> pd.DataFrame:
 
 # ── HubSpot helpers ───────────────────────────────────────────────────────────
 
-def _submit_import(df: pd.DataFrame, run_id: str) -> tuple[str, int]:
+def _submit_import(
+    df: pd.DataFrame,
+    run_id: str,
+    extra_col_map: dict[str, str] | None = None,
+) -> tuple[str, int]:
     """
     Build a deduplicated contacts CSV and submit to HubSpot imports API.
     Returns (import_id, row_count).
@@ -107,6 +119,9 @@ def _submit_import(df: pd.DataFrame, run_id: str) -> tuple[str, int]:
     # Build full column map: standard props + any custom props present in the DataFrame
     col_map = [(src, hs, id_type) for src, hs, id_type in _STANDARD_COLS if src in df.columns]
     for csv_col, (hs_name, _label, _type, _field) in _CUSTOM_PROPS.items():
+        if csv_col in df.columns:
+            col_map.append((csv_col, hs_name, None))
+    for csv_col, hs_name in (extra_col_map or {}).items():
         if csv_col in df.columns:
             col_map.append((csv_col, hs_name, None))
 
@@ -164,7 +179,7 @@ def _submit_import(df: pd.DataFrame, run_id: str) -> tuple[str, int]:
     return str(resp.json()['id']), len(export)
 
 
-def _ensure_properties() -> list[str]:
+def _ensure_properties(extra_props: dict[str, tuple] | None = None) -> list[str]:
     """
     Create any missing custom company properties in HubSpot.
     Returns a list of property names that were created.
@@ -181,7 +196,11 @@ def _ensure_properties() -> list[str]:
     existing = {p['name'] for p in resp.json().get('results', [])}
     created  = []
 
-    for _csv_col, (hs_name, label, prop_type, field_type) in _CUSTOM_PROPS.items():
+    all_props = dict(_CUSTOM_PROPS)
+    if extra_props:
+        all_props.update(extra_props)
+
+    for _csv_col, (hs_name, label, prop_type, field_type) in all_props.items():
         if hs_name in existing:
             continue
         create_resp = requests.post(
@@ -329,20 +348,49 @@ import_cols = [c for c in all_mapped_cols if c in df.columns]
 st.caption(f'Columns that will be imported: `{"`, `".join(import_cols)}`')
 st.dataframe(df[import_cols].head(50), use_container_width=True, hide_index=True)
 
+# ── Optional custom columns ───────────────────────────────────────────────────
+
+extra_df_cols = [
+    c for c in df.columns
+    if c not in _KNOWN_COLS
+    and c not in _IMPORT_EXCLUDE
+    and not c.startswith('_')
+]
+
+selected_extras: dict[str, tuple] = {}
+if extra_df_cols:
+    st.divider()
+    st.subheader('Optional custom columns')
+    st.caption(
+        'These columns were added during topic import and are not part of the standard HubSpot property set. '
+        'Check the ones you want to include — HubSpot properties will be created automatically.'
+    )
+    for col in extra_df_cols:
+        hs_name = f'matcher_{col}'
+        if st.checkbox(
+            f'`{col}` → `{hs_name}`',
+            value=True,
+            key=f'hs_extra_{col}',
+            help=f'Creates HubSpot company property `{hs_name}` (label: "{_col_to_label(col)}") if it does not exist.',
+        ):
+            selected_extras[col] = (hs_name, _col_to_label(col), 'string', 'text')
+
 # ── Import ────────────────────────────────────────────────────────────────────
 
 st.divider()
 if not st.button('▶ Import to HubSpot', type='primary'):
     st.stop()
 
+extra_col_map_flat = {csv_col: tup[0] for csv_col, tup in selected_extras.items()}
+
 try:
     with st.spinner('Ensuring HubSpot custom properties exist…'):
-        created_props = _ensure_properties()
+        created_props = _ensure_properties(extra_props=selected_extras or None)
     if created_props:
         st.info(f'Created {len(created_props)} new HubSpot property/ies: `{"`, `".join(created_props)}`')
 
     with st.spinner('Building CSV and submitting to HubSpot…'):
-        import_id, row_count = _submit_import(df, run_id)
+        import_id, row_count = _submit_import(df, run_id, extra_col_map=extra_col_map_flat or None)
 
     st.session_state.hs_import_id   = import_id
     st.session_state.hs_import_rows = row_count

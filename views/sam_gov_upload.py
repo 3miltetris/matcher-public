@@ -345,6 +345,11 @@ def _run_screening(df: pd.DataFrame, col_map: dict, anth_key: str) -> pd.DataFra
     return out
 
 
+_SAM_RESERVED_COLS = frozenset({
+    'topic_number', 'agency', 'title', 'description', 'open_date', 'close_date',
+    'scraped_at', 'sam_confidence', 'sam_reason', 'grant_summary', 'embeddings',
+})
+
 # ── Existing-record dedup ──────────────────────────────────────────────────
 
 def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
@@ -366,7 +371,13 @@ def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
 
 # ── Embed + save ───────────────────────────────────────────────────────────
 
-def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str, anth_key: str) -> str:
+def _embed_and_save(
+    df: pd.DataFrame,
+    col_map: dict,
+    oai_key: str,
+    anth_key: str,
+    extra_cols: dict[str, str] | None = None,
+) -> str:
     tp    = TextProcessor(api_key=oai_key)
     bm    = BucketManager(_BUCKET, client=_get_storage_client())
     today = datetime.today().strftime('%Y-%m-%d')
@@ -397,6 +408,10 @@ def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str, anth_key: str
 
     out['embeddings'] = embeddings
 
+    if extra_cols:
+        for col_name, col_val in extra_cols.items():
+            out[col_name] = col_val
+
     hex_suffix = secrets.token_hex(3)
     gcs_path   = f'{_SAM_PREFIX}sam_gov_{today}_{hex_suffix}.parquet'
     bm.upload_file(gcs_path, out)
@@ -408,6 +423,8 @@ def _embed_and_save(df: pd.DataFrame, col_map: dict, oai_key: str, anth_key: str
 for _k in ['sam_raw_df', 'sam_screened_df', 'sam_existing_keys', 'sam_col_map', 'sam_from_api']:
     if _k not in st.session_state:
         st.session_state[_k] = None
+if 'sam_custom_cols' not in st.session_state:
+    st.session_state.sam_custom_cols = []
 
 
 # ── Page ───────────────────────────────────────────────────────────────────
@@ -456,6 +473,7 @@ with tab_csv:
                 st.session_state.sam_col_map       = None
                 st.session_state.sam_from_api      = False
                 st.session_state.sam_existing_keys = None
+                st.session_state.sam_custom_cols   = []
 
 # ── Tab: Fetch from API ────────────────────────────────────────────────────
 
@@ -532,6 +550,7 @@ with tab_api:
                     st.session_state.sam_from_api      = True
                     st.session_state.sam_screened_df   = None
                     st.session_state.sam_existing_keys = None
+                    st.session_state.sam_custom_cols   = []
                     st.rerun()
             except requests.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else '?'
@@ -730,6 +749,54 @@ if new_rows.empty:
     st.success('All passing rows are already in the store — nothing new to save.')
     st.stop()
 
+with st.expander('➕ Custom columns', expanded=bool(st.session_state.sam_custom_cols)):
+    st.caption(
+        'Add extra columns to tag every saved topic with campaign-specific metadata. '
+        'Columns are saved to the parquet and available as optional fields in HubSpot import.'
+    )
+
+    for entry in list(st.session_state.sam_custom_cols):
+        sc1, sc2, sc3 = st.columns([2, 4, 1])
+        with sc1:
+            st.text(entry['name'])
+        with sc2:
+            entry['value'] = st.text_input(
+                'Value', value=entry['value'],
+                key=f'scfill_{entry["name"]}', label_visibility='collapsed',
+            )
+        with sc3:
+            if st.button('✕', key=f'scrm_{entry["name"]}', use_container_width=True):
+                st.session_state.sam_custom_cols = [
+                    e for e in st.session_state.sam_custom_cols if e['name'] != entry['name']
+                ]
+                st.rerun()
+
+    if st.session_state.sam_custom_cols:
+        st.divider()
+
+    sna1, sna2, sna3 = st.columns([2, 4, 1])
+    with sna1:
+        new_sc_name = st.text_input(
+            'Column name', placeholder='e.g. campaign_name',
+            key='new_sc_name', label_visibility='collapsed',
+        )
+    with sna2:
+        new_sc_val = st.text_input(
+            'Value', placeholder='e.g. Spring 2026',
+            key='new_sc_val', label_visibility='collapsed',
+        )
+    with sna3:
+        if st.button('Add', key='add_sc_btn', use_container_width=True):
+            clean = new_sc_name.strip().replace(' ', '_').lower()
+            existing_names = {e['name'] for e in st.session_state.sam_custom_cols}
+            if (
+                clean
+                and clean not in _SAM_RESERVED_COLS
+                and clean not in existing_names
+            ):
+                st.session_state.sam_custom_cols.append({'name': clean, 'value': new_sc_val.strip()})
+                st.rerun()
+
 st.caption(
     f'**{len(new_rows)}** new rows will be embedded (`text-embedding-ada-002`) and saved to '
     f'`{_SAM_PREFIX}sam_gov_{{date}}_{{hex}}.parquet`.'
@@ -738,14 +805,16 @@ st.caption(
 if st.button('💾 Embed & Save', type='primary'):
     oai_key  = st.secrets['openai_api_key']
     anth_key = st.secrets['anthropic_api_key']
+    extra_cols_dict = {e['name']: e['value'] for e in st.session_state.sam_custom_cols} or None
     try:
-        path = _embed_and_save(new_rows.reset_index(drop=True), col_map, oai_key, anth_key)
+        path = _embed_and_save(new_rows.reset_index(drop=True), col_map, oai_key, anth_key, extra_cols=extra_cols_dict)
         st.success(f'Saved **{path}** — {len(new_rows)} topics ready for matching.')
         st.session_state.sam_raw_df        = None
         st.session_state.sam_screened_df   = None
         st.session_state.sam_existing_keys = None
         st.session_state.sam_col_map       = None
         st.session_state.sam_from_api      = None
+        st.session_state.sam_custom_cols   = []
         st.rerun()
     except Exception as e:
         st.error(f'Save failed: {e}')

@@ -57,6 +57,10 @@ If the document has a single global due date or funding amount, apply it to all 
 _EXTRACT_MODEL = 'claude-sonnet-4-6'
 _EMBED_MODEL   = 'text-embedding-ada-002'
 _COL_ORDER     = ['topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount', 'scraped_at', 'description']
+_RESERVED_COLS = frozenset({
+    'topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount',
+    'scraped_at', 'description', 'embeddings', 'grant_summary',
+})
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -153,6 +157,8 @@ if 'topics_df' not in st.session_state:
     st.session_state.topics_df = None
 if 'save_results' not in st.session_state:
     st.session_state.save_results = []
+if 'topic_custom_cols' not in st.session_state:
+    st.session_state.topic_custom_cols = []
 
 
 # ── Page ───────────────────────────────────────────────────────────────────
@@ -229,8 +235,9 @@ if extract_btn:
         if not topics:
             st.warning('No topics found in the document.')
         else:
-            st.session_state.topics_df   = _build_df(topics, sub_agency_input.strip(), source_input.strip())
-            st.session_state.save_results = []
+            st.session_state.topics_df        = _build_df(topics, sub_agency_input.strip(), source_input.strip())
+            st.session_state.save_results      = []
+            st.session_state.topic_custom_cols = []
             st.success(f'Extracted **{len(topics)}** topic(s). Review and edit below.')
 
 # ── Section 2 · Review & edit ──────────────────────────────────────────────
@@ -293,6 +300,70 @@ if st.session_state.topics_df is not None:
     )
     # Persist edits so "Apply to all rows" and Save see the latest table state
     st.session_state.topics_df = edited_df
+
+    # ── Custom columns ──────────────────────────────────────────────────────
+
+    with st.expander('➕ Custom columns', expanded=bool(st.session_state.topic_custom_cols)):
+        st.caption(
+            'Add extra columns to tag every topic with campaign-specific metadata. '
+            'Columns are saved to the parquet and available as optional fields in HubSpot import.'
+        )
+
+        for col_name in list(st.session_state.topic_custom_cols):
+            cc1, cc2, cc3, cc4 = st.columns([2, 3, 2, 1])
+            with cc1:
+                st.text(col_name)
+            with cc2:
+                cur_val = (
+                    str(st.session_state.topics_df[col_name].iloc[0])
+                    if col_name in st.session_state.topics_df.columns and len(st.session_state.topics_df) > 0
+                    else ''
+                )
+                fill_v = st.text_input(
+                    'Value', value=cur_val,
+                    key=f'ccfill_{col_name}', label_visibility='collapsed',
+                )
+            with cc3:
+                if st.button('Apply to all', key=f'ccapply_{col_name}', use_container_width=True):
+                    _df = st.session_state.topics_df.copy()
+                    _df[col_name] = fill_v
+                    st.session_state.topics_df = _df
+                    st.rerun()
+            with cc4:
+                if st.button('✕', key=f'ccrm_{col_name}', use_container_width=True):
+                    _df = st.session_state.topics_df.copy()
+                    _df = _df.drop(columns=[col_name], errors='ignore')
+                    st.session_state.topics_df = _df
+                    st.session_state.topic_custom_cols.remove(col_name)
+                    st.rerun()
+
+        if st.session_state.topic_custom_cols:
+            st.divider()
+
+        na1, na2, na3 = st.columns([2, 3, 1])
+        with na1:
+            new_cc_name = st.text_input(
+                'Column name', placeholder='e.g. campaign_name',
+                key='new_cc_name', label_visibility='collapsed',
+            )
+        with na2:
+            new_cc_val = st.text_input(
+                'Default value', placeholder='e.g. Spring 2026',
+                key='new_cc_val', label_visibility='collapsed',
+            )
+        with na3:
+            if st.button('Add', key='add_cc_btn', use_container_width=True):
+                clean = new_cc_name.strip().replace(' ', '_').lower()
+                if (
+                    clean
+                    and clean not in _RESERVED_COLS
+                    and clean not in st.session_state.topic_custom_cols
+                ):
+                    _df = st.session_state.topics_df.copy()
+                    _df[clean] = new_cc_val.strip()
+                    st.session_state.topics_df = _df
+                    st.session_state.topic_custom_cols.append(clean)
+                    st.rerun()
 
     # ── Section 3 · Save ──────────────────────────────────────────────────
 
