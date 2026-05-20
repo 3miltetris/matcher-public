@@ -138,13 +138,14 @@ def _fetch_all_descriptions(items: list[dict]) -> list[str]:
 
 
 def _search_grants(
-    keyword:     str,
-    statuses:    list[str],
-    instruments: list[str],
-    agencies:    list[str],
-    date_from:   date | None,
-    date_to:     date | None,
-    max_results: int,
+    keyword:         str,
+    statuses:        list[str],
+    instruments:     list[str],
+    agencies:        list[str],
+    date_from:       date | None,
+    date_to:         date | None,
+    exclude_expired: bool,
+    max_results:     int,
 ) -> tuple[pd.DataFrame, int]:
     all_items: list[dict] = []
     start = 1
@@ -186,15 +187,22 @@ def _search_grants(
     descriptions = _fetch_all_descriptions(all_items) if all_items else []
     df = _items_to_df(all_items, descriptions)
 
-    # Client-side date filter (API doesn't support date range in POST body)
-    if (date_from or date_to) and not df.empty:
-        parsed = df['posted_date'].apply(_parse_date)
-        mask   = pd.Series(True, index=df.index)
-        if date_from:
-            mask &= parsed.apply(lambda d: d is None or d >= date_from)
-        if date_to:
-            mask &= parsed.apply(lambda d: d is None or d <= date_to)
-        df = df[mask].reset_index(drop=True)
+    if not df.empty:
+        # Exclude already-closed opportunities (close_date in the past; empty = keep)
+        if exclude_expired:
+            today = datetime.today().date()
+            close_parsed = df['close_date'].apply(_parse_date)
+            df = df[close_parsed.apply(lambda d: d is None or d >= today)].reset_index(drop=True)
+
+        # Client-side posted-date filter (API doesn't support date range in POST body)
+        if date_from or date_to:
+            open_parsed = df['posted_date'].apply(_parse_date)
+            mask = pd.Series(True, index=df.index)
+            if date_from:
+                mask &= open_parsed.apply(lambda d: d is None or d >= date_from)
+            if date_to:
+                mask &= open_parsed.apply(lambda d: d is None or d <= date_to)
+            df = df[mask].reset_index(drop=True)
 
     return df, total or 0
 
@@ -417,13 +425,24 @@ st.caption(
 st.subheader('1 · Fetch from Grants.gov')
 
 today_date = datetime.today().date()
-gg_use_date_filter = st.checkbox('Filter by posted date', value=False, key='gg_use_date')
+
+col_exc, col_pf = st.columns(2)
+with col_exc:
+    gg_exclude_expired = st.checkbox(
+        'Exclude already-closed opportunities',
+        value=True,
+        key='gg_exclude_expired',
+        help='Hide grants whose close date has already passed. Grants with no close date (common for forecasted) are always kept.',
+    )
+with col_pf:
+    gg_use_date_filter = st.checkbox('Filter by posted date', value=False, key='gg_use_date')
+
 gg_date_from: date | None = None
 gg_date_to:   date | None = None
 if gg_use_date_filter:
     col_l, col_r = st.columns(2)
     with col_l:
-        gg_date_from = st.date_input('Posted from', value=today_date - timedelta(days=60), key='gg_date_from')
+        gg_date_from = st.date_input('Posted from', value=today_date - timedelta(days=365), key='gg_date_from')
     with col_r:
         gg_date_to = st.date_input('Posted to', value=today_date, key='gg_date_to')
 
@@ -466,7 +485,7 @@ with col_m:
     )
 
 if gg_use_date_filter:
-    st.caption('Date filter is applied client-side after fetch. Use a keyword or cap results to stay responsive.')
+    st.caption('Posted-date filter is applied client-side. Many active grants were posted over a year ago — widen the range if you get no results.')
 
 if gg_use_date_filter and gg_date_from and gg_date_to and gg_date_from > gg_date_to:
     st.error('"Posted from" must be on or before "Posted to".')
@@ -480,13 +499,14 @@ elif st.button('🔍 Fetch from Grants.gov', type='primary', key='gg_fetch_btn')
     else:
         try:
             df_fetched, total = _search_grants(
-                keyword     = gg_keyword.strip(),
-                statuses    = statuses,
-                instruments = instruments,
-                agencies    = agencies,
-                date_from   = gg_date_from,
-                date_to     = gg_date_to,
-                max_results = int(gg_max),
+                keyword         = gg_keyword.strip(),
+                statuses        = statuses,
+                instruments     = instruments,
+                agencies        = agencies,
+                date_from       = gg_date_from,
+                date_to         = gg_date_to,
+                exclude_expired = gg_exclude_expired,
+                max_results     = int(gg_max),
             )
             if df_fetched.empty:
                 st.warning(
