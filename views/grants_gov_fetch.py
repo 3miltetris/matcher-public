@@ -150,6 +150,9 @@ def _search_grants(
     all_items: list[dict] = []
     start = 1
     total = None
+    # When a date filter is active we must page through everything so recently-
+    # posted items aren't missed due to API ordering; otherwise cap at max_results.
+    need_all_pages = bool(date_from or date_to)
 
     with st.spinner('Querying Grants.gov…'):
         while True:
@@ -177,32 +180,35 @@ def _search_grants(
 
             if not page_items:
                 break
-            if max_results and len(all_items) >= max_results:
+            if not need_all_pages and max_results and len(all_items) >= max_results:
                 all_items = all_items[:max_results]
                 break
             start += len(page_items)
             if start > total:
                 break
 
-    descriptions = _fetch_all_descriptions(all_items) if all_items else []
-    df = _items_to_df(all_items, descriptions)
+    # Build a lightweight df (no descriptions) for fast metadata filtering.
+    df_meta = _items_to_df(all_items)
+    keep = pd.Series(True, index=range(len(all_items)))
 
-    if not df.empty:
-        # Exclude already-closed opportunities (close_date in the past; empty = keep)
+    if not df_meta.empty:
         if exclude_expired:
             today = datetime.today().date()
-            close_parsed = df['close_date'].apply(_parse_date)
-            df = df[close_parsed.apply(lambda d: d is None or d >= today)].reset_index(drop=True)
+            close_parsed = df_meta['close_date'].apply(_parse_date)
+            keep &= close_parsed.apply(lambda d: d is None or d >= today)
 
-        # Client-side posted-date filter (API doesn't support date range in POST body)
         if date_from or date_to:
-            open_parsed = df['posted_date'].apply(_parse_date)
-            mask = pd.Series(True, index=df.index)
+            open_parsed = df_meta['posted_date'].apply(_parse_date)
             if date_from:
-                mask &= open_parsed.apply(lambda d: d is None or d >= date_from)
+                keep &= open_parsed.apply(lambda d: d is None or d >= date_from)
             if date_to:
-                mask &= open_parsed.apply(lambda d: d is None or d <= date_to)
-            df = df[mask].reset_index(drop=True)
+                keep &= open_parsed.apply(lambda d: d is None or d <= date_to)
+
+    filtered_items = [item for item, k in zip(all_items, keep) if k]
+
+    # Only fetch descriptions for items that survived filtering.
+    descriptions = _fetch_all_descriptions(filtered_items) if filtered_items else []
+    df = _items_to_df(filtered_items, descriptions)
 
     return df, total or 0
 
@@ -426,25 +432,23 @@ st.subheader('1 · Fetch from Grants.gov')
 
 today_date = datetime.today().date()
 
-col_exc, col_pf = st.columns(2)
-with col_exc:
-    gg_exclude_expired = st.checkbox(
-        'Exclude already-closed opportunities',
-        value=True,
-        key='gg_exclude_expired',
-        help='Hide grants whose close date has already passed. Grants with no close date (common for forecasted) are always kept.',
-    )
-with col_pf:
-    gg_use_date_filter = st.checkbox('Filter by posted date', value=False, key='gg_use_date')
+gg_exclude_expired = st.checkbox(
+    'Exclude already-closed opportunities',
+    value=True,
+    key='gg_exclude_expired',
+    help='Hide grants whose close date has already passed. Grants with no close date (common for forecasted) are always kept.',
+)
 
+gg_use_date_filter = st.checkbox('Filter by posted date', value=False, key='gg_use_date')
 gg_date_from: date | None = None
 gg_date_to:   date | None = None
 if gg_use_date_filter:
     col_l, col_r = st.columns(2)
     with col_l:
-        gg_date_from = st.date_input('Posted from', value=today_date - timedelta(days=365), key='gg_date_from')
+        gg_date_from = st.date_input('Posted from', value=today_date - timedelta(days=1), key='gg_date_from')
     with col_r:
         gg_date_to = st.date_input('Posted to', value=today_date, key='gg_date_to')
+    st.caption('All pages are fetched before date filtering so no recent results are missed — this may be slower than an unfiltered fetch.')
 
 gg_keyword = st.text_input(
     'Keyword (optional)',
@@ -484,9 +488,6 @@ with col_m:
         key='gg_max',
     )
 
-if gg_use_date_filter:
-    st.caption('Posted-date filter is applied client-side. Many active grants were posted over a year ago — widen the range if you get no results.')
-
 if gg_use_date_filter and gg_date_from and gg_date_to and gg_date_from > gg_date_to:
     st.error('"Posted from" must be on or before "Posted to".')
 elif st.button('🔍 Fetch from Grants.gov', type='primary', key='gg_fetch_btn'):
@@ -511,10 +512,10 @@ elif st.button('🔍 Fetch from Grants.gov', type='primary', key='gg_fetch_btn')
             if df_fetched.empty:
                 st.warning(
                     f'No opportunities matched the filters (API returned {total:,} total records). '
-                    'Try a broader date range or fewer filters.'
+                    'Try adjusting the posted-date range or status/instrument filters.'
                 )
             else:
-                st.caption(f'API total: **{total:,}** — after date filter: **{len(df_fetched):,}** rows.')
+                st.caption(f'API total: **{total:,}** — after filters: **{len(df_fetched):,}** rows.')
                 st.session_state.ggov_raw_df        = df_fetched
                 st.session_state.ggov_screened_df   = None
                 st.session_state.ggov_existing_keys = None
