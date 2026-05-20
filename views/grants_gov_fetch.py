@@ -416,13 +416,16 @@ st.caption(
 
 st.subheader('1 · Fetch from Grants.gov')
 
-col_l, col_r = st.columns(2)
-with col_l:
-    today_date   = datetime.today().date()
-    default_from = today_date - timedelta(days=60)
-    gg_date_from = st.date_input('Posted from', value=default_from, key='gg_date_from')
-with col_r:
-    gg_date_to = st.date_input('Posted to', value=today_date, key='gg_date_to')
+today_date = datetime.today().date()
+gg_use_date_filter = st.checkbox('Filter by posted date', value=False, key='gg_use_date')
+gg_date_from: date | None = None
+gg_date_to:   date | None = None
+if gg_use_date_filter:
+    col_l, col_r = st.columns(2)
+    with col_l:
+        gg_date_from = st.date_input('Posted from', value=today_date - timedelta(days=60), key='gg_date_from')
+    with col_r:
+        gg_date_to = st.date_input('Posted to', value=today_date, key='gg_date_to')
 
 gg_keyword = st.text_input(
     'Keyword (optional)',
@@ -462,12 +465,10 @@ with col_m:
         key='gg_max',
     )
 
-st.caption(
-    'Date range filters are applied client-side after fetch. '
-    'For large date windows, set a keyword or lower the max results to stay responsive.'
-)
+if gg_use_date_filter:
+    st.caption('Date filter is applied client-side after fetch. Use a keyword or cap results to stay responsive.')
 
-if gg_date_from > gg_date_to:
+if gg_use_date_filter and gg_date_from and gg_date_to and gg_date_from > gg_date_to:
     st.error('"Posted from" must be on or before "Posted to".')
 elif st.button('🔍 Fetch from Grants.gov', type='primary', key='gg_fetch_btn'):
     statuses    = [_STATUS_OPTIONS[lbl]    for lbl in selected_status_labels]
