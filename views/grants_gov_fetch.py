@@ -166,7 +166,7 @@ def _search_grants(
 
             r = requests.post(_SEARCH_URL, json=payload, timeout=30)
             r.raise_for_status()
-            data = r.json()
+            data = r.json().get('data', {})
 
             if total is None:
                 total = int(data.get('hitCount', 0))
