@@ -18,6 +18,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from anthropic import Anthropic
+from bs4 import BeautifulSoup
 from google.cloud import storage
 from google.oauth2 import service_account
 
@@ -36,7 +37,9 @@ _SCREEN_MAX_CHARS = 3000
 # ── Grants.gov API ─────────────────────────────────────────────────────────
 
 _SEARCH_URL   = 'https://api.grants.gov/v1/api/search2'
+_DETAIL_URL   = 'https://apply07.grants.gov/grantsws/rest/opportunity/details'
 _PAGE_SIZE    = 25   # conservative; grants.gov legacy API
+_DETAIL_WORKERS = 8
 
 _STATUS_OPTIONS = {
     'Posted':     'posted',
@@ -79,33 +82,59 @@ def _parse_date(s: str) -> date | None:
     return None
 
 
-def _items_to_df(items: list[dict]) -> pd.DataFrame:
+def _items_to_df(items: list[dict], descriptions: list[str] | None = None) -> pd.DataFrame:
     rows = []
-    for opp in items:
-        synopsis = opp.get('synopsis', {})
-        if isinstance(synopsis, dict):
-            desc = (
-                synopsis.get('synopsisDesc') or
-                synopsis.get('fundDesc') or
-                synopsis.get('text') or ''
-            )
-            award_ceiling = str(synopsis.get('awardCeiling') or '')
-        else:
-            desc = str(synopsis) if synopsis else ''
-            award_ceiling = ''
-
+    for i, opp in enumerate(items):
+        desc = descriptions[i] if descriptions and i < len(descriptions) else ''
         rows.append({
             'title':         str(opp.get('title') or '').strip(),
             'description':   str(desc).strip(),
             'notice_id':     str(opp.get('number') or opp.get('id') or '').strip(),
-            'agency':        str(opp.get('agencyName') or '').strip(),
+            'agency':        str(opp.get('agency') or '').strip(),
             'agency_code':   str(opp.get('agencyCode') or '').strip(),
             'posted_date':   str(opp.get('openDate') or '').strip(),
             'close_date':    str(opp.get('closeDate') or '').strip(),
-            'award_ceiling': award_ceiling,
+            'award_ceiling': '',
             'status':        str(opp.get('oppStatus') or '').strip(),
         })
     return pd.DataFrame(rows)
+
+
+def _fetch_description(opp_id: str, doc_type: str) -> str:
+    try:
+        r = requests.post(
+            _DETAIL_URL,
+            data={'oppId': opp_id},
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=15,
+        )
+        r.raise_for_status()
+        d = r.json()
+        if doc_type == 'forecast':
+            html = (d.get('forecast') or {}).get('forecastDesc') or ''
+        else:
+            html = (d.get('synopsis') or {}).get('synopsisDesc') or ''
+        return BeautifulSoup(html, 'html.parser').get_text(separator=' ', strip=True)
+    except Exception:
+        return ''
+
+
+def _fetch_all_descriptions(items: list[dict]) -> list[str]:
+    results = [''] * len(items)
+    progress = st.progress(0, text=f'Fetching descriptions… 0/{len(items)}')
+    with ThreadPoolExecutor(max_workers=_DETAIL_WORKERS) as pool:
+        futures = {
+            pool.submit(_fetch_description, str(item['id']), item.get('docType', 'synopsis')): i
+            for i, item in enumerate(items)
+        }
+        done = 0
+        for future in as_completed(futures):
+            i = futures[future]
+            results[i] = future.result()
+            done += 1
+            progress.progress(done / len(items), text=f'Fetching descriptions… {done}/{len(items)}')
+    progress.empty()
+    return results
 
 
 def _search_grants(
@@ -124,16 +153,16 @@ def _search_grants(
     with st.spinner('Querying Grants.gov…'):
         while True:
             payload: dict = {
-                'oppStatuses': statuses,
+                'oppStatuses': '|'.join(statuses),
                 'rows':        _PAGE_SIZE,
                 'startRecord': start,
             }
             if keyword:
                 payload['keyword'] = keyword
             if instruments:
-                payload['fundingInstruments'] = instruments
+                payload['fundingInstruments'] = '|'.join(instruments)
             if agencies:
-                payload['agencies'] = agencies
+                payload['agencies'] = '|'.join(agencies)
 
             r = requests.post(_SEARCH_URL, json=payload, timeout=30)
             r.raise_for_status()
@@ -154,7 +183,8 @@ def _search_grants(
             if start > total:
                 break
 
-    df = _items_to_df(all_items)
+    descriptions = _fetch_all_descriptions(all_items) if all_items else []
+    df = _items_to_df(all_items, descriptions)
 
     # Client-side date filter (API doesn't support date range in POST body)
     if (date_from or date_to) and not df.empty:
