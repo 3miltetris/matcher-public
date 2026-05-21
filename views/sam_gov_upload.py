@@ -346,7 +346,7 @@ def _run_screening(df: pd.DataFrame, col_map: dict, anth_key: str) -> pd.DataFra
 
 
 _SAM_RESERVED_COLS = frozenset({
-    'topic_number', 'agency', 'title', 'description', 'open_date', 'close_date',
+    'topic_number', 'agency', 'title', 'description', 'open_date', 'due_date',
     'scraped_at', 'sam_confidence', 'sam_reason', 'grant_summary', 'embeddings',
 })
 
@@ -388,7 +388,7 @@ def _embed_and_save(
     out['title']        = df[col_map['title']].astype(str)
     out['description']  = df[col_map['description']].astype(str)
     out['open_date']    = df[col_map['posted_date']].astype(str)  if col_map.get('posted_date') else ''
-    out['close_date']   = df[col_map['deadline']].astype(str)     if col_map.get('deadline')    else ''
+    out['due_date']     = df[col_map['deadline']].astype(str)     if col_map.get('deadline')    else ''
     out['scraped_at']   = today
     out['sam_confidence'] = df['_confidence'].values
     out['sam_reason']   = df['_reason'].values
