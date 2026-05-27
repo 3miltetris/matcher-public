@@ -35,7 +35,8 @@ _STANDARD_COLS = [
 # Custom properties created automatically if missing
 # csv_col: (hs_internal_name, display_label, type, fieldType)
 _CUSTOM_PROPS: dict[str, tuple[str, str, str, str]] = {
-    'source_y':      ('matcher_source',        'Matcher Source',        'string', 'text'),
+    'source':        ('matcher_contact_source', 'Matcher Contact Source', 'string', 'text'),
+    'grant_source':  ('matcher_grant_source',  'Matcher Grant Source',  'string', 'text'),
     'topic_number':  ('matcher_topic_number',  'Matcher Topic Number',  'string', 'text'),
     'title':         ('matcher_grant_title',   'Matcher Grant Title',   'string', 'text'),
     'agency':        ('matcher_agency',        'Matcher Agency',        'string', 'text'),
