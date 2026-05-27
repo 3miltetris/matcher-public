@@ -348,7 +348,7 @@ if prewrite_email:
         with msg_right:
             msg_word_limit = st.number_input(
                 'Word limit', min_value=1, max_value=500,
-                value=50, step=1, key='bm_msg_wl',
+                value=15, step=1, key='bm_msg_wl',
             )
 
         st.divider()

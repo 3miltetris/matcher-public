@@ -187,7 +187,7 @@ async def _generate_email_batch(
                 async_josiah_copy(
                     company_summary=str(row.get('company_summary', '') or ''),
                     grant_summary=str(row.get('grant_summary', '') or ''),
-                    word_limit=message_cfg.get('word_limit', 50),
+                    word_limit=message_cfg.get('word_limit', 15),
                     anth_client=anth,
                     system_override=message_cfg.get('system') or None,
                 ),
