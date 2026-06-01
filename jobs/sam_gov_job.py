@@ -47,6 +47,7 @@ import json
 import os
 import secrets as _secrets
 import sys
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -67,7 +68,9 @@ _STATUS_PREFIX    = 'sam-gov-jobs/'
 _SAM_API_BASE     = 'https://api.sam.gov/opportunities/v2/search'
 _SAM_DESC_BASE    = 'https://api.sam.gov/opportunities/v2/noticedesc'
 _SAM_PAGE_SIZE    = 1000
-_DESC_WORKERS     = 10
+_DESC_WORKERS     = 3   # keep low to avoid SAM.gov burst rate limits
+_SAM_PAGE_SLEEP   = 1.0  # seconds between pagination requests
+_SAM_MAX_RETRIES  = 6   # max retries on 429
 _SCREEN_CONCUR    = 20
 _SUMMARY_CONCUR   = 20
 _EMBED_WORKERS    = 8
@@ -149,14 +152,26 @@ def _write_status(client: storage.Client, run_id: str, payload: dict) -> None:
 
 # ── SAM.gov API helpers ────────────────────────────────────────────────────────
 
+def _sam_get(url: str, params: dict, timeout: int = 30) -> requests.Response:
+    """GET with exponential backoff on 429 responses."""
+    for attempt in range(_SAM_MAX_RETRIES):
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code == 429:
+            wait = 2 ** attempt
+            print(f'  SAM.gov 429 — waiting {wait}s before retry {attempt + 1}/{_SAM_MAX_RETRIES}', flush=True)
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r
+    # Final attempt — let the caller handle any error
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r
+
+
 def _fetch_one_desc(notice_id: str, api_key: str) -> str:
     try:
-        r = requests.get(
-            _SAM_DESC_BASE,
-            params={'noticeid': notice_id, 'api_key': api_key},
-            timeout=20,
-        )
-        r.raise_for_status()
+        r = _sam_get(_SAM_DESC_BASE, {'noticeid': notice_id, 'api_key': api_key}, timeout=20)
         content = r.text
         if '<' in content:
             return BeautifulSoup(content, 'html.parser').get_text(separator=' ', strip=True)
@@ -207,8 +222,10 @@ def _fetch_from_sam(api_params: dict) -> pd.DataFrame:
         if keyword:
             params['keyword'] = keyword
 
-        r = requests.get(_SAM_API_BASE, params=params, timeout=30)
-        r.raise_for_status()
+        if offset > 0:
+            time.sleep(_SAM_PAGE_SLEEP)
+
+        r    = _sam_get(_SAM_API_BASE, params)
         data = r.json()
 
         if total is None:
