@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.sam_gov_job.txt .
+RUN pip install --no-cache-dir -r requirements.sam_gov_job.txt
+
+COPY jobs/sam_gov_job.py jobs/sam_gov_job.py
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "jobs/sam_gov_job.py"]
