@@ -114,6 +114,12 @@ def _decompose_query(query_text: str, anth_client: anthropic.Anthropic) -> list[
             messages=[{'role': 'user', 'content': f'Query: "{query_text}"'}],
         )
         raw = response.content[0].text.strip()
+        # Strip markdown code fences if Claude adds them
+        if raw.startswith('```'):
+            raw = raw.split('```')[1]
+            if raw.startswith('json'):
+                raw = raw[4:]
+            raw = raw.strip()
         parsed = json.loads(raw)
         if (
             isinstance(parsed, list)
@@ -121,9 +127,19 @@ def _decompose_query(query_text: str, anth_client: anthropic.Anthropic) -> list[
             and all(isinstance(a, str) and a.strip() for a in parsed)
         ):
             return [a.strip() for a in parsed]
-    except Exception:
-        pass
-    st.warning('Aspect decomposition unavailable — running standard single-aspect search.')
+        st.warning(
+            f'Aspect decomposition returned unexpected format — running standard search. '
+            f'(Response: `{raw[:200]}`)'
+        )
+    except anthropic.APIError as e:
+        st.warning(f'Claude API error during decomposition — running standard search. ({e})')
+    except json.JSONDecodeError as e:
+        st.warning(
+            f'Could not parse Claude response as JSON — running standard search. '
+            f'(Error: {e}; Raw: `{raw[:200]}`)'
+        )
+    except Exception as e:
+        st.warning(f'Aspect decomposition failed — running standard search. ({type(e).__name__}: {e})')
     return [query_text]
 
 
