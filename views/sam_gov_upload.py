@@ -398,7 +398,15 @@ def _embed_and_save(
     summaries = _summarize_descriptions(titles, descs, anth_key)
     out['grant_summary'] = summaries
 
-    embed_texts = [s if s.strip() else d for s, d in zip(summaries, descs)]
+    # Drop rows where Claude returned a refusal (description too sparse to summarize)
+    _THIN_PHRASES = ("don't have enough technical content", "not enough technical content", "i cannot summarize", "i'm unable to summarize")
+    thin_mask = out['grant_summary'].apply(lambda s: any(p in s.lower() for p in _THIN_PHRASES))
+    if thin_mask.any():
+        n_thin = int(thin_mask.sum())
+        st.warning(f'{n_thin} row(s) dropped — description had insufficient technical content to summarize.')
+        out = out[~thin_mask].reset_index(drop=True)
+
+    embed_texts = [s if s.strip() else d for s, d in zip(out['grant_summary'].tolist(), out['description'].tolist())]
     progress    = st.progress(0, text='Generating embeddings…')
     embeddings  = []
     for i, text in enumerate(embed_texts):

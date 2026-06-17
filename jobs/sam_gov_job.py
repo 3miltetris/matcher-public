@@ -528,6 +528,26 @@ def main(config_blob_path: str) -> None:
         anth_key,
     ))
 
+    # Drop rows where the LLM couldn't produce a useful summary (sparse/title-only descriptions)
+    _THIN_PHRASES = ("don't have enough technical content", "not enough technical content", "i cannot summarize", "i'm unable to summarize")
+    thin_mask = [any(p in s.lower() for p in _THIN_PHRASES) for s in summaries]
+    n_thin = sum(thin_mask)
+    if n_thin:
+        print(f'  {n_thin:,} rows dropped — description too sparse to summarize', flush=True)
+        keep = [not t for t in thin_mask]
+        new_rows  = new_rows[[i for i, k in enumerate(keep) if k]].reset_index(drop=True)
+        summaries = [s for s, k in zip(summaries, keep) if k]
+        rows_dedup = len(new_rows)
+
+    if new_rows.empty:
+        _write_status(gcs, run_id, {
+            'run_id': run_id, 'rows_fetched': rows_fetched,
+            'rows_passed_screening': rows_passed, 'rows_after_dedup': 0,
+            'rows_saved': 0, 'gcs_path': None, 'error': None,
+        })
+        print('All rows had insufficient descriptions — exiting.', flush=True)
+        return
+
     # ── Step 5: Embed ──────────────────────────────────────────────────────────
     print(f'Generating embeddings for {rows_dedup:,} rows…', flush=True)
     embed_texts = [s if s.strip() else d for s, d in zip(summaries, new_rows['description'].tolist())]
