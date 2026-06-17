@@ -103,6 +103,44 @@ Respond only with valid JSON. No preamble, no markdown, no explanation outside t
 """
 
 
+# ── Agency normalization prompt ───────────────────────────────────────────
+
+_AGENCY_NORM_SYSTEM = """\
+You are normalizing U.S. federal agency names from SAM.gov to short, standard abbreviations.
+
+Given a list of raw agency names (department or sub-tier names), return a JSON object mapping each original name to its standard abbreviation.
+
+Rules:
+- Use well-known abbreviations for sub-agencies when they exist: NIH, NCI, DARPA, ARMY, NAVY, USAF, USMC, NSF, DOE, NASA, DHS, EPA, USDA, VA, SBA, NOAA, CDC, FDA, etc.
+- When the sub-agency is not well-known, use the parent department abbreviation: DOD, HHS, DOE, DOC, DOT, ED, etc.
+- Keep abbreviations uppercase, 2–10 characters, no spaces.
+- Return only valid JSON with no markdown: {"Original Name": "ABBREV", ...}
+- Include every input name exactly as provided, even blank strings (map them to "SAM-GOV").\
+"""
+
+
+def _normalize_agencies(raw_agencies: list[str], anth_key: str) -> dict[str, str]:
+    """Map raw SAM.gov agency strings to short abbreviations via a single Claude call."""
+    unique = list(dict.fromkeys(raw_agencies))  # preserve order, deduplicate
+    if not unique:
+        return {}
+    client   = Anthropic(api_key=anth_key)
+    user_msg = 'Normalize these agency names:\n' + '\n'.join(f'- {a}' for a in unique)
+    resp     = client.messages.create(
+        model=_SCREEN_MODEL,
+        max_tokens=1000,
+        system=_AGENCY_NORM_SYSTEM,
+        messages=[{'role': 'user', 'content': user_msg}],
+    )
+    raw = resp.content[0].text.strip()
+    if raw.startswith('```'):
+        raw = raw.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
 # ── Summarization prompt ──────────────────────────────────────────────────
 
 _SUMMARY_SYSTEM = """\
@@ -553,6 +591,18 @@ with tab_api:
                 else:
                     st.caption(f'Found **{total:,}** total records; fetched **{len(items):,}**.')
                     df_api, col_map_api = _items_to_df(items, sam_key, bool(api_fetch_desc))
+                    with st.spinner('Normalizing agency names…'):
+                        try:
+                            mapping = _normalize_agencies(
+                                df_api['agency'].tolist(),
+                                st.secrets['anthropic_api_key'],
+                            )
+                            if mapping:
+                                df_api['agency'] = df_api['agency'].map(
+                                    lambda a: mapping.get(a, a)
+                                )
+                        except Exception:
+                            pass  # non-critical — keep raw names if it fails
                     st.session_state.sam_raw_df        = df_api
                     st.session_state.sam_col_map       = col_map_api
                     st.session_state.sam_from_api      = True
