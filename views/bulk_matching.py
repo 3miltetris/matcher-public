@@ -11,10 +11,13 @@ and monitoring only.
 
 import io
 import json
+import smtplib
 import time
 import traceback
 import warnings
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import numpy as np
 import pandas as pd
@@ -133,6 +136,46 @@ def _poll_status(client: storage.Client, run_id: str) -> dict | None:
     return json.loads(blob.download_as_text())
 
 
+def _send_notification_email(to_email: str, run_id: str, success: bool, status: dict) -> None:
+    try:
+        smtp_host = st.secrets.get('smtp_host', 'smtp.gmail.com')
+        smtp_port = int(st.secrets.get('smtp_port', 587))
+        smtp_user = st.secrets['smtp_user']
+        smtp_password = st.secrets['smtp_password']
+    except KeyError:
+        st.warning('SMTP credentials not configured — skipping email notification.')
+        return
+
+    if success:
+        subject = f'Matcher run complete: {run_id}'
+        body = (
+            f'Your matching run has finished.\n\n'
+            f'Run ID: {run_id}\n'
+            f'Rows saved: {status.get("total_saved", "N/A"):,}\n'
+            f'Total candidates: {status.get("total_candidates", "N/A"):,}\n'
+            f'Segments: {status.get("segments", "N/A")}\n'
+        )
+    else:
+        subject = f'Matcher run failed: {run_id}'
+        body = (
+            f'Your matching run encountered an error.\n\n'
+            f'Run ID: {run_id}\n'
+            f'Error: {status.get("error", "Unknown error")}\n'
+        )
+
+    msg = MIMEMultipart()
+    msg['From'] = smtp_user
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, to_email, msg.as_string())
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
 for _k in ['bm_active_run', 'bm_run_summary', 'bm_topics_df']:
@@ -173,6 +216,12 @@ if st.session_state.bm_active_run:
         elif status.get('error'):
             st.error('Job failed.')
             st.code(status['error'])
+            if active.get('notify_email'):
+                try:
+                    _send_notification_email(active['notify_email'], run_id, False, status)
+                    st.info(f'Notification sent to {active["notify_email"]}')
+                except Exception as _email_err:
+                    st.warning(f'Could not send notification email: {_email_err}')
             st.session_state.bm_active_run = None
 
         else:
@@ -181,6 +230,12 @@ if st.session_state.bm_active_run:
                 f'**{status["segments"]}** segment(s) '
                 f'(from {status["total_candidates"]:,} candidates)'
             )
+            if active.get('notify_email'):
+                try:
+                    _send_notification_email(active['notify_email'], run_id, True, status)
+                    st.info(f'Notification sent to {active["notify_email"]}')
+                except Exception as _email_err:
+                    st.warning(f'Could not send notification email: {_email_err}')
             st.session_state.bm_run_summary = status
             st.session_state.bm_active_run  = None
 
@@ -305,6 +360,13 @@ with opt_left:
 with opt_mid:
     ai_validation  = st.checkbox('AI validation',  value=True)
     prewrite_email = st.checkbox('Pre-write email', value=False)
+
+notify_email = st.text_input(
+    'Notify when done (optional)',
+    placeholder='you@example.com',
+    key='bm_notify_email',
+    help='Sends a completion email when the run finishes. Requires smtp_user and smtp_password in secrets.toml.',
+)
 
 # ── Email pre-write settings ──────────────────────────────────────────────────
 
@@ -457,7 +519,11 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
         with st.spinner('Triggering Cloud Run job…'):
             _trigger_job(_get_credentials(), config_blob)
 
-        st.session_state.bm_active_run  = {'run_id': run_id, 'config_blob': config_blob}
+        st.session_state.bm_active_run  = {
+            'run_id':       run_id,
+            'config_blob':  config_blob,
+            'notify_email': notify_email.strip() or None,
+        }
         st.session_state.bm_run_summary = None
         st.rerun()
 
