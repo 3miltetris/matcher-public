@@ -1,4 +1,18 @@
+import subprocess
+import sys
+
 import streamlit as st
+
+
+@st.cache_resource(show_spinner=False)
+def _install_playwright_browser():
+    subprocess.run(
+        [sys.executable, '-m', 'playwright', 'install', 'chromium'],
+        capture_output=True,
+    )
+
+
+_install_playwright_browser()
 
 st.set_page_config(
     page_title="The Matcher",
