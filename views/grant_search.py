@@ -17,6 +17,7 @@ from google.oauth2 import service_account
 
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
+from src.modules.grant_utils import normalize_grant_columns
 
 # ── GCS ────────────────────────────────────────────────────────────────────
 
@@ -199,7 +200,7 @@ def _llm_rerank(
     scores = []
     rationales = []
     for i, (_, row) in enumerate(subset.iterrows()):
-        grant_text = row.get('grant_summary') or row.get('description', '')
+        grant_text = row.get('grant_summary', '')
         try:
             resp = anth_client.messages.create(
                 model='claude-haiku-4-5-20251001',
@@ -268,7 +269,7 @@ if st.button('Load Topics', type='primary', disabled=not selected):
     if df.empty:
         st.warning('No topics found for the selected agencies.')
     else:
-        st.session_state.gs_topics_df = df
+        st.session_state.gs_topics_df = normalize_grant_columns(df)
         st.session_state.gs_results_df = None
         st.session_state.gs_aspects = None
         st.session_state.gs_search_mode = None

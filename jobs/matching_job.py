@@ -34,6 +34,7 @@ from openai import AsyncOpenAI
 
 # ── src modules are on the path because the Dockerfile sets PYTHONPATH ────────
 from src.modules.email_generator import async_generate_subject_line, async_josiah_copy, async_custom_prompt
+from src.modules.grant_utils import normalize_grant_columns
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -353,8 +354,7 @@ def main(config_blob_path: str) -> None:
     if topics_df.empty:
         raise RuntimeError('No topic parquet files found for selected agencies.')
 
-    if 'grant_summary' not in topics_df.columns and 'description' in topics_df.columns:
-        topics_df = topics_df.rename(columns={'description': 'grant_summary'})
+    topics_df = normalize_grant_columns(topics_df)
 
     if topic_filters:
         topics_df = _apply_filters(topics_df, topic_filters)

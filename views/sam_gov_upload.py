@@ -2,47 +2,40 @@
 SAM.gov Upload
 --------------
 Two input modes:
-  - Upload CSV     : Upload SAM.gov contract opportunity CSVs (original behaviour).
-  - Fetch from API : Query the SAM.gov Opportunities API directly by date range,
-                     notice type, and optional keyword — no manual export needed.
-
-In both modes Claude Haiku screens each row for relevance to deep tech / R&D small
-businesses, then passing rows are embedded and saved to GCS under
-data/all-topics/processed/SAM-GOV/.
+  - Upload CSV     : Upload SAM.gov contract opportunity CSVs (runs in Streamlit).
+  - Fetch from API : Configure parameters and trigger the Cloud Run sam-gov-job.
+                     Fetching, screening, summarising, and embedding all run in the
+                     background job — Streamlit polls for completion.
 """
 
 import io
 import json
 import secrets
+import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import pandas as pd
-import requests
 import streamlit as st
 from anthropic import Anthropic
-from bs4 import BeautifulSoup
-from google.cloud import storage
+from google.cloud import run_v2, storage
 from google.oauth2 import service_account
 
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 
-# ── GCS ────────────────────────────────────────────────────────────────────
+# ── Constants ────────────────────────────────────────────────────────────────
 
-_BUCKET     = 'cc-matcher-bucket-jeg-v1'
-_SAM_PREFIX = 'data/all-topics/processed/SAM-GOV/'
+_BUCKET          = 'cc-matcher-bucket-jeg-v1'
+_SAM_PREFIX      = 'data/all-topics/processed/SAM-GOV/'
+_SAM_CFG_PREFIX  = 'sam-gov-configs/'
+_JOB_NAME        = 'projects/cc-matcher-v1/locations/us-central1/jobs/sam-gov-job'
+_POLL_INTERVAL   = 10
 
 _SCREEN_MODEL     = 'claude-haiku-4-5-20251001'
 _SCREEN_WORKERS   = 8
 _SCREEN_MAX_CHARS = 3000
-
-# ── SAM.gov API ────────────────────────────────────────────────────────────
-
-_SAM_API_BASE  = 'https://api.sam.gov/opportunities/v2/search'
-_SAM_DESC_BASE = 'https://api.sam.gov/opportunities/v2/noticedesc'
-_SAM_PAGE_SIZE = 1000
-_DESC_WORKERS  = 10
 
 _NOTICE_TYPE_OPTIONS = {
     'Presolicitation':                'p',
@@ -53,16 +46,7 @@ _NOTICE_TYPE_OPTIONS = {
 }
 
 
-# ── Storage client ─────────────────────────────────────────────────────────
-
-def _get_storage_client() -> storage.Client:
-    creds = service_account.Credentials.from_service_account_info(
-        st.secrets['gcp_service_account']
-    )
-    return storage.Client(credentials=creds)
-
-
-# ── Screening prompt ───────────────────────────────────────────────────────
+# ── Screening prompt (CSV path) ───────────────────────────────────────────────
 
 _SCREEN_SYSTEM = """\
 You are a grant opportunity screening filter for a consultancy that serves innovative startups, R&D companies, and deep tech small businesses.
@@ -103,45 +87,7 @@ Respond only with valid JSON. No preamble, no markdown, no explanation outside t
 """
 
 
-# ── Agency normalization prompt ───────────────────────────────────────────
-
-_AGENCY_NORM_SYSTEM = """\
-You are normalizing U.S. federal agency names from SAM.gov to short, standard abbreviations.
-
-Given a list of raw agency names (department or sub-tier names), return a JSON object mapping each original name to its standard abbreviation.
-
-Rules:
-- Use well-known abbreviations for sub-agencies when they exist: NIH, NCI, DARPA, ARMY, NAVY, USAF, USMC, NSF, DOE, NASA, DHS, EPA, USDA, VA, SBA, NOAA, CDC, FDA, etc.
-- When the sub-agency is not well-known, use the parent department abbreviation: DOD, HHS, DOE, DOC, DOT, ED, etc.
-- Keep abbreviations uppercase, 2–10 characters, no spaces.
-- Return only valid JSON with no markdown: {"Original Name": "ABBREV", ...}
-- Include every input name exactly as provided, even blank strings (map them to "SAM-GOV").\
-"""
-
-
-def _normalize_agencies(raw_agencies: list[str], anth_key: str) -> dict[str, str]:
-    """Map raw SAM.gov agency strings to short abbreviations via a single Claude call."""
-    unique = list(dict.fromkeys(raw_agencies))  # preserve order, deduplicate
-    if not unique:
-        return {}
-    client   = Anthropic(api_key=anth_key)
-    user_msg = 'Normalize these agency names:\n' + '\n'.join(f'- {a}' for a in unique)
-    resp     = client.messages.create(
-        model=_SCREEN_MODEL,
-        max_tokens=1000,
-        system=_AGENCY_NORM_SYSTEM,
-        messages=[{'role': 'user', 'content': user_msg}],
-    )
-    raw = resp.content[0].text.strip()
-    if raw.startswith('```'):
-        raw = raw.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {}
-
-
-# ── Summarization prompt ──────────────────────────────────────────────────
+# ── Summarization prompt (CSV path) ──────────────────────────────────────────
 
 _SUMMARY_SYSTEM = """\
 You are preparing a federal contract opportunity for semantic matching against startup and R&D company profiles.
@@ -155,42 +101,52 @@ Strip out all procurement boilerplate: FAR clauses, set-aside language, submissi
 """
 
 
-def _summarize_one(title: str, desc: str, anth_key: str) -> str:
-    client   = Anthropic(api_key=anth_key)
-    user_msg = f"Title: {title}\n\nDescription:\n{str(desc)[:5000]}"
-    resp = client.messages.create(
-        model=_SCREEN_MODEL,
-        max_tokens=400,
-        system=_SUMMARY_SYSTEM,
-        messages=[{'role': 'user', 'content': user_msg}],
+# ── GCS helpers ──────────────────────────────────────────────────────────────
+
+def _get_credentials():
+    return service_account.Credentials.from_service_account_info(
+        st.secrets['gcp_service_account']
     )
-    return resp.content[0].text.strip()
 
 
-def _summarize_descriptions(titles: list[str], descs: list[str], anth_key: str) -> list[str]:
-    results  = [''] * len(descs)
-    progress = st.progress(0, text='Summarizing descriptions…')
-
-    with ThreadPoolExecutor(max_workers=_SCREEN_WORKERS) as pool:
-        futures = {
-            pool.submit(_summarize_one, titles[i], descs[i], anth_key): i
-            for i in range(len(descs))
-        }
-        done = 0
-        for future in as_completed(futures):
-            i = futures[future]
-            try:
-                results[i] = future.result()
-            except Exception:
-                results[i] = descs[i]
-            done += 1
-            progress.progress(done / len(descs), text=f'Summarizing… {done}/{len(descs)}')
-
-    progress.empty()
-    return results
+def _get_storage_client() -> storage.Client:
+    return storage.Client(credentials=_get_credentials())
 
 
-# ── Column auto-detection (CSV path) ──────────────────────────────────────
+# ── Cloud Run helpers (API path) ──────────────────────────────────────────────
+
+def _write_sam_config(client: storage.Client, config: dict) -> str:
+    blob_path = f'{_SAM_CFG_PREFIX}{config["run_id"]}.json'
+    client.bucket(_BUCKET).blob(blob_path).upload_from_string(
+        json.dumps(config), content_type='application/json'
+    )
+    return blob_path
+
+
+def _trigger_sam_job(config_blob_path: str) -> None:
+    job_client = run_v2.JobsClient(credentials=_get_credentials())
+    job_client.run_job(
+        request=run_v2.RunJobRequest(
+            name=_JOB_NAME,
+            overrides=run_v2.RunJobRequest.Overrides(
+                container_overrides=[
+                    run_v2.RunJobRequest.Overrides.ContainerOverride(
+                        args=[config_blob_path]
+                    )
+                ]
+            ),
+        )
+    )
+
+
+def _poll_sam_status(client: storage.Client, run_id: str) -> dict | None:
+    blob = client.bucket(_BUCKET).blob(f'sam-gov-jobs/{run_id}/status.json')
+    if not blob.exists():
+        return None
+    return json.loads(blob.download_as_text())
+
+
+# ── Column auto-detection (CSV path) ─────────────────────────────────────────
 
 _CANDIDATES: dict[str, list[str]] = {
     'title':        ['title', 'opportunity title', 'solicitation title'],
@@ -211,126 +167,7 @@ def _detect_col(columns: list[str], field: str) -> str | None:
     return None
 
 
-# ── SAM.gov API helpers ────────────────────────────────────────────────────
-
-def _fetch_one_desc(notice_id: str, api_key: str) -> str:
-    """Fetch and strip HTML from a single SAM.gov opportunity description."""
-    try:
-        r = requests.get(
-            _SAM_DESC_BASE,
-            params={'noticeid': notice_id, 'api_key': api_key},
-            timeout=20,
-        )
-        r.raise_for_status()
-        content = r.text
-        if '<' in content:
-            soup = BeautifulSoup(content, 'html.parser')
-            return soup.get_text(separator=' ', strip=True)
-        return content.strip()
-    except Exception:
-        return ''
-
-
-def _fetch_descriptions_batch(notice_ids: list[str], api_key: str) -> list[str]:
-    results  = [''] * len(notice_ids)
-    progress = st.progress(0, text='Fetching full descriptions…')
-    with ThreadPoolExecutor(max_workers=_DESC_WORKERS) as pool:
-        futures = {
-            pool.submit(_fetch_one_desc, nid, api_key): i
-            for i, nid in enumerate(notice_ids)
-        }
-        done = 0
-        for future in as_completed(futures):
-            i        = futures[future]
-            results[i] = future.result()
-            done    += 1
-            progress.progress(done / len(notice_ids), text=f'Fetching descriptions… {done}/{len(notice_ids)}')
-    progress.empty()
-    return results
-
-
-def _search_sam(
-    api_key:      str,
-    date_from:    str,
-    date_to:      str,
-    notice_types: list[str],
-    keyword:      str,
-    max_results:  int,
-) -> tuple[list[dict], int]:
-    """Paginated SAM.gov opportunity search. Returns (items, total_records)."""
-    all_items: list[dict] = []
-    offset = 0
-    total  = None
-
-    with st.spinner('Querying SAM.gov…'):
-        while True:
-            params: dict = {
-                'api_key':    api_key,
-                'postedFrom': date_from,
-                'postedTo':   date_to,
-                'limit':      _SAM_PAGE_SIZE,
-                'offset':     offset,
-                'active':     'Yes',
-            }
-            if notice_types:
-                params['ntype'] = ','.join(notice_types)
-            if keyword:
-                params['keyword'] = keyword
-
-            r = requests.get(_SAM_API_BASE, params=params, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-
-            if total is None:
-                total = int(data.get('totalRecords', 0))
-
-            page_items = data.get('opportunitiesData') or []
-            all_items.extend(page_items)
-
-            if not page_items:
-                break
-            if max_results and len(all_items) >= max_results:
-                all_items = all_items[:max_results]
-                break
-            offset += len(page_items)
-            if offset >= total:
-                break
-
-    return all_items, total or 0
-
-
-def _items_to_df(items: list[dict], api_key: str, fetch_desc: bool) -> tuple[pd.DataFrame, dict]:
-    """Convert raw SAM.gov API items to a DataFrame + col_map ready for screening."""
-    notice_ids = [item.get('noticeId', '') for item in items]
-
-    if fetch_desc and notice_ids:
-        descriptions = _fetch_descriptions_batch(notice_ids, api_key)
-    else:
-        descriptions = ['' for _ in items]
-
-    df = pd.DataFrame({
-        'title':       [item.get('title', '')                                          for item in items],
-        'description': descriptions,
-        'naics_desc':  [item.get('naicsCode', '')                                      for item in items],
-        'notice_id':   [(item.get('solicitationNumber') or item.get('noticeId', ''))   for item in items],
-        'agency':      [(item.get('subTier') or item.get('department', ''))            for item in items],
-        'posted_date': [item.get('postedDate', '')                                     for item in items],
-        'deadline':    [(item.get('responseDeadLine') or '')[:10]                      for item in items],
-    })
-
-    col_map = {
-        'title':       'title',
-        'description': 'description',
-        'naics_desc':  'naics_desc',
-        'notice_id':   'notice_id',
-        'agency':      'agency',
-        'posted_date': 'posted_date',
-        'deadline':    'deadline',
-    }
-    return df, col_map
-
-
-# ── Screening ─────────────────────────────────────────────────────────────
+# ── Screening (CSV path) ──────────────────────────────────────────────────────
 
 def _screen_one(title: str, desc: str, naics: str, anth_key: str) -> dict:
     client   = Anthropic(api_key=anth_key)
@@ -383,15 +220,46 @@ def _run_screening(df: pd.DataFrame, col_map: dict, anth_key: str) -> pd.DataFra
     return out
 
 
-_SAM_RESERVED_COLS = frozenset({
-    'topic_number', 'agency', 'title', 'description', 'open_date', 'due_date',
-    'scraped_at', 'sam_confidence', 'sam_reason', 'grant_summary', 'embeddings',
-})
+# ── Summarization (CSV path) ──────────────────────────────────────────────────
 
-# ── Existing-record dedup ──────────────────────────────────────────────────
+def _summarize_one(title: str, desc: str, anth_key: str) -> str:
+    client   = Anthropic(api_key=anth_key)
+    user_msg = f"Title: {title}\n\nDescription:\n{str(desc)[:5000]}"
+    resp = client.messages.create(
+        model=_SCREEN_MODEL,
+        max_tokens=400,
+        system=_SUMMARY_SYSTEM,
+        messages=[{'role': 'user', 'content': user_msg}],
+    )
+    return resp.content[0].text.strip()
+
+
+def _summarize_descriptions(titles: list[str], descs: list[str], anth_key: str) -> list[str]:
+    results  = [''] * len(descs)
+    progress = st.progress(0, text='Summarizing descriptions…')
+
+    with ThreadPoolExecutor(max_workers=_SCREEN_WORKERS) as pool:
+        futures = {
+            pool.submit(_summarize_one, titles[i], descs[i], anth_key): i
+            for i in range(len(descs))
+        }
+        done = 0
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                results[i] = future.result()
+            except Exception:
+                results[i] = descs[i]
+            done += 1
+            progress.progress(done / len(descs), text=f'Summarizing… {done}/{len(descs)}')
+
+    progress.empty()
+    return results
+
+
+# ── Existing-record dedup (CSV path) ──────────────────────────────────────────
 
 def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
-    """Return (notice_ids, lower_titles) already in the sam-gov prefix."""
     notice_ids: set[str] = set()
     titles:     set[str] = set()
     blobs = client.list_blobs(_BUCKET, prefix=_SAM_PREFIX)
@@ -407,7 +275,13 @@ def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
     return notice_ids, titles
 
 
-# ── Embed + save ───────────────────────────────────────────────────────────
+# ── Embed + save (CSV path) ───────────────────────────────────────────────────
+
+_SAM_RESERVED_COLS = frozenset({
+    'topic_number', 'agency', 'title', 'description', 'open_date', 'due_date',
+    'scraped_at', 'sam_confidence', 'sam_reason', 'grant_summary', 'embeddings',
+})
+
 
 def _embed_and_save(
     df: pd.DataFrame,
@@ -436,7 +310,6 @@ def _embed_and_save(
     summaries = _summarize_descriptions(titles, descs, anth_key)
     out['grant_summary'] = summaries
 
-    # Drop rows where Claude returned a refusal (description too sparse to summarize)
     _THIN_PHRASES = ("don't have enough technical content", "not enough technical content", "i cannot summarize", "i'm unable to summarize")
     thin_mask = out['grant_summary'].apply(lambda s: any(p in s.lower() for p in _THIN_PHRASES))
     if thin_mask.any():
@@ -464,30 +337,84 @@ def _embed_and_save(
     return gcs_path
 
 
-# ── Session state ──────────────────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 
-for _k in ['sam_raw_df', 'sam_screened_df', 'sam_existing_keys', 'sam_col_map', 'sam_from_api']:
+for _k in ['sam_raw_df', 'sam_screened_df', 'sam_existing_keys', 'sam_col_map']:
     if _k not in st.session_state:
         st.session_state[_k] = None
+if 'sam_active_run' not in st.session_state:
+    st.session_state.sam_active_run = None
 if 'sam_custom_cols' not in st.session_state:
     st.session_state.sam_custom_cols = []
+if 'sam_api_custom_cols' not in st.session_state:
+    st.session_state.sam_api_custom_cols = []
 
 
-# ── Page ───────────────────────────────────────────────────────────────────
+# ── Page ──────────────────────────────────────────────────────────────────────
 
 st.title('🏛️ SAM.gov Upload')
 st.caption(
     'Screen and embed SAM.gov contract opportunities for the matching pipeline. '
-    'Upload exported CSVs or fetch directly from the SAM.gov Opportunities API.'
+    'Upload exported CSVs (processed in Streamlit) or fetch directly from the '
+    'SAM.gov API (processed by Cloud Run).'
 )
 
-# ── Section 1 · Load ───────────────────────────────────────────────────────
+
+# ── Active run: polling UI ────────────────────────────────────────────────────
+
+if st.session_state.sam_active_run:
+    active = st.session_state.sam_active_run
+    run_id = active['run_id']
+
+    st.subheader('🔄 Import in progress')
+    st.caption(f'Run ID: `{run_id}`')
+
+    try:
+        gcs    = _get_storage_client()
+        status = _poll_sam_status(gcs, run_id)
+
+        if status is None:
+            st.info(f'Job is running… checking again in {_POLL_INTERVAL}s.')
+            if st.button('Cancel monitoring (job keeps running)'):
+                st.session_state.sam_active_run = None
+                st.rerun()
+            time.sleep(_POLL_INTERVAL)
+            st.rerun()
+
+        elif status.get('error'):
+            st.error('Import job failed.')
+            st.code(status['error'])
+            st.session_state.sam_active_run = None
+
+        else:
+            st.success(
+                f'Import complete — **{status["rows_saved"]:,}** topics saved '
+                f'(fetched {status["rows_fetched"]:,}, '
+                f'passed screening {status["rows_passed_screening"]:,}, '
+                f'after dedup {status["rows_after_dedup"]:,}).'
+            )
+            if status.get('gcs_path'):
+                st.caption(f'Saved to `{status["gcs_path"]}`')
+            st.session_state.sam_active_run = None
+
+    except Exception as e:
+        st.error(f'Error polling status: {e}')
+        st.code(traceback.format_exc())
+        if st.button('Stop monitoring'):
+            st.session_state.sam_active_run = None
+            st.rerun()
+
+    st.stop()
+
+
+# ── Section 1 · Load ──────────────────────────────────────────────────────────
 
 st.subheader('1 · Load opportunities')
 
 tab_csv, tab_api = st.tabs(['📄 Upload CSV', '🔌 Fetch from API'])
 
-# ── Tab: Upload CSV ────────────────────────────────────────────────────────
+
+# ── Tab: Upload CSV ───────────────────────────────────────────────────────────
 
 with tab_csv:
     files = st.file_uploader(
@@ -511,17 +438,16 @@ with tab_csv:
             combined = pd.concat(frames, ignore_index=True).dropna(how='all')
             if (
                 st.session_state.sam_raw_df is None
-                or st.session_state.sam_from_api
                 or len(combined) != len(st.session_state.sam_raw_df)
             ):
                 st.session_state.sam_raw_df        = combined
                 st.session_state.sam_screened_df   = None
                 st.session_state.sam_col_map       = None
-                st.session_state.sam_from_api      = False
                 st.session_state.sam_existing_keys = None
                 st.session_state.sam_custom_cols   = []
 
-# ── Tab: Fetch from API ────────────────────────────────────────────────────
+
+# ── Tab: Fetch from API ───────────────────────────────────────────────────────
 
 with tab_api:
     sam_key = st.secrets.get('sam_gov_api_key')
@@ -531,6 +457,11 @@ with tab_api:
             'Register for a free key at **beta.sam.gov → Account Settings → API Keys**.'
         )
     else:
+        st.caption(
+            'Triggers the Cloud Run `sam-gov-job` — fetching, screening, summarising, '
+            'and embedding all run in the background. Streamlit polls for completion.'
+        )
+
         today_date   = datetime.today().date()
         default_from = today_date - timedelta(days=30)
 
@@ -570,127 +501,157 @@ with tab_api:
                 key='sam_api_fetch_desc',
                 help=(
                     'Makes one additional API call per opportunity to retrieve the full '
-                    'synopsis text. Slower but significantly improves screening accuracy.'
+                    'synopsis text. Slower but significantly improves screening accuracy. '
+                    'Disable for very large date ranges to stay within the daily API quota.'
                 ),
             )
 
+        with st.expander('Custom columns (optional)', expanded=bool(st.session_state.sam_api_custom_cols)):
+            st.caption(
+                'Add extra columns to tag every saved topic with campaign-specific metadata.'
+            )
+
+            for entry in list(st.session_state.sam_api_custom_cols):
+                sc1, sc2, sc3 = st.columns([2, 4, 1])
+                with sc1:
+                    st.text(entry['name'])
+                with sc2:
+                    entry['value'] = st.text_input(
+                        'Value', value=entry['value'],
+                        key=f'sam_api_cfill_{entry["name"]}', label_visibility='collapsed',
+                    )
+                with sc3:
+                    if st.button('✕', key=f'sam_api_crm_{entry["name"]}', use_container_width=True):
+                        st.session_state.sam_api_custom_cols = [
+                            e for e in st.session_state.sam_api_custom_cols if e['name'] != entry['name']
+                        ]
+                        st.rerun()
+
+            if st.session_state.sam_api_custom_cols:
+                st.divider()
+
+            sna1, sna2, sna3 = st.columns([2, 4, 1])
+            with sna1:
+                new_api_sc_name = st.text_input(
+                    'Column name', placeholder='e.g. campaign_name',
+                    key='sam_api_new_sc_name', label_visibility='collapsed',
+                )
+            with sna2:
+                new_api_sc_val = st.text_input(
+                    'Value', placeholder='e.g. Spring 2026',
+                    key='sam_api_new_sc_val', label_visibility='collapsed',
+                )
+            with sna3:
+                if st.button('Add', key='sam_api_add_sc_btn', use_container_width=True):
+                    clean = new_api_sc_name.strip().replace(' ', '_').lower()
+                    existing_names = {e['name'] for e in st.session_state.sam_api_custom_cols}
+                    if (
+                        clean
+                        and clean not in _SAM_RESERVED_COLS
+                        and clean not in existing_names
+                    ):
+                        st.session_state.sam_api_custom_cols.append({'name': clean, 'value': new_api_sc_val.strip()})
+                        st.rerun()
+
         if api_date_from > api_date_to:
             st.error('"Posted from" must be on or before "Posted to".')
-        elif st.button('🔍 Fetch from SAM.gov', type='primary', key='sam_api_fetch_btn'):
-            try:
-                items, total = _search_sam(
-                    api_key      = sam_key,
-                    date_from    = api_date_from.strftime('%m/%d/%Y'),
-                    date_to      = api_date_to.strftime('%m/%d/%Y'),
-                    notice_types = selected_type_codes,
-                    keyword      = api_keyword.strip(),
-                    max_results  = int(api_max),
-                )
-                if not items:
-                    st.warning(f'No active opportunities found for those filters (total records: {total:,}).')
-                else:
-                    st.caption(f'Found **{total:,}** total records; fetched **{len(items):,}**.')
-                    df_api, col_map_api = _items_to_df(items, sam_key, bool(api_fetch_desc))
-                    with st.spinner('Normalizing agency names…'):
-                        try:
-                            mapping = _normalize_agencies(
-                                df_api['agency'].tolist(),
-                                st.secrets['anthropic_api_key'],
-                            )
-                            if mapping:
-                                df_api['agency'] = df_api['agency'].map(
-                                    lambda a: mapping.get(a, a)
-                                )
-                        except Exception:
-                            pass  # non-critical — keep raw names if it fails
-                    st.session_state.sam_raw_df        = df_api
-                    st.session_state.sam_col_map       = col_map_api
-                    st.session_state.sam_from_api      = True
-                    st.session_state.sam_screened_df   = None
-                    st.session_state.sam_existing_keys = None
-                    st.session_state.sam_custom_cols   = []
+        else:
+            if st.button('▶ Run SAM.gov Import', type='primary', key='sam_api_run_btn'):
+                run_id = f"sam_gov_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+                config = {
+                    'run_id':      run_id,
+                    'input_mode':  'api',
+                    'api_params':  {
+                        'date_from':       api_date_from.strftime('%m/%d/%Y'),
+                        'date_to':         api_date_to.strftime('%m/%d/%Y'),
+                        'notice_types':    selected_type_codes,
+                        'keyword':         api_keyword.strip(),
+                        'max_results':     int(api_max),
+                        'fetch_desc':      bool(api_fetch_desc),
+                        'sam_gov_api_key': sam_key,
+                    },
+                    'custom_cols': {
+                        e['name']: e['value']
+                        for e in st.session_state.sam_api_custom_cols
+                    },
+                }
+                try:
+                    gcs_client = _get_storage_client()
+                    with st.spinner('Uploading job config…'):
+                        config_blob = _write_sam_config(gcs_client, config)
+                    with st.spinner('Triggering Cloud Run job…'):
+                        _trigger_sam_job(config_blob)
+                    st.session_state.sam_active_run = {
+                        'run_id':      run_id,
+                        'config_blob': config_blob,
+                    }
                     st.rerun()
-            except requests.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else '?'
-                if status == 403:
-                    st.error('SAM.gov API returned 403 — check that your API key is correct and active.')
-                elif status == 429:
-                    st.error('SAM.gov API rate limit reached — wait a moment and try again.')
-                else:
-                    st.error(f'SAM.gov API HTTP {status}: {exc}')
-            except Exception as exc:
-                st.error(f'Fetch failed: {exc}')
+                except Exception as exc:
+                    st.error(f'Failed to trigger job: {exc}')
+                    st.code(traceback.format_exc())
 
+
+# ── CSV path guard ────────────────────────────────────────────────────────────
 
 if st.session_state.sam_raw_df is None:
     st.stop()
 
 df_raw   = st.session_state.sam_raw_df
-from_api = bool(st.session_state.sam_from_api)
-src_label = 'API fetch' if from_api else (f'{len(files)} file(s)' if files else '(previously loaded)')
+src_label = f'{len(files)} file(s)' if files else '(previously loaded)'
 st.caption(f'**{len(df_raw):,}** rows loaded from {src_label}.')
 st.dataframe(df_raw.head(5), hide_index=True, use_container_width=True)
 
 
-# ── Section 2 · Column mapping (CSV path only) ─────────────────────────────
+# ── Section 2 · Column mapping ────────────────────────────────────────────────
 
-if not from_api:
-    st.divider()
-    st.subheader('2 · Column mapping')
-    st.caption('Confirm which columns map to each field — auto-detected where possible.')
+st.divider()
+st.subheader('2 · Column mapping')
+st.caption('Confirm which columns map to each field — auto-detected where possible.')
 
-    cols     = df_raw.columns.tolist()
-    none_opt = '— none —'
-    col_opts = [none_opt] + cols
-
-    def _sel(field: str, label: str, required: bool = False) -> str | None:
-        detected = _detect_col(cols, field)
-        idx      = col_opts.index(detected) if detected in col_opts else 0
-        val      = st.selectbox(
-            label + (' *' if required else ''),
-            col_opts,
-            index=idx,
-            key=f'sam_map_{field}',
-        )
-        return val if val != none_opt else None
-
-    left_col, right_col = st.columns(2)
-    with left_col:
-        m_title  = _sel('title',       'Title',              required=True)
-        m_desc   = _sel('description', 'Description',        required=True)
-        m_naics  = _sel('naics_desc',  'NAICS Descriptor')
-        m_notice = _sel('notice_id',   'Notice ID')
-    with right_col:
-        m_agency = _sel('agency',      'Agency / Department')
-        m_posted = _sel('posted_date', 'Posted Date')
-        m_dl     = _sel('deadline',    'Response Deadline')
-
-    col_map = {
-        'title':       m_title,
-        'description': m_desc,
-        'naics_desc':  m_naics,
-        'notice_id':   m_notice,
-        'agency':      m_agency,
-        'posted_date': m_posted,
-        'deadline':    m_dl,
-    }
-
-    if not m_title or not m_desc:
-        st.warning('Title and Description columns are required before proceeding.')
-        st.stop()
-
-else:
-    col_map  = st.session_state.sam_col_map
-    m_title  = col_map['title']
-    m_desc   = col_map['description']
-    m_naics  = col_map.get('naics_desc')
-    m_notice = col_map.get('notice_id')
-    m_agency = col_map.get('agency')
-    m_posted = col_map.get('posted_date')
-    m_dl     = col_map.get('deadline')
+cols     = df_raw.columns.tolist()
+none_opt = '— none —'
+col_opts = [none_opt] + cols
 
 
-# ── Section 3 · Screening ──────────────────────────────────────────────────
+def _sel(field: str, label: str, required: bool = False) -> str | None:
+    detected = _detect_col(cols, field)
+    idx      = col_opts.index(detected) if detected in col_opts else 0
+    val      = st.selectbox(
+        label + (' *' if required else ''),
+        col_opts,
+        index=idx,
+        key=f'sam_map_{field}',
+    )
+    return val if val != none_opt else None
+
+
+left_col, right_col = st.columns(2)
+with left_col:
+    m_title  = _sel('title',       'Title',              required=True)
+    m_desc   = _sel('description', 'Description',        required=True)
+    m_naics  = _sel('naics_desc',  'NAICS Descriptor')
+    m_notice = _sel('notice_id',   'Notice ID')
+with right_col:
+    m_agency = _sel('agency',      'Agency / Department')
+    m_posted = _sel('posted_date', 'Posted Date')
+    m_dl     = _sel('deadline',    'Response Deadline')
+
+col_map = {
+    'title':       m_title,
+    'description': m_desc,
+    'naics_desc':  m_naics,
+    'notice_id':   m_notice,
+    'agency':      m_agency,
+    'posted_date': m_posted,
+    'deadline':    m_dl,
+}
+
+if not m_title or not m_desc:
+    st.warning('Title and Description columns are required before proceeding.')
+    st.stop()
+
+
+# ── Section 3 · Screening ─────────────────────────────────────────────────────
 
 st.divider()
 st.subheader('3 · Screen with Claude')
@@ -757,7 +718,7 @@ with st.expander(f'❌ Filtered out ({len(failing)})', expanded=False):
         )
 
 
-# ── Section 4 · Save ──────────────────────────────────────────────────────
+# ── Section 4 · Save ─────────────────────────────────────────────────────────
 
 st.divider()
 st.subheader('4 · Save to topic store')
@@ -871,7 +832,6 @@ if st.button('💾 Embed & Save', type='primary'):
         st.session_state.sam_screened_df   = None
         st.session_state.sam_existing_keys = None
         st.session_state.sam_col_map       = None
-        st.session_state.sam_from_api      = None
         st.session_state.sam_custom_cols   = []
         st.rerun()
     except Exception as e:
