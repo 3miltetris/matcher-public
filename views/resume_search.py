@@ -9,6 +9,7 @@ and get a ranked list of matching contacts with their expertise summaries.
 import io
 
 import numpy as np
+_ARRAY_TYPES = (list, np.ndarray)
 import pandas as pd
 import streamlit as st
 from google.cloud import storage
@@ -31,24 +32,35 @@ def _get_storage_client() -> storage.Client:
     return storage.Client(credentials=creds)
 
 
-@st.cache_data(ttl=300, show_spinner='Loading resumes from GCS…')
-def _load_resumes() -> pd.DataFrame:
+def _load_resumes() -> tuple[pd.DataFrame, list[str]]:
+    """Returns (df, errors). df contains only rows with valid embeddings."""
     client = _get_storage_client()
-    blobs  = client.list_blobs(_BUCKET, prefix=_RESUMES_PREFIX)
-    frames = []
-    for blob in blobs:
-        if not blob.name.endswith('.parquet'):
-            continue
+    blobs  = list(client.list_blobs(_BUCKET, prefix=_RESUMES_PREFIX))
+    parquet_blobs = [b for b in blobs if b.name.endswith('.parquet')]
+
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    for blob in parquet_blobs:
         try:
             frames.append(pd.read_parquet(io.BytesIO(blob.download_as_bytes())))
-        except Exception:
-            pass
+        except Exception as e:
+            errors.append(f'{blob.name}: {e}')
+
     if not frames:
-        return pd.DataFrame()
+        return pd.DataFrame(), errors
+
     df = pd.concat(frames, ignore_index=True)
-    # Drop rows without a usable embedding
-    df = df[df['embeddings'].apply(lambda e: isinstance(e, list) and len(e) > 0)]
-    return df.reset_index(drop=True)
+    if 'embeddings' not in df.columns:
+        errors.append('embeddings column missing from parquet — re-run the importer embed step')
+        return pd.DataFrame(), errors
+
+    before = len(df)
+    df = df[df['embeddings'].apply(lambda e: isinstance(e, _ARRAY_TYPES) and len(e) > 0)]
+    skipped = before - len(df)
+    if skipped:
+        errors.append(f'{skipped} row(s) skipped — empty embeddings (contacts with no extractable resume text)')
+
+    return df.reset_index(drop=True), errors
 
 
 # ── Page ───────────────────────────────────────────────────────────────────
@@ -64,13 +76,16 @@ st.caption(
 col_reload, col_count = st.columns([1, 5])
 with col_reload:
     if st.button('↺ Reload', help='Refresh resume data from GCS'):
-        st.cache_data.clear()
         st.rerun()
 
-resumes_df = _load_resumes()
+with st.spinner('Loading resumes from GCS…'):
+    resumes_df, load_errors = _load_resumes()
+
+for err in load_errors:
+    st.warning(err)
 
 if resumes_df.empty:
-    st.warning('No resumes found in GCS. Use the Resume Importer to add contacts.')
+    st.warning('No resumes with valid embeddings found in GCS. Use the Resume Importer to add contacts.')
     st.stop()
 
 with col_count:
