@@ -45,6 +45,8 @@ _NOTICE_TYPE_OPTIONS = {
     'Special Notice':                 's',
 }
 
+_DAILY_CONFIG_PATH = 'sam-gov-configs/daily_schedule.json'
+
 
 # ── Screening prompt (CSV path) ───────────────────────────────────────────────
 
@@ -99,6 +101,21 @@ Summarize the opportunity in 3–5 sentences. Focus exclusively on:
 
 Strip out all procurement boilerplate: FAR clauses, set-aside language, submission deadlines, page limits, administrative instructions, and points of contact. Write in plain technical language. If the description is already short and technical, return it as-is.\
 """
+
+
+# ── Daily schedule helpers ────────────────────────────────────────────────────
+
+def _load_daily_config(client: storage.Client) -> dict | None:
+    blob = client.bucket(_BUCKET).blob(_DAILY_CONFIG_PATH)
+    if not blob.exists():
+        return None
+    return json.loads(blob.download_as_text())
+
+
+def _save_daily_config(client: storage.Client, config: dict) -> None:
+    client.bucket(_BUCKET).blob(_DAILY_CONFIG_PATH).upload_from_string(
+        json.dumps(config), content_type='application/json'
+    )
 
 
 # ── GCS helpers ──────────────────────────────────────────────────────────────
@@ -348,6 +365,8 @@ if 'sam_custom_cols' not in st.session_state:
     st.session_state.sam_custom_cols = []
 if 'sam_api_custom_cols' not in st.session_state:
     st.session_state.sam_api_custom_cols = []
+if 'sam_daily_config' not in st.session_state:
+    st.session_state.sam_daily_config = 'unloaded'
 
 
 # ── Page ──────────────────────────────────────────────────────────────────────
@@ -359,6 +378,122 @@ st.caption(
     'SAM.gov API (processed by Cloud Run).'
 )
 
+
+# ── Daily Schedule ─────────────────────────────────────────────────────────────
+
+# Load the saved daily config once per session
+if st.session_state.sam_daily_config == 'unloaded':
+    try:
+        st.session_state.sam_daily_config = _load_daily_config(_get_storage_client())
+    except Exception:
+        st.session_state.sam_daily_config = None
+
+_daily_cfg     = st.session_state.sam_daily_config
+_daily_params  = (_daily_cfg or {}).get('api_params', {})
+_daily_exists  = _daily_cfg is not None
+
+with st.expander('⏰ Daily API Parameters', expanded=not _daily_exists):
+    st.caption(
+        'Configure the filters for the automated 5 AM CST daily pull. '
+        'Settings are saved to GCS and picked up by Cloud Scheduler each morning — '
+        'no redeploy needed to change parameters.'
+    )
+
+    _sam_key = st.secrets.get('sam_gov_api_key')
+    if not _sam_key:
+        st.warning(
+            'Add `sam_gov_api_key` to `.streamlit/secrets.toml` to configure the daily schedule.'
+        )
+    else:
+        _d_lookback = st.number_input(
+            'Lookback window (days)',
+            min_value=1, max_value=30,
+            value=int(_daily_params.get('lookback_days', 1)),
+            help='Pull opportunities posted within the last N days relative to when the job fires.',
+            key='daily_lookback',
+        )
+
+        _d_type_labels = st.multiselect(
+            'Notice types',
+            list(_NOTICE_TYPE_OPTIONS.keys()),
+            default=[
+                lbl for lbl, code in _NOTICE_TYPE_OPTIONS.items()
+                if code in _daily_params.get('notice_types', ['p', 'o', 'k', 'r'])
+            ],
+            key='daily_notice_types',
+        )
+
+        _d_keyword = st.text_input(
+            'Keyword filter (optional)',
+            value=_daily_params.get('keyword', ''),
+            placeholder='e.g. AI, biotech, cybersecurity',
+            key='daily_keyword',
+        )
+
+        _dc_l, _dc_r = st.columns(2)
+        with _dc_l:
+            _d_max = st.number_input(
+                'Max results (0 = no cap)',
+                min_value=0,
+                value=int(_daily_params.get('max_results', 500)),
+                step=100,
+                key='daily_max',
+            )
+        with _dc_r:
+            _d_fetch_desc = st.checkbox(
+                'Fetch full descriptions',
+                value=bool(_daily_params.get('fetch_desc', True)),
+                key='daily_fetch_desc',
+            )
+
+        if st.button('💾 Save Daily Schedule', key='save_daily_btn'):
+            _new_daily = {
+                'run_id':      'daily',
+                'input_mode':  'api',
+                'api_params':  {
+                    'lookback_days':  int(_d_lookback),
+                    'notice_types':   [_NOTICE_TYPE_OPTIONS[lbl] for lbl in _d_type_labels],
+                    'keyword':        _d_keyword.strip(),
+                    'max_results':    int(_d_max),
+                    'fetch_desc':     bool(_d_fetch_desc),
+                    'sam_gov_api_key': _sam_key,
+                },
+                'custom_cols': {},
+            }
+            try:
+                _save_daily_config(_get_storage_client(), _new_daily)
+                st.session_state.sam_daily_config = _new_daily
+                st.success(f'Daily schedule saved to `{_DAILY_CONFIG_PATH}`.')
+            except Exception as _e:
+                st.error(f'Failed to save: {_e}')
+
+    if _daily_exists:
+        st.divider()
+        st.caption(
+            f'**Current schedule:** last {_daily_params.get("lookback_days", 1)} day(s) · '
+            f'notice types: `{", ".join(_daily_params.get("notice_types", []))}`'
+        )
+        with st.expander('Cloud Scheduler setup (one-time)', expanded=False):
+            st.caption(
+                'Run this once in Cloud Shell to wire up the daily 5 AM CST trigger. '
+                'After that, only the GCS config controls what gets fetched — no redeploy needed.'
+            )
+            st.code(
+                'gcloud scheduler jobs create http sam-gov-daily \\\n'
+                '  --schedule="0 11 * * *" \\\n'
+                '  --uri="https://run.googleapis.com/v2/projects/cc-matcher-v1/locations/us-central1/jobs/sam-gov-job:run" \\\n'
+                '  --message-body=\'{"overrides":{"containerOverrides":[{"args":["sam-gov-configs/daily_schedule.json"]}]}}\' \\\n'
+                '  --oauth-service-account-email=matching-job@cc-matcher-v1.iam.gserviceaccount.com \\\n'
+                '  --location=us-central1 \\\n'
+                '  --time-zone="America/Chicago"',
+                language='bash',
+            )
+            st.caption(
+                'To update the trigger time later: '
+                '`gcloud scheduler jobs update http sam-gov-daily --schedule="..." --location=us-central1`'
+            )
+
+st.divider()
 
 # ── Active run: polling UI ────────────────────────────────────────────────────
 

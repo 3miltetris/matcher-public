@@ -50,7 +50,7 @@ import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
@@ -195,9 +195,16 @@ def _fetch_descriptions_batch(notice_ids: list[str], api_key: str) -> list[str]:
 
 
 def _fetch_from_sam(api_params: dict) -> pd.DataFrame:
-    api_key      = api_params['sam_gov_api_key']
-    date_from    = api_params['date_from']
-    date_to      = api_params['date_to']
+    api_key   = api_params['sam_gov_api_key']
+
+    # Support dynamic date range for scheduled daily runs
+    if api_params.get('lookback_days'):
+        today_dt  = datetime.today()
+        date_to   = today_dt.strftime('%m/%d/%Y')
+        date_from = (today_dt - timedelta(days=int(api_params['lookback_days']))).strftime('%m/%d/%Y')
+    else:
+        date_from = api_params['date_from']
+        date_to   = api_params['date_to']
     notice_types = api_params.get('notice_types', [])
     keyword      = api_params.get('keyword', '')
     max_results  = int(api_params.get('max_results', 0))
@@ -448,6 +455,10 @@ def main(config_blob_path: str) -> None:
     config = json.loads(gcs.bucket(_BUCKET).blob(config_blob_path).download_as_text())
 
     run_id      = config['run_id']
+    # "daily" is the sentinel used by Cloud Scheduler; generate a real ID at runtime
+    if run_id == 'daily':
+        run_id = f"sam_gov_{datetime.today().strftime('%Y-%m-%d_%H-%M-%S')}"
+
     input_mode  = config['input_mode']
     custom_cols = config.get('custom_cols', {})
 
