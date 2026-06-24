@@ -117,10 +117,24 @@ def _extract_text(content: bytes, url: str, content_type: str) -> tuple[str, str
         except Exception:
             return '', 'pdf'
     if ftype == 'docx':
+        # Try python-docx first — paragraphs plus table cells (many resumes use table layouts)
         try:
-            import docx
-            doc = docx.Document(io.BytesIO(content))
-            return ' '.join(p.text for p in doc.paragraphs)[:_TEXT_LIMIT], 'docx'
+            import docx as docx_lib
+            doc   = docx_lib.Document(io.BytesIO(content))
+            parts = [p.text for p in doc.paragraphs]
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        parts.append(cell.text)
+            text = ' '.join(p for p in parts if p.strip())[:_TEXT_LIMIT]
+            if text:
+                return text, 'docx'
+        except Exception:
+            pass
+        # Fallback: PyMuPDF handles DOCX natively and may recover text python-docx misses
+        try:
+            doc = fitz.open(stream=content, filetype='docx')
+            return ' '.join(page.get_text() for page in doc)[:_TEXT_LIMIT], 'docx'
         except Exception:
             return '', 'docx'
     return '', 'unknown'
