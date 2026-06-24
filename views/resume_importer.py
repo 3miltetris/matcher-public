@@ -87,9 +87,9 @@ def _load_existing_emails(client: storage.Client) -> set[str]:
 
 # ── Fetch helpers ──────────────────────────────────────────────────────────
 
-def _fetch_resume(url: str, hs_token: str | None) -> tuple[bytes | None, str]:
-    """Return (content_bytes, content_type). Sends auth on the first request if available.
-    Returns None when the server responds with HTML (auth redirect masquerading as 200 OK)."""
+def _fetch_resume(url: str, hs_token: str | None) -> tuple[bytes | None, str, str]:
+    """Return (content_bytes, content_type, error_detail).
+    error_detail is non-empty only on failure and describes why."""
     headers = {'User-Agent': 'MatcherBot/1.0'}
     if hs_token:
         headers['Authorization'] = f'Bearer {hs_token}'
@@ -98,11 +98,11 @@ def _fetch_resume(url: str, hs_token: str | None) -> tuple[bytes | None, str]:
         if resp.status_code == 200:
             ct = resp.headers.get('Content-Type', '')
             if 'text/html' in ct:
-                return None, ''  # auth redirect or error page, not a file
-            return resp.content, ct
-    except Exception:
-        pass
-    return None, ''
+                return None, '', f'200 OK but Content-Type is text/html (auth redirect?)'
+            return resp.content, ct, ''
+        return None, '', f'HTTP {resp.status_code}'
+    except Exception as exc:
+        return None, '', f'exception: {exc}'
 
 
 def _detect_file_type(content: bytes, url: str, content_type: str) -> str:
@@ -186,12 +186,12 @@ def _run_fetch_and_extract(rows: list[dict], hs_token: str | None, progress) -> 
     def _one(idx: int, row: dict) -> tuple[int, dict]:
         url = str(row.get('resume_url') or '').strip()
         if not url:
-            return idx, {**row, 'resume_text': '', 'file_type': 'missing'}
-        content, ct = _fetch_resume(url, hs_token)
+            return idx, {**row, 'resume_text': '', 'file_type': 'missing', 'fetch_error': 'no url'}
+        content, ct, err = _fetch_resume(url, hs_token)
         if content is None:
-            return idx, {**row, 'resume_text': '', 'file_type': 'fetch_failed'}
+            return idx, {**row, 'resume_text': '', 'file_type': 'fetch_failed', 'fetch_error': err}
         text, ftype = _extract_text(content, url, ct)
-        return idx, {**row, 'resume_text': text, 'file_type': ftype}
+        return idx, {**row, 'resume_text': text, 'file_type': ftype, 'fetch_error': ''}
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(_one, i, r): i for i, r in enumerate(rows)}
@@ -426,6 +426,15 @@ if st.session_state.ri_processed_rows is None:
             ft = r.get('file_type', 'unknown')
             statuses[ft] = statuses.get(ft, 0) + 1
         st.write('**Fetch results:**', statuses)
+
+        # Show a sample of failure reasons to diagnose auth/URL issues
+        failed_rows = [r for r in fetched if r.get('file_type') == 'fetch_failed']
+        if failed_rows:
+            with st.expander(f'Failure diagnostics (sample of {min(5, len(failed_rows))})'):
+                for r in failed_rows[:5]:
+                    st.markdown(f'**URL:** `{r.get("resume_url", "")[:120]}`')
+                    st.markdown(f'**Reason:** `{r.get("fetch_error", "unknown")}`')
+                    st.divider()
 
         ok_rows = [r for r in fetched
                    if len(str(r.get('resume_text', '')).strip()) >= _MIN_TEXT_LEN]
