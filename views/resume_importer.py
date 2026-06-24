@@ -32,15 +32,15 @@ _TEXT_LIMIT     = 12_000  # chars of resume text fed to GPT
 _MIN_TEXT_LEN   = 400     # minimum chars to consider extraction successful
 
 _SUMMARISE_SYSTEM = (
-    'You are analyzing resume text. Write a 3-5 sentence professional summary covering: '
+    'You are analyzing resume text. Write a 3-5 sentence professional summary covering as many '
+    'of the following as the text supports: '
     '(1) primary technical skills and tools, '
     '(2) domain and industry expertise, '
     '(3) years of relevant experience, and '
     '(4) notable project types or accomplishments. '
-    'CRITICAL: only use information explicitly stated in the text. '
-    'Do NOT infer, assume, or invent any detail not present. '
-    'If the text does not contain enough information to write a grounded summary, '
-    'respond with exactly: INSUFFICIENT_TEXT'
+    'Only use information explicitly present in the text — do not invent or assume anything. '
+    'If the text contains too little information for even a brief grounded summary, '
+    'respond with a single dash: -'
 )
 
 _FIELD_CANDIDATES: dict[str, list[str]] = {
@@ -226,7 +226,10 @@ def _run_summarization(rows: list[dict], openai_key: str, progress) -> list[dict
                 ],
             )
             summary = resp.choices[0].message.content.strip()
-            if summary == 'INSUFFICIENT_TEXT':
+            # Clean up sentinel leakage from either prompt version
+            summary = summary.replace('INSUFFICIENT_TEXT', '').strip(' .')
+            # Single-dash response means GPT had too little to work with
+            if summary in ('-', '–', '—') or len(summary) < 40:
                 summary = ''
             return idx, {**row, 'expertise_summary': summary}
         except Exception as e:
