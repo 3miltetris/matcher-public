@@ -47,6 +47,7 @@ import json
 import os
 import secrets as _secrets
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -68,9 +69,12 @@ _STATUS_PREFIX    = 'sam-gov-jobs/'
 _SAM_API_BASE     = 'https://api.sam.gov/opportunities/v2/search'
 _SAM_DESC_BASE    = 'https://api.sam.gov/opportunities/v2/noticedesc'
 _SAM_PAGE_SIZE    = 1000
-_DESC_WORKERS     = 6   # SAM.gov allows 10 req/s — 6 workers halves description fetch time
+_DESC_WORKERS     = 6   # SAM.gov allows 10 req/s — 6 workers is the concurrency cap
 _SAM_PAGE_SLEEP   = 1.0  # seconds between pagination requests
 _SAM_MAX_RETRIES  = 6   # max retries on 429
+_SAM_RATE_LOCK    = threading.Lock()
+_SAM_LAST_REQ     = [0.0]  # mutable for closure; protected by _SAM_RATE_LOCK
+_SAM_MIN_INTERVAL = 1.0 / 8  # 8 req/s — conservative under 10 req/s limit
 _SCREEN_CONCUR    = 20
 _SUMMARY_CONCUR   = 20
 _EMBED_WORKERS    = 8
@@ -153,7 +157,13 @@ def _write_status(client: storage.Client, run_id: str, payload: dict) -> None:
 # ── SAM.gov API helpers ────────────────────────────────────────────────────────
 
 def _sam_get(url: str, params: dict, timeout: int = 30) -> requests.Response:
-    """GET with exponential backoff on 429 responses."""
+    """GET with proactive rate limiting (8 req/s global) and exponential backoff on 429."""
+    with _SAM_RATE_LOCK:
+        gap = _SAM_MIN_INTERVAL - (time.time() - _SAM_LAST_REQ[0])
+        if gap > 0:
+            time.sleep(gap)
+        _SAM_LAST_REQ[0] = time.time()
+
     for attempt in range(_SAM_MAX_RETRIES):
         r = requests.get(url, params=params, timeout=timeout)
         if r.status_code == 429:
@@ -208,7 +218,6 @@ def _fetch_from_sam(api_params: dict) -> pd.DataFrame:
     notice_types = api_params.get('notice_types', [])
     keyword      = api_params.get('keyword', '')
     max_results  = int(api_params.get('max_results', 0))
-    fetch_desc   = bool(api_params.get('fetch_desc', True))
 
     all_items: list[dict] = []
     offset = 0
@@ -253,16 +262,12 @@ def _fetch_from_sam(api_params: dict) -> pd.DataFrame:
 
     print(f'  fetched {len(all_items):,} items', flush=True)
 
-    notice_ids = [item.get('noticeId', '') for item in all_items]
-    if fetch_desc and notice_ids:
-        print('Fetching full descriptions…', flush=True)
-        descriptions = _fetch_descriptions_batch(notice_ids, api_key)
-    else:
-        descriptions = ['' for _ in all_items]
-
+    # Descriptions are fetched later, after screening, to avoid burning API quota on rows
+    # that will be filtered out.  The caller is responsible for calling _fetch_descriptions_batch
+    # on the subset that passes screening when fetch_desc is True.
     return pd.DataFrame({
         'title':       [item.get('title', '')                                                    for item in all_items],
-        'description': descriptions,
+        'description': ['' for _ in all_items],
         'naics_desc':  [item.get('naicsCode', '')                                                for item in all_items],
         'notice_id':   [(item.get('solicitationNumber') or item.get('noticeId', ''))             for item in all_items],
         'agency':      [(item.get('subTier') or item.get('department', ''))                      for item in all_items],
@@ -531,7 +536,18 @@ def main(config_blob_path: str) -> None:
         print('All passing rows already in the store — exiting.', flush=True)
         return
 
-    # ── Step 4: Summarize ──────────────────────────────────────────────────────
+    # ── Step 4 (API mode only): Fetch full descriptions for passing rows ───────
+    # Descriptions were intentionally skipped during the initial fetch so we only
+    # call the SAM.gov description endpoint for the ~20-40% of rows that survived
+    # screening and dedup — typically 5-10x fewer requests than the full fetch.
+    if input_mode == 'api' and config.get('api_params', {}).get('fetch_desc', True):
+        api_key = config['api_params']['sam_gov_api_key']
+        print(f'Fetching descriptions for {rows_dedup:,} passing rows…', flush=True)
+        descriptions = _fetch_descriptions_batch(new_rows['notice_id'].tolist(), api_key)
+        new_rows = new_rows.copy()
+        new_rows['description'] = descriptions
+
+    # ── Step 5: Summarize ──────────────────────────────────────────────────────
     print(f'Summarizing {rows_dedup:,} rows…', flush=True)
     summaries = asyncio.run(_summarize_all(
         new_rows['title'].tolist(),
