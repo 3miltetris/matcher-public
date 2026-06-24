@@ -29,6 +29,7 @@ from src.modules.Embedding.text_embedder import TextProcessor
 _BUCKET         = 'cc-matcher-bucket-jeg-v1'
 _RESUMES_PREFIX = 'data/resumes/'
 _TEXT_LIMIT     = 12_000  # chars of resume text fed to GPT
+_MIN_TEXT_LEN   = 150     # minimum chars to consider extraction successful
 
 _SUMMARISE_SYSTEM = (
     'You are analyzing a resume. Write a 3-5 sentence professional summary that highlights: '
@@ -84,15 +85,18 @@ def _load_existing_emails(client: storage.Client) -> set[str]:
 # ── Fetch helpers ──────────────────────────────────────────────────────────
 
 def _fetch_resume(url: str, hs_token: str | None) -> tuple[bytes | None, str]:
-    """Return (content_bytes, content_type). Retries with Bearer auth on 401/403."""
+    """Return (content_bytes, content_type). Sends auth on the first request if available.
+    Returns None when the server responds with HTML (auth redirect masquerading as 200 OK)."""
     headers = {'User-Agent': 'MatcherBot/1.0'}
+    if hs_token:
+        headers['Authorization'] = f'Bearer {hs_token}'
     try:
         resp = req_lib.get(url, headers=headers, timeout=25, allow_redirects=True)
-        if resp.status_code in (401, 403) and hs_token:
-            headers['Authorization'] = f'Bearer {hs_token}'
-            resp = req_lib.get(url, headers=headers, timeout=25, allow_redirects=True)
         if resp.status_code == 200:
-            return resp.content, resp.headers.get('Content-Type', '')
+            ct = resp.headers.get('Content-Type', '')
+            if 'text/html' in ct:
+                return None, ''  # auth redirect or error page, not a file
+            return resp.content, ct
     except Exception:
         pass
     return None, ''
@@ -174,8 +178,8 @@ def _run_summarization(rows: list[dict], openai_key: str, progress) -> list[dict
     client = OpenAI(api_key=openai_key)
 
     def _one(idx: int, row: dict) -> tuple[int, dict]:
-        text = row.get('resume_text', '')
-        if not text:
+        text = str(row.get('resume_text', '')).strip()
+        if len(text) < _MIN_TEXT_LEN:
             return idx, {**row, 'expertise_summary': ''}
         try:
             resp = client.chat.completions.create(
@@ -385,7 +389,8 @@ if st.session_state.ri_processed_rows is None:
             statuses[ft] = statuses.get(ft, 0) + 1
         st.write('**Fetch results:**', statuses)
 
-        ok_rows = [r for r in fetched if r.get('resume_text')]
+        ok_rows = [r for r in fetched
+                   if len(str(r.get('resume_text', '')).strip()) >= _MIN_TEXT_LEN]
         failed  = len(fetched) - len(ok_rows)
         if failed:
             st.warning(f'{failed} resume(s) could not be fetched or had no extractable text.')
