@@ -29,15 +29,18 @@ from src.modules.Embedding.text_embedder import TextProcessor
 _BUCKET         = 'cc-matcher-bucket-jeg-v1'
 _RESUMES_PREFIX = 'data/resumes/'
 _TEXT_LIMIT     = 12_000  # chars of resume text fed to GPT
-_MIN_TEXT_LEN   = 150     # minimum chars to consider extraction successful
+_MIN_TEXT_LEN   = 400     # minimum chars to consider extraction successful
 
 _SUMMARISE_SYSTEM = (
-    'You are analyzing a resume. Write a 3-5 sentence professional summary that highlights: '
+    'You are analyzing resume text. Write a 3-5 sentence professional summary covering: '
     '(1) primary technical skills and tools, '
     '(2) domain and industry expertise, '
     '(3) years of relevant experience, and '
     '(4) notable project types or accomplishments. '
-    'Be specific and factual. Only include what is clearly present in the resume.'
+    'CRITICAL: only use information explicitly stated in the text. '
+    'Do NOT infer, assume, or invent any detail not present. '
+    'If the text does not contain enough information to write a grounded summary, '
+    'respond with exactly: INSUFFICIENT_TEXT'
 )
 
 _FIELD_CANDIDATES: dict[str, list[str]] = {
@@ -112,16 +115,45 @@ def _detect_file_type(content: bytes, url: str, content_type: str) -> str:
     return 'unknown'
 
 
+def _extract_docx_xml(content: bytes) -> str:
+    """Parse word/document.xml directly to pull every <w:t> text run.
+    Captures paragraphs, table cells, AND text boxes — the python-docx API misses text boxes,
+    which most resume templates use for their column/sidebar layout."""
+    import zipfile
+    from xml.etree import ElementTree as ET
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            with z.open('word/document.xml') as f:
+                xml_bytes = f.read()
+        ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+        root = ET.fromstring(xml_bytes)
+        texts = [el.text for el in root.findall('.//w:t', ns) if el.text]
+        return ' '.join(texts)[:_TEXT_LIMIT]
+    except Exception:
+        return ''
+
+
 def _extract_text(content: bytes, url: str, content_type: str) -> tuple[str, str]:
     ftype = _detect_file_type(content, url, content_type)
     if ftype == 'pdf':
         try:
-            doc = fitz.open(stream=content, filetype='pdf')
-            return ' '.join(page.get_text() for page in doc)[:_TEXT_LIMIT], 'pdf'
+            doc   = fitz.open(stream=content, filetype='pdf')
+            parts = []
+            for page in doc:
+                # get_text("text") is reliable for native PDFs;
+                # iterating blocks catches some layouts that the flat join misses
+                text = page.get_text("text").strip()
+                if text:
+                    parts.append(text)
+            return ' '.join(parts)[:_TEXT_LIMIT], 'pdf'
         except Exception:
             return '', 'pdf'
     if ftype == 'docx':
-        # Try python-docx first — paragraphs plus table cells (many resumes use table layouts)
+        # Primary: XML parse — the only method that sees text boxes
+        text = _extract_docx_xml(content)
+        if len(text.strip()) >= _MIN_TEXT_LEN:
+            return text, 'docx'
+        # Fallback: python-docx paragraphs + table cells
         try:
             import docx as docx_lib
             doc   = docx_lib.Document(io.BytesIO(content))
@@ -131,16 +163,19 @@ def _extract_text(content: bytes, url: str, content_type: str) -> tuple[str, str
                     for cell in row.cells:
                         parts.append(cell.text)
             text = ' '.join(p for p in parts if p.strip())[:_TEXT_LIMIT]
-            if text:
+            if len(text.strip()) >= _MIN_TEXT_LEN:
                 return text, 'docx'
         except Exception:
             pass
-        # Fallback: PyMuPDF handles DOCX natively and may recover text python-docx misses
+        # Last resort: PyMuPDF
         try:
             doc = fitz.open(stream=content, filetype='docx')
-            return ' '.join(page.get_text() for page in doc)[:_TEXT_LIMIT], 'docx'
+            text = ' '.join(page.get_text() for page in doc)[:_TEXT_LIMIT]
+            if len(text.strip()) >= _MIN_TEXT_LEN:
+                return text, 'docx'
         except Exception:
-            return '', 'docx'
+            pass
+        return '', 'docx'
     return '', 'unknown'
 
 
@@ -190,7 +225,10 @@ def _run_summarization(rows: list[dict], openai_key: str, progress) -> list[dict
                     {'role': 'user',   'content': text},
                 ],
             )
-            return idx, {**row, 'expertise_summary': resp.choices[0].message.content.strip()}
+            summary = resp.choices[0].message.content.strip()
+            if summary == 'INSUFFICIENT_TEXT':
+                summary = ''
+            return idx, {**row, 'expertise_summary': summary}
         except Exception as e:
             return idx, {**row, 'expertise_summary': f'SUMMARY_ERROR: {e}'}
 
@@ -398,12 +436,22 @@ if st.session_state.ri_processed_rows is None:
             st.error('No resume text extracted — check URLs and try again.')
             st.stop()
 
+        with st.expander(f'Preview extracted text ({len(ok_rows)} resumes) — verify before summarising'):
+            for r in ok_rows[:5]:
+                name = f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or r.get('email', '?')
+                st.markdown(f'**{name}** (`{r.get("file_type")}`)')
+                st.text(str(r.get('resume_text', ''))[:600])
+                st.divider()
+            if len(ok_rows) > 5:
+                st.caption(f'Showing 5 of {len(ok_rows)}.')
+
         prog_sum   = st.progress(0, text='Summarising…')
         summarised = _run_summarization(ok_rows, oai_key, prog_sum)
         prog_sum.empty()
 
         st.session_state.ri_processed_rows = summarised
         st.rerun()
+    st.stop()  # wait for the button click before rendering steps 5+
 else:
     summarised = st.session_state.ri_processed_rows
 
