@@ -96,11 +96,19 @@ with col_count:
 st.divider()
 st.subheader('Search')
 
-keyword = st.text_input(
-    'Keyword filter (optional)',
-    placeholder='e.g. machine learning, NIH, Python',
-    help='Only resumes whose expertise summary contains this keyword will be searched.',
-)
+kf_col, ex_col = st.columns(2)
+with kf_col:
+    keyword = st.text_input(
+        'Include keyword (optional)',
+        placeholder='e.g. machine learning, NIH, Python',
+        help='Only resumes whose expertise summary contains this keyword will be searched.',
+    )
+with ex_col:
+    exclude_keywords = st.text_input(
+        'Exclude keywords (optional, comma-separated)',
+        placeholder='e.g. sales, marketing',
+        help='Resumes whose expertise summary contains any of these keywords will be excluded.',
+    )
 
 query = st.text_area(
     'Describe the candidate you\'re looking for *',
@@ -137,6 +145,18 @@ if keyword.strip():
     pool = pool[mask].reset_index(drop=True)
     if pool.empty:
         st.warning(f'No resumes contain the keyword "{keyword}". Try a broader term.')
+        st.stop()
+
+if exclude_keywords.strip():
+    ex_terms = [t.strip().lower() for t in exclude_keywords.split(',') if t.strip()]
+    summaries = pool['expertise_summary'].fillna('').str.lower()
+    exclude_mask = summaries.apply(lambda s: any(t in s for t in ex_terms))
+    excluded_count = exclude_mask.sum()
+    pool = pool[~exclude_mask].reset_index(drop=True)
+    if excluded_count:
+        st.info(f'{excluded_count} resume(s) excluded by keyword filter.')
+    if pool.empty:
+        st.warning('All resumes were excluded by the exclude keyword filter. Try different terms.')
         st.stop()
 
 # ── Embed query & score ────────────────────────────────────────────────────
