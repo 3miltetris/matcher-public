@@ -40,6 +40,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import secrets as _secrets
 import sys
 import traceback
@@ -101,6 +102,19 @@ def _write_status(client: storage.Client, run_id: str, payload: dict) -> None:
     )
 
 
+# ── Text cleanup ──────────────────────────────────────────────────────────────
+
+# Matches Excel HYPERLINK formulas, e.g. =HYPERLINK("https://...", "BROCAM LLC")
+_HYPERLINK_RE = re.compile(r'=HYPERLINK\s*\(\s*"[^"]*"\s*,\s*"([^"]*)"\s*\)', re.IGNORECASE)
+
+def _strip_hyperlink(text: str) -> str:
+    """Extract display text from an Excel HYPERLINK formula; return text unchanged otherwise."""
+    if not text:
+        return text
+    m = _HYPERLINK_RE.match(text.strip())
+    return m.group(1) if m else text
+
+
 # ── URL helpers ────────────────────────────────────────────────────────────────
 
 def _normalize_url(url) -> str:
@@ -134,7 +148,7 @@ def _apply_col_map(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
     for std_field in _STANDARD_FIELDS:
         src_col = col_map.get(std_field)
         if src_col and src_col in df.columns:
-            out[std_field] = df[src_col].astype(str)
+            out[std_field] = df[src_col].astype(str).apply(_strip_hyperlink)
         else:
             out[std_field] = ''
     out['companyWebsite'] = out['companyWebsite'].apply(_normalize_url)
