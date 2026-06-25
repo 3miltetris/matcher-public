@@ -107,10 +107,11 @@ def _write_status(client: storage.Client, run_id: str, payload: dict) -> None:
 # Matches Excel HYPERLINK formulas, e.g. =HYPERLINK("https://...", "BROCAM LLC")
 _HYPERLINK_RE = re.compile(r'=HYPERLINK\s*\(\s*"[^"]*"\s*,\s*"([^"]*)"\s*\)', re.IGNORECASE)
 
-def _strip_hyperlink(text: str) -> str:
+def _strip_hyperlink(val) -> str:
     """Extract display text from an Excel HYPERLINK formula; return text unchanged otherwise."""
-    if not text:
-        return text
+    text = str(val) if not isinstance(val, str) else val
+    if not text or text.lower() in ('nan', 'none', ''):
+        return ''
     m = _HYPERLINK_RE.match(text.strip())
     return m.group(1) if m else text
 

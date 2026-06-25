@@ -12,6 +12,7 @@ so this view polls without holding a long Streamlit connection.
 
 import io
 import json
+import re
 import time
 import traceback
 from datetime import datetime
@@ -52,6 +53,19 @@ def _detect_col(columns: list[str], field: str) -> str | None:
         if candidate in lower:
             return lower[candidate]
     return None
+
+
+# ── Text cleanup ──────────────────────────────────────────────────────────────
+
+_HYPERLINK_RE = re.compile(r'=HYPERLINK\s*\(\s*"[^"]*"\s*,\s*"([^"]*)"\s*\)', re.IGNORECASE)
+
+def _strip_hyperlink(val) -> str:
+    """Extract display text from an Excel HYPERLINK formula; return text unchanged otherwise."""
+    text = str(val) if not isinstance(val, str) else val
+    if not text or text.lower() in ('nan', 'none', ''):
+        return ''
+    m = _HYPERLINK_RE.match(text.strip())
+    return m.group(1) if m else text
 
 
 # ── URL helpers ────────────────────────────────────────────────────────────────
@@ -342,7 +356,7 @@ def _build_mapped_df() -> pd.DataFrame:
     out = pd.DataFrame()
     for std_col, src_col in col_map.items():
         if src_col and src_col in df_raw.columns:
-            out[std_col] = df_raw[src_col].astype(str)
+            out[std_col] = df_raw[src_col].astype(str).apply(_strip_hyperlink)
         else:
             out[std_col] = ''
     out['companyWebsite'] = out['companyWebsite'].apply(_normalize_url)
