@@ -2,45 +2,35 @@
 Contact Importer
 -----------------
 Upload a lead spreadsheet from any source, map columns to standard fields,
-scrape company websites (aiohttp → Playwright fallback), summarise with
-GPT-3.5-turbo, embed with text-embedding-ada-002, and save to GCS under
-data/all-contacts/{source}/{source}_{date}_{hex}.parquet.
+deduplicate against existing GCS records, then trigger a Cloud Run job
+that scrapes company websites, summarises with GPT-3.5-turbo, embeds with
+text-embedding-ada-002, and saves to GCS under data/all-contacts/{source}/.
+
+The Cloud Run job (contact-import-job) writes a status.json on completion
+so this view polls without holding a long Streamlit connection.
 """
 
-import asyncio
 import io
-import secrets
-import sys
-import uuid
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed as futures_completed
+import json
+import time
+import traceback
 from datetime import datetime
 
-import aiohttp
 import pandas as pd
 import tldextract
 import streamlit as st
-from bs4 import BeautifulSoup
-from google.cloud import storage
+from google.cloud import run_v2, storage
 from google.oauth2 import service_account
-from openai import OpenAI
 
-from src.modules.Embedding.text_embedder import TextProcessor
-from src.modules.GoogleBucketManager.bucket_manager import BucketManager
-
-# ── Constants ──────────────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────
 
 _BUCKET          = 'cc-matcher-bucket-jeg-v1'
 _CONTACTS_ROOT   = 'data/all-contacts/'
-_SCRAPE_TIMEOUT  = 15        # seconds (aiohttp)
-_PW_TIMEOUT      = 20_000    # ms (Playwright)
-_MAX_CONCURRENT  = 20        # semaphore
-_PAGE_TEXT_LIMIT = 8_000     # chars
-
-_SUMMARISE_SYSTEM = (
-    'Summarise what this company does in 3-5 sentences. '
-    'Focus on technology, product, and market. Be factual and concise.'
-)
+_UPLOAD_PREFIX   = 'contact-import-uploads/'
+_CONFIG_PREFIX   = 'contact-import-configs/'
+_STATUS_PREFIX   = 'contact-import-jobs/'
+_JOB_NAME        = 'projects/cc-matcher-v1/locations/us-central1/jobs/contact-import-job'
+_POLL_INTERVAL   = 10   # seconds between status checks
 
 _SOURCE_OPTIONS = ['apollo', 'sba', 'free_alert', 'custom…']
 
@@ -64,7 +54,7 @@ def _detect_col(columns: list[str], field: str) -> str | None:
     return None
 
 
-# ── URL helpers ────────────────────────────────────────────────────────────
+# ── URL helpers ────────────────────────────────────────────────────────────────
 
 def _normalize_url(url) -> str:
     url = str(url or '').strip()
@@ -80,19 +70,21 @@ def _bare_domain(url: str) -> str:
     return f'{ext.domain}.{ext.suffix}'.lower() if ext.domain else ''
 
 
-# ── GCS helpers ────────────────────────────────────────────────────────────
+# ── GCS / Cloud Run helpers ────────────────────────────────────────────────────
 
-def _get_storage_client() -> storage.Client:
-    creds = service_account.Credentials.from_service_account_info(
+def _get_credentials():
+    return service_account.Credentials.from_service_account_info(
         st.secrets['gcp_service_account']
     )
-    return storage.Client(credentials=creds)
+
+
+def _get_storage_client() -> storage.Client:
+    return storage.Client(credentials=_get_credentials())
 
 
 def _load_existing_domains(client: storage.Client, source: str) -> set[str]:
-    """Return bare domains already stored for this source in GCS."""
-    prefix = f'{_CONTACTS_ROOT}{source}/'
-    blobs  = client.list_blobs(_BUCKET, prefix=prefix)
+    prefix  = f'{_CONTACTS_ROOT}{source}/'
+    blobs   = client.list_blobs(_BUCKET, prefix=prefix)
     domains: set[str] = set()
     for blob in blobs:
         if not blob.name.endswith('.parquet'):
@@ -111,112 +103,50 @@ def _load_existing_domains(client: storage.Client, source: str) -> set[str]:
     return domains
 
 
-# ── Async scraping ─────────────────────────────────────────────────────────
-
-async def _aiohttp_scrape(session: aiohttp.ClientSession, url: str) -> str:
-    try:
-        async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=_SCRAPE_TIMEOUT),
-            ssl=False,
-        ) as resp:
-            if resp.status >= 400:
-                return 'FAILED'
-            html = await resp.text(errors='replace')
-            soup = BeautifulSoup(html, 'html.parser')
-            for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
-                tag.decompose()
-            return ' '.join(soup.get_text(separator=' ').split())[:_PAGE_TEXT_LIMIT]
-    except Exception:
-        return 'FAILED'
+def _upload_raw_file(client: storage.Client, blob_path: str, data: bytes) -> None:
+    client.bucket(_BUCKET).blob(blob_path).upload_from_string(data)
 
 
-async def _playwright_scrape(url: str) -> str:
-    try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page    = await browser.new_page()
-            await page.goto(url, timeout=_PW_TIMEOUT, wait_until='domcontentloaded')
-            content = await page.inner_text('body')
-            await browser.close()
-            return ' '.join(content.split())[:_PAGE_TEXT_LIMIT]
-    except Exception:
-        return 'ERROR'
+def _write_config(client: storage.Client, config: dict) -> str:
+    blob_path = f"{_CONFIG_PREFIX}{config['run_id']}.json"
+    client.bucket(_BUCKET).blob(blob_path).upload_from_string(
+        json.dumps(config), content_type='application/json'
+    )
+    return blob_path
 
 
-async def _scrape_one(sem: asyncio.Semaphore, session: aiohttp.ClientSession, url: str, idx: int) -> dict:
-    async with sem:
-        text = await _aiohttp_scrape(session, url)
-        if text == 'FAILED':
-            text = await _playwright_scrape(url)
-    return {'_idx': idx, 'page_text': text}
+def _trigger_job(credentials, config_blob_path: str) -> None:
+    job_client = run_v2.JobsClient(credentials=credentials)
+    job_client.run_job(
+        request=run_v2.RunJobRequest(
+            name=_JOB_NAME,
+            overrides=run_v2.RunJobRequest.Overrides(
+                container_overrides=[
+                    run_v2.RunJobRequest.Overrides.ContainerOverride(
+                        args=[config_blob_path]
+                    )
+                ]
+            ),
+        )
+    )
 
 
-async def _run_scraping(urls: list[str], progress) -> list[str]:
-    """Scrape all URLs concurrently (≤20 at once). Returns page_texts in input order."""
-    sem     = asyncio.Semaphore(_MAX_CONCURRENT)
-    headers = {'User-Agent': 'Mozilla/5.0 (compatible; MatcherBot/1.0)'}
-    total   = len(urls)
-    ordered = {}
-    done_n  = 0
-
-    async with aiohttp.ClientSession(headers=headers) as session:
-        tasks = [
-            asyncio.create_task(_scrape_one(sem, session, url, i))
-            for i, url in enumerate(urls)
-        ]
-        for coro in asyncio.as_completed(tasks):
-            item              = await coro
-            ordered[item['_idx']] = item['page_text']
-            done_n           += 1
-            progress.progress(done_n / total, text=f'Scraping… {done_n}/{total}')
-
-    return [ordered[i] for i in range(total)]
+def _poll_status(client: storage.Client, run_id: str) -> dict | None:
+    blob = client.bucket(_BUCKET).blob(f'{_STATUS_PREFIX}{run_id}/status.json')
+    if not blob.exists():
+        return None
+    return json.loads(blob.download_as_text())
 
 
-# ── Summarisation (threaded sync OpenAI) ───────────────────────────────────
+# ── Session state init ─────────────────────────────────────────────────────────
 
-def _run_summarization(page_texts: list[str], openai_key: str, progress) -> list[str]:
-    client    = OpenAI(api_key=openai_key)
-    summaries = [''] * len(page_texts)
-
-    def _one(idx: int, text: str) -> tuple[int, str]:
-        if not text or text in ('FAILED', 'ERROR', 'nan', ''):
-            return idx, ''
-        try:
-            resp = client.chat.completions.create(
-                model='gpt-3.5-turbo',
-                max_tokens=300,
-                messages=[
-                    {'role': 'system', 'content': _SUMMARISE_SYSTEM},
-                    {'role': 'user',   'content': text[:_PAGE_TEXT_LIMIT]},
-                ],
-            )
-            return idx, resp.choices[0].message.content.strip()
-        except Exception as e:
-            return idx, f'SUMMARY_ERROR: {e}'
-
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {pool.submit(_one, i, t): i for i, t in enumerate(page_texts)}
-        done = 0
-        for future in futures_completed(futures):
-            idx, summary   = future.result()
-            summaries[idx] = summary
-            done          += 1
-            progress.progress(done / len(page_texts), text=f'Summarising… {done}/{len(page_texts)}')
-
-    return summaries
-
-
-# ── Session state init ─────────────────────────────────────────────────────
-
-for _k in ('ci_raw_df', 'ci_deduped_df', 'ci_scraped_df', 'ci_dedup_source', 'ci_dedup_url_col'):
+for _k in ('ci_raw_df', 'ci_file_bytes', 'ci_file_ext', 'ci_deduped_df',
+           'ci_dedup_source', 'ci_dedup_url_col', 'ci_active_run'):
     if _k not in st.session_state:
         st.session_state[_k] = None
 
 
-# ── Page ───────────────────────────────────────────────────────────────────
+# ── Page ───────────────────────────────────────────────────────────────────────
 
 st.title('📋 Contact Importer')
 st.caption(
@@ -224,7 +154,64 @@ st.caption(
     'scrape company websites, and add contacts to the matching database.'
 )
 
-# ── 1 · Upload ─────────────────────────────────────────────────────────────
+# ── Active run polling (shown above everything else when a job is running) ─────
+
+if st.session_state.ci_active_run:
+    run_id = st.session_state.ci_active_run
+
+    st.subheader('🔄 Import job in progress')
+    st.caption(f'Run ID: `{run_id}`')
+
+    try:
+        gcs    = _get_storage_client()
+        status = _poll_status(gcs, run_id)
+
+        if status is None:
+            st.info(f'Job is running… checking again in {_POLL_INTERVAL}s.')
+            if st.button('Cancel monitoring (job keeps running)'):
+                st.session_state.ci_active_run = None
+                st.rerun()
+            time.sleep(_POLL_INTERVAL)
+            st.rerun()
+
+        elif status.get('error'):
+            st.error('Import job failed.')
+            st.code(status['error'], language='text')
+            st.session_state.ci_active_run = None
+
+        else:
+            st.success('Import job completed.')
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric('Rows fetched',   f"{status.get('rows_fetched', 0):,}")
+            c2.metric('After dedup',    f"{status.get('rows_after_dedup', 0):,}")
+            c3.metric('Scraped OK',     f"{status.get('rows_scraped_ok', 0):,}")
+            c4.metric('Contacts saved', f"{status.get('rows_saved', 0):,}")
+            if status.get('gcs_path'):
+                st.caption(f"Saved → `{status['gcs_path']}`")
+            st.session_state.ci_active_run = None
+
+    except Exception as e:
+        st.error(f'Error polling status: {e}')
+        st.code(traceback.format_exc())
+        if st.button('Stop monitoring'):
+            st.session_state.ci_active_run = None
+            st.rerun()
+
+    st.stop()
+
+# Resume a previous run ────────────────────────────────────────────────────────
+
+with st.expander('Resume monitoring a previous import job'):
+    resume_id = st.text_input(
+        'Run ID',
+        key='ci_resume_run_id',
+        placeholder='contact_import_2026-06-25_10-30-00_apollo',
+    )
+    if st.button('Check status') and resume_id.strip():
+        st.session_state.ci_active_run = resume_id.strip()
+        st.rerun()
+
+# ── 1 · Upload ─────────────────────────────────────────────────────────────────
 
 st.subheader('1 · Upload spreadsheet')
 
@@ -236,14 +223,19 @@ uploaded = st.file_uploader(
 
 if uploaded:
     try:
-        if uploaded.name.endswith(('.xlsx', '.xls')):
-            raw = pd.read_excel(uploaded, dtype=str)
+        if uploaded.name.endswith('.xlsx'):
+            raw      = pd.read_excel(uploaded, dtype=str)
+            file_ext = '.xlsx'
+        elif uploaded.name.endswith('.xls'):
+            raw      = pd.read_excel(uploaded, dtype=str)
+            file_ext = '.xls'
         else:
             try:
                 raw = pd.read_csv(uploaded, dtype=str, encoding='utf-8')
             except UnicodeDecodeError:
                 uploaded.seek(0)
                 raw = pd.read_csv(uploaded, dtype=str, encoding='latin-1')
+            file_ext = '.csv'
         raw = raw.dropna(how='all')
 
         if (
@@ -251,8 +243,9 @@ if uploaded:
             or len(raw) != len(st.session_state.ci_raw_df)
         ):
             st.session_state.ci_raw_df        = raw
+            st.session_state.ci_file_bytes    = uploaded.getvalue()
+            st.session_state.ci_file_ext      = file_ext
             st.session_state.ci_deduped_df    = None
-            st.session_state.ci_scraped_df    = None
             st.session_state.ci_dedup_source  = None
             st.session_state.ci_dedup_url_col = None
     except Exception as e:
@@ -265,7 +258,7 @@ df_raw = st.session_state.ci_raw_df
 st.caption(f'**{len(df_raw):,}** rows loaded.')
 st.dataframe(df_raw.head(5), hide_index=True, use_container_width=True)
 
-# ── 2 · Source & column mapping ────────────────────────────────────────────
+# ── 2 · Source & column mapping ────────────────────────────────────────────────
 
 st.divider()
 st.subheader('2 · Source & column mapping')
@@ -337,10 +330,9 @@ if st.session_state.ci_deduped_df is not None and (
     or st.session_state.ci_dedup_url_col != m_url
 ):
     st.session_state.ci_deduped_df = None
-    st.session_state.ci_scraped_df = None
 
 
-# ── 3 · Deduplicate ────────────────────────────────────────────────────────
+# ── 3 · Deduplicate ────────────────────────────────────────────────────────────
 
 st.divider()
 st.subheader('3 · Deduplicate')
@@ -377,7 +369,6 @@ if st.button('🔍 Check for duplicates', key='ci_dedup_btn'):
             st.session_state.ci_deduped_df    = mapped_df[mask].reset_index(drop=True)
             st.session_state.ci_dedup_source  = source
             st.session_state.ci_dedup_url_col = m_url
-            st.session_state.ci_scraped_df    = None
             st.rerun()
         except Exception as e:
             st.error(f'Dedup check failed: {e}')
@@ -398,116 +389,45 @@ if deduped_df.empty:
     st.success('All URLs are already in the contact store — nothing new to import.')
     st.stop()
 
-# ── 4 · Scrape & summarise ─────────────────────────────────────────────────
+# ── 4 · Trigger import job ────────────────────────────────────────────────────
 
 st.divider()
-st.subheader('4 · Scrape & summarise')
-
-if st.session_state.ci_scraped_df is not None:
-    scraped_df = st.session_state.ci_scraped_df
-    n_ok   = int((scraped_df['scrape_status'] == 'ok').sum())
-    n_fail = int((scraped_df['scrape_status'] != 'ok').sum())
-
-    sm1, sm2 = st.columns(2)
-    sm1.metric('Scraped OK',       f'{n_ok:,}')
-    sm2.metric('Failed / no text', f'{n_fail:,}')
-
-    preview_cols = [c for c in ['companyWebsite', 'companyName', 'scrape_status', 'company_summary']
-                    if c in scraped_df.columns]
-    st.dataframe(
-        scraped_df[preview_cols].head(20),
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            'company_summary': st.column_config.TextColumn('Summary', width='large'),
-            'scrape_status':   st.column_config.TextColumn('Status',  width='small'),
-        },
-    )
-    if st.button('↺ Re-scrape'):
-        st.session_state.ci_scraped_df = None
-        st.rerun()
-
-else:
-    n_to_scrape = len(deduped_df)
-    st.caption(
-        f'**{n_to_scrape:,}** websites will be scraped (aiohttp → Playwright fallback) '
-        f'and summarised with GPT-3.5-turbo.'
-    )
-    if st.button('🕷️ Scrape & Summarise', type='primary', key='ci_scrape_btn'):
-        urls    = deduped_df['companyWebsite'].tolist()
-        oai_key = st.secrets['openai_api_key']
-
-        scrape_bar = st.progress(0, text='Starting scraper…')
-        try:
-            if sys.platform == 'win32':
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            page_texts = asyncio.run(_run_scraping(urls, scrape_bar))
-        except Exception as e:
-            st.error(f'Scraping failed: {e}')
-            st.stop()
-        scrape_bar.empty()
-
-        summ_bar  = st.progress(0, text='Summarising…')
-        summaries = _run_summarization(page_texts, oai_key, summ_bar)
-        summ_bar.empty()
-
-        result = deduped_df.copy()
-        result['page_text']       = page_texts
-        result['company_summary'] = summaries
-        result['scrape_status']   = [
-            'ok' if t not in ('FAILED', 'ERROR', '', 'nan') else 'failed'
-            for t in page_texts
-        ]
-        st.session_state.ci_scraped_df = result
-        st.rerun()
-    st.stop()
-
-# ── 5 · Embed & save ──────────────────────────────────────────────────────
-
-st.divider()
-st.subheader('5 · Embed & save')
-
-ok_rows = scraped_df[scraped_df['scrape_status'] == 'ok'].reset_index(drop=True)
-
-if ok_rows.empty:
-    st.warning('No successfully scraped rows to embed — check URLs and try again.')
-    st.stop()
+st.subheader('4 · Run import job')
 
 st.caption(
-    f'**{len(ok_rows):,}** rows will be embedded (`text-embedding-ada-002`) '
-    f'and saved to `{_CONTACTS_ROOT}{source}/`.'
+    f'**{len(deduped_df):,}** new contacts will be scraped, summarised (GPT-3.5-turbo), '
+    f'and embedded (text-embedding-ada-002) by a Cloud Run job. '
+    f'The job re-deduplicates at runtime as a safety check, so the final count may differ slightly.'
 )
 
-if st.button('💾 Embed & Save', type='primary', key='ci_embed_btn'):
-    oai_key = st.secrets['openai_api_key']
-    tp      = TextProcessor(api_key=oai_key)
-    today   = datetime.today().strftime('%Y-%m-%d')
-
-    texts      = ok_rows['company_summary'].tolist()
-    embed_bar  = st.progress(0, text='Generating embeddings…')
-    embeddings = []
-    for i, text in enumerate(texts):
-        try:
-            embeddings.append(tp.get_embedding(text) if text.strip() else None)
-        except Exception:
-            embeddings.append(None)
-        embed_bar.progress((i + 1) / len(texts), text=f'Embedding {i + 1}/{len(texts)}…')
-    embed_bar.empty()
-
-    out = ok_rows.drop(columns=['page_text', 'scrape_status'], errors='ignore').copy()
-    out['embeddings'] = embeddings
-    out['uuid']       = [str(uuid.uuid4()) for _ in range(len(out))]
-    out['scraped_at'] = today
-
-    hex_suffix = secrets.token_hex(3)
-    gcs_path   = f'{_CONTACTS_ROOT}{source}/{source}_{today}_{hex_suffix}.parquet'
+if st.button('🚀 Start import job', type='primary', key='ci_trigger_btn'):
+    file_bytes = st.session_state.ci_file_bytes
+    file_ext   = st.session_state.ci_file_ext or '.csv'
+    timestamp  = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    run_id     = f'contact_import_{timestamp}_{source}'
 
     try:
-        bm = BucketManager(_BUCKET, client=_get_storage_client())
-        bm.upload_file(gcs_path, out)
-        st.success(f'Saved **{len(out):,}** contacts → `{gcs_path}`')
-        for _k in ('ci_raw_df', 'ci_deduped_df', 'ci_scraped_df', 'ci_dedup_source', 'ci_dedup_url_col'):
-            st.session_state[_k] = None
+        with st.spinner('Staging file to GCS…'):
+            gcs            = _get_storage_client()
+            file_blob_path = f'{_UPLOAD_PREFIX}{run_id}{file_ext}'
+            _upload_raw_file(gcs, file_blob_path, file_bytes)
+
+        with st.spinner('Writing job config…'):
+            config = {
+                'run_id':        run_id,
+                'source':        source,
+                'file_ext':      file_ext,
+                'csv_blob_path': file_blob_path,
+                'col_map':       col_map,
+            }
+            config_blob_path = _write_config(gcs, config)
+
+        with st.spinner('Triggering Cloud Run job…'):
+            _trigger_job(_get_credentials(), config_blob_path)
+
+        st.session_state.ci_active_run = run_id
         st.rerun()
+
     except Exception as e:
-        st.error(f'Save failed: {e}')
+        st.error(f'Failed to start job: {e}')
+        st.code(traceback.format_exc())
