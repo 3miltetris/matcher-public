@@ -401,7 +401,7 @@ def main(config_blob_path: str) -> None:
 
     # ── Step 6: Filter to ok rows, embed ──────────────────────────────────────
     ok_mask      = [s == 'ok' for s in scrape_statuses]
-    ok_df        = new_df[[i for i, ok in enumerate(ok_mask) if ok]].reset_index(drop=True)
+    ok_df        = new_df[ok_mask].reset_index(drop=True)
     ok_summaries = [s for s, ok in zip(summaries, ok_mask) if ok]
 
     if ok_df.empty:
