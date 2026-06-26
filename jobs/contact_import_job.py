@@ -63,7 +63,7 @@ _CONTACTS_ROOT     = 'data/all-contacts/'
 _STATUS_PREFIX     = 'contact-import-jobs/'
 _SCRAPE_TIMEOUT    = 15         # seconds (aiohttp)
 _PW_TIMEOUT        = 20_000     # ms (Playwright)
-_MAX_CONCURRENT    = 20         # scraping semaphore
+_MAX_CONCURRENT    = 8          # scraping semaphore (Playwright processes ~200MB each)
 _PAGE_TEXT_LIMIT   = 8_000      # chars
 _SUMMARISE_WORKERS = 10
 _EMBED_WORKERS     = 8
@@ -403,6 +403,9 @@ def main(config_blob_path: str) -> None:
     ok_mask      = [s == 'ok' for s in scrape_statuses]
     ok_df        = new_df[ok_mask].reset_index(drop=True)
     ok_summaries = [s for s, ok in zip(summaries, ok_mask) if ok]
+
+    # Free large objects before embedding — page_texts can be GBs for big imports
+    del page_texts, scrape_statuses, summaries, raw_df, mapped_df, new_df
 
     if ok_df.empty:
         _write_status(gcs, run_id, {
