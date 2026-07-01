@@ -273,6 +273,7 @@ def _fetch_from_sam(api_params: dict) -> pd.DataFrame:
         'agency':      [(item.get('subTier') or item.get('department', ''))                      for item in all_items],
         'posted_date': [item.get('postedDate', '')                                               for item in all_items],
         'deadline':    [(item.get('responseDeadLine') or '')[:10]                                for item in all_items],
+        'sam_url':     [f"https://sam.gov/opp/{item['noticeId']}/view" if item.get('noticeId') else '' for item in all_items],
     })
 
 
@@ -296,6 +297,7 @@ def _load_from_csv(client: storage.Client, csv_blob_path: str, col_map: dict) ->
         'agency':      _ser('agency', 'SAM-GOV'),
         'posted_date': _ser('posted_date'),
         'deadline':    _ser('deadline'),
+        'sam_url':     _ser('source_url'),
     })
 
 
@@ -589,6 +591,7 @@ def main(config_blob_path: str) -> None:
         'description':    new_rows['description'].astype(str),
         'open_date':      new_rows['posted_date'].astype(str),
         'due_date':       new_rows['deadline'].astype(str),
+        'source':         new_rows['sam_url'].astype(str) if 'sam_url' in new_rows.columns else '',
         'scraped_at':     today,
         'sam_confidence': new_rows['_confidence'].values,
         'sam_reason':     new_rows['_reason'].values,
