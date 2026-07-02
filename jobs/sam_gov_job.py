@@ -70,8 +70,9 @@ _SAM_API_BASE     = 'https://api.sam.gov/opportunities/v2/search'
 _SAM_DESC_BASE    = 'https://api.sam.gov/opportunities/v2/noticedesc'
 _SAM_PAGE_SIZE    = 1000
 _DESC_WORKERS     = 6   # SAM.gov allows 10 req/s — 6 workers is the concurrency cap
-_SAM_PAGE_SLEEP   = 1.0  # seconds between pagination requests
-_SAM_MAX_RETRIES  = 6   # max retries on 429
+_SAM_PAGE_SLEEP   = 3.0  # seconds between pagination requests
+_SAM_MAX_RETRIES  = 8   # max retries on 429
+_SAM_RETRY_BASE   = 30  # seconds — SAM.gov quota resets on a minutes timescale
 _SAM_RATE_LOCK    = threading.Lock()
 _SAM_LAST_REQ     = [0.0]  # mutable for closure; protected by _SAM_RATE_LOCK
 _SAM_MIN_INTERVAL = 1.0 / 8  # 8 req/s — conservative under 10 req/s limit
@@ -167,7 +168,7 @@ def _sam_get(url: str, params: dict, timeout: int = 30) -> requests.Response:
     for attempt in range(_SAM_MAX_RETRIES):
         r = requests.get(url, params=params, timeout=timeout)
         if r.status_code == 429:
-            wait = 2 ** attempt
+            wait = min(_SAM_RETRY_BASE * (2 ** attempt), 600)  # 30, 60, 120, 240, 480, 600, 600, 600s
             print(f'  SAM.gov 429 — waiting {wait}s before retry {attempt + 1}/{_SAM_MAX_RETRIES}', flush=True)
             time.sleep(wait)
             continue
