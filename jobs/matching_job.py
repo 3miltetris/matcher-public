@@ -24,7 +24,7 @@ import random
 import sys
 import traceback
 import warnings
-from datetime import datetime
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -67,19 +67,56 @@ def _get_secret(secret_id: str) -> str:
     return value
 
 
-# ── Filter helper ────────────────────────────────────────────────────────────
+# ── Filter helpers ───────────────────────────────────────────────────────────
+
+# Topic dates are strings in mixed formats (ISO from Topic Importer,
+# mm/dd/yyyy from SAM.gov, sometimes with a time suffix) — try each.
+_DATE_FORMATS = ('%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d', '%m-%d-%Y', '%b %d, %Y')
+
+
+def _parse_date_str(value) -> date | None:
+    s = str(value).strip()
+    if not s:
+        return None
+    for fmt in _DATE_FORMATS:
+        for candidate in (s, s[:10]):
+            try:
+                return datetime.strptime(candidate, fmt).date()
+            except ValueError:
+                pass
+    return None
+
+
+def _filter_is_active(f: dict) -> bool:
+    if not f.get('column'):
+        return False
+    if f.get('type') == 'date_range':
+        return bool(f.get('date_from') and f.get('date_to'))
+    return bool(f.get('keyword', '').strip())
+
+
+def _filter_mask(df: pd.DataFrame, f: dict) -> pd.Series:
+    if f.get('type') == 'date_range':
+        d_from = date.fromisoformat(f['date_from'])
+        d_to   = date.fromisoformat(f['date_to'])
+
+        def _in_range(v) -> bool:
+            d = _parse_date_str(v)
+            return d is not None and d_from <= d <= d_to
+
+        return df[f['column']].map(_in_range)
+    return df[f['column']].astype(str).str.lower().str.contains(
+        f['keyword'].lower(), na=False
+    )
+
 
 def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
-    active = [f for f in filters if f.get('keyword', '').strip() and f.get('column')]
+    active = [f for f in filters if _filter_is_active(f)]
     if not active:
         return df
-    mask = df[active[0]['column']].astype(str).str.lower().str.contains(
-        active[0]['keyword'].lower(), na=False
-    )
+    mask = _filter_mask(df, active[0])
     for f in active[1:]:
-        m = df[f['column']].astype(str).str.lower().str.contains(
-            f['keyword'].lower(), na=False
-        )
+        m = _filter_mask(df, f)
         mask = (mask & m) if f.get('operator', 'AND') == 'AND' else (mask | m)
     return df[mask]
 
