@@ -15,7 +15,7 @@ import smtplib
 import time
 import traceback
 import warnings
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -26,6 +26,7 @@ from google.cloud import run_v2, storage
 from google.oauth2 import service_account
 
 from src.modules.email_generator import DEFAULT_SUBJECT_SYSTEM, DEFAULT_JOSIAH_SYSTEM
+from src.modules.grant_utils import normalize_grant_columns
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -86,19 +87,55 @@ def _load_topics(client: storage.Client, agencies: list[str]) -> pd.DataFrame:
         return pd.concat(frames, ignore_index=True)
 
 
-# ── Filter helper ─────────────────────────────────────────────────────────────
+# ── Filter helpers ────────────────────────────────────────────────────────────
+
+# Topic dates arrive as strings in mixed formats (ISO from Topic Importer,
+# mm/dd/yyyy from SAM.gov, sometimes with a time suffix) — try each.
+_DATE_FORMATS = ('%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d', '%m-%d-%Y', '%b %d, %Y')
+
+
+def _parse_date_str(value) -> date | None:
+    s = str(value).strip()
+    if not s:
+        return None
+    for fmt in _DATE_FORMATS:
+        for candidate in (s, s[:10]):
+            try:
+                return datetime.strptime(candidate, fmt).date()
+            except ValueError:
+                pass
+    return None
+
+
+def _filter_is_active(f: dict) -> bool:
+    if not f.get('column'):
+        return False
+    if f.get('type') == 'date_range':
+        return bool(f.get('date_from') and f.get('date_to'))
+    return bool(f.get('keyword', '').strip())
+
+
+def _filter_mask(df: pd.DataFrame, f: dict) -> pd.Series:
+    if f.get('type') == 'date_range':
+        d_from, d_to = f['date_from'], f['date_to']
+
+        def _in_range(v) -> bool:
+            d = _parse_date_str(v)
+            return d is not None and d_from <= d <= d_to
+
+        return df[f['column']].map(_in_range)
+    return df[f['column']].astype(str).str.lower().str.contains(
+        f['keyword'].lower(), na=False
+    )
+
 
 def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
-    active = [f for f in filters if f['keyword'].strip() and f['column']]
+    active = [f for f in filters if _filter_is_active(f)]
     if not active:
         return df
-    mask = df[active[0]['column']].astype(str).str.lower().str.contains(
-        active[0]['keyword'].lower(), na=False
-    )
+    mask = _filter_mask(df, active[0])
     for f in active[1:]:
-        m = df[f['column']].astype(str).str.lower().str.contains(
-            f['keyword'].lower(), na=False
-        )
+        m = _filter_mask(df, f)
         mask = (mask & m) if f['operator'] == 'AND' else (mask | m)
     return df[mask]
 
@@ -182,7 +219,7 @@ for _k in ['bm_active_run', 'bm_run_summary', 'bm_topics_df']:
     if _k not in st.session_state:
         st.session_state[_k] = None
 if 'bm_filters' not in st.session_state:
-    st.session_state.bm_filters = [{'column': None, 'keyword': '', 'operator': 'AND'}]
+    st.session_state.bm_filters = [{'column': None, 'type': 'keyword', 'keyword': '', 'operator': 'AND'}]
 if 'bm_custom_prompts' not in st.session_state:
     st.session_state.bm_custom_prompts = []
 
@@ -290,11 +327,10 @@ if st.button('Load Topics', type='primary', disabled=not selected_agencies):
     if _df.empty:
         st.warning('No topics found for the selected agencies.')
     else:
-        if 'grant_summary' not in _df.columns and 'description' in _df.columns:
-            _df = _df.rename(columns={'description': 'grant_summary'})
+        _df = normalize_grant_columns(_df)
         _df = _df.drop(columns=['embeddings'], errors='ignore')
         st.session_state.bm_topics_df  = _df
-        st.session_state.bm_filters    = [{'column': None, 'keyword': '', 'operator': 'AND'}]
+        st.session_state.bm_filters    = [{'column': None, 'type': 'keyword', 'keyword': '', 'operator': 'AND'}]
         st.session_state.bm_run_summary = None
         st.success(f'Loaded **{len(_df):,}** grant topics.')
 
@@ -308,9 +344,9 @@ if st.session_state.bm_topics_df is not None:
 
     for i, f in enumerate(st.session_state.bm_filters):
         if i == 0:
-            col_sel, kw_input, _, remove_col = st.columns([2, 3, 1, 0.5])
+            col_sel, mode_col, val_input, remove_col = st.columns([2, 1.4, 3, 0.5])
         else:
-            op_col, col_sel, kw_input, remove_col = st.columns([1, 2, 3, 0.5])
+            op_col, col_sel, mode_col, val_input, remove_col = st.columns([1, 2, 1.4, 3, 0.5])
             f['operator'] = op_col.radio(
                 'op', ['AND', 'OR'],
                 index=0 if f['operator'] == 'AND' else 1,
@@ -321,18 +357,39 @@ if st.session_state.bm_topics_df is not None:
             index=filterable_cols.index(f['column']) if f['column'] in filterable_cols else 0,
             key=f'bm_col_{i}', label_visibility='collapsed'
         )
-        f['keyword'] = kw_input.text_input(
-            'Keyword', value=f['keyword'],
-            placeholder=f'Filter by {f["column"]}…',
-            key=f'bm_kw_{i}', label_visibility='collapsed'
+        mode_label = mode_col.selectbox(
+            'Filter type', ['Keyword', 'Date range'],
+            index=1 if f.get('type') == 'date_range' else 0,
+            key=f'bm_type_{i}', label_visibility='collapsed'
         )
+        f['type'] = 'date_range' if mode_label == 'Date range' else 'keyword'
+        if f['type'] == 'date_range':
+            picked = val_input.date_input(
+                'Date range',
+                value=(
+                    f.get('date_from') or date.today() - timedelta(days=30),
+                    f.get('date_to') or date.today(),
+                ),
+                key=f'bm_dr_{i}', label_visibility='collapsed',
+            )
+            if isinstance(picked, tuple) and len(picked) == 2:
+                f['date_from'], f['date_to'] = picked
+            elif isinstance(picked, tuple) and len(picked) == 1:
+                # Mid-selection: only the start date is chosen so far.
+                f['date_from'], f['date_to'] = picked[0], None
+        else:
+            f['keyword'] = val_input.text_input(
+                'Keyword', value=f.get('keyword', ''),
+                placeholder=f'Filter by {f["column"]}…',
+                key=f'bm_kw_{i}', label_visibility='collapsed'
+            )
         if remove_col.button('✕', key=f'bm_rm_{i}', disabled=len(st.session_state.bm_filters) == 1):
             st.session_state.bm_filters.pop(i)
             st.rerun()
 
     if st.button('+ Add filter', key='bm_add_filter'):
         st.session_state.bm_filters.append(
-            {'column': filterable_cols[0], 'keyword': '', 'operator': 'AND'}
+            {'column': filterable_cols[0], 'type': 'keyword', 'keyword': '', 'operator': 'AND'}
         )
         st.rerun()
 
@@ -493,10 +550,24 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
     # Serialize active filters (only if topics have been loaded)
     active_filters = []
     if st.session_state.bm_topics_df is not None:
-        active_filters = [
-            f for f in st.session_state.bm_filters
-            if f.get('keyword', '').strip() and f.get('column')
-        ]
+        for f in st.session_state.bm_filters:
+            if not _filter_is_active(f):
+                continue
+            if f.get('type') == 'date_range':
+                active_filters.append({
+                    'column':    f['column'],
+                    'type':      'date_range',
+                    'date_from': f['date_from'].isoformat(),
+                    'date_to':   f['date_to'].isoformat(),
+                    'operator':  f['operator'],
+                })
+            else:
+                active_filters.append({
+                    'column':   f['column'],
+                    'type':     'keyword',
+                    'keyword':  f['keyword'],
+                    'operator': f['operator'],
+                })
 
     ag_tag  = '-'.join(selected_agencies) if selected_agencies else 'none'
     src_tag = '-'.join(selected_sources)  if selected_sources  else 'none'

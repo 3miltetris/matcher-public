@@ -2,7 +2,8 @@
 Grants.gov Fetch
 ----------------
 Query the Grants.gov public search API for federal grant opportunities.
-Filter by keyword, opportunity status, funding instrument, and agency.
+Filter by keyword, posted-date range, opportunity status, funding
+instrument, and agency.
 Claude Haiku screens each row for relevance, then passing rows are
 embedded and saved to GCS under data/all-topics/processed/GRANTS-GOV/.
 No API key required — uses the public search2 endpoint.
@@ -12,7 +13,7 @@ import io
 import json
 import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
@@ -142,13 +143,23 @@ def _search_grants(
     statuses:        list[str],
     instruments:     list[str],
     agencies:        list[str],
-    date_range_days: int | None,
+    date_from:       date | None,
+    date_to:         date | None,
     exclude_expired: bool,
     max_results:     int,
 ) -> tuple[pd.DataFrame, int]:
     all_items: list[dict] = []
     start = 1
     total = None
+
+    # The Grants.gov API only supports "posted in the last N days" — derive N
+    # from the range start to narrow the server-side fetch, then enforce the
+    # exact [date_from, date_to] range client-side below.
+    date_range_days: int | None = None
+    if date_from:
+        days_back = (datetime.today().date() - date_from).days + 1
+        if 1 <= days_back <= 365:
+            date_range_days = days_back
 
     with st.spinner('Querying Grants.gov…'):
         while True:
@@ -188,13 +199,19 @@ def _search_grants(
     if not all_items:
         return pd.DataFrame(), total or 0
 
-    # Apply exclude-expired filter before fetching descriptions.
-    keep = [True] * len(all_items)
-    if exclude_expired:
-        today = datetime.today().date()
-        for i, item in enumerate(all_items):
+    # Apply exclude-expired and posted-date-range filters before fetching
+    # descriptions (the API's dateRange param is only a coarse pre-filter).
+    keep  = [True] * len(all_items)
+    today = datetime.today().date()
+    for i, item in enumerate(all_items):
+        if exclude_expired:
             cd = _parse_date(str(item.get('closeDate') or ''))
             if cd is not None and cd < today:
+                keep[i] = False
+                continue
+        if date_from and date_to:
+            posted = _parse_date(str(item.get('openDate') or ''))
+            if posted is None or posted < date_from or posted > date_to:
                 keep[i] = False
 
     filtered_items = [item for item, k in zip(all_items, keep) if k]
@@ -427,13 +444,22 @@ gg_exclude_expired = st.checkbox(
 )
 
 gg_use_date_filter = st.checkbox('Filter by posted date', value=False, key='gg_use_date')
-gg_date_range_days: int | None = None
+gg_date_from: date | None = None
+gg_date_to:   date | None = None
 if gg_use_date_filter:
-    gg_date_range_days = st.number_input(
-        'Posted in the last N days',
-        min_value=1, max_value=365, value=3, step=1,
-        key='gg_date_range_days',
-    )
+    col_df, col_dt = st.columns(2)
+    with col_df:
+        gg_date_from = st.date_input(
+            'Posted from',
+            value=date.today() - timedelta(days=7),
+            key='gg_date_from',
+        )
+    with col_dt:
+        gg_date_to = st.date_input(
+            'Posted to',
+            value=date.today(),
+            key='gg_date_to',
+        )
 
 gg_keyword = st.text_input(
     'Keyword (optional)',
@@ -480,6 +506,8 @@ if st.button('🔍 Fetch from Grants.gov', type='primary', key='gg_fetch_btn'):
 
     if not statuses:
         st.error('Select at least one opportunity status.')
+    elif gg_use_date_filter and gg_date_from and gg_date_to and gg_date_from > gg_date_to:
+        st.error('"Posted from" must be on or before "Posted to".')
     else:
         try:
             df_fetched, total = _search_grants(
@@ -487,7 +515,8 @@ if st.button('🔍 Fetch from Grants.gov', type='primary', key='gg_fetch_btn'):
                 statuses         = statuses,
                 instruments      = instruments,
                 agencies         = agencies,
-                date_range_days  = int(gg_date_range_days) if gg_date_range_days else None,
+                date_from        = gg_date_from,
+                date_to          = gg_date_to,
                 exclude_expired  = gg_exclude_expired,
                 max_results      = int(gg_max),
             )

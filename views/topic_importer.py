@@ -56,7 +56,7 @@ If the document has a single global due date or funding amount, apply it to all 
 
 _EXTRACT_MODEL = 'claude-sonnet-4-6'
 _EMBED_MODEL   = 'text-embedding-ada-002'
-_COL_ORDER     = ['topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount', 'scraped_at', 'description']
+_COL_ORDER     = ['topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount', 'scraped_at', 'grant_summary']
 _RESERVED_COLS = frozenset({
     'topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount',
     'scraped_at', 'description', 'embeddings', 'grant_summary',
@@ -119,6 +119,11 @@ def _build_df(topics: list[dict], sub_agency: str, source: str = '') -> pd.DataF
     for col in ['topic_number', 'title', 'description', 'due_date', 'funding_amount']:
         if col not in df.columns:
             df[col] = None
+    # Normalise to canonical column name before saving
+    if 'description' in df.columns:
+        df = df.rename(columns={'description': 'grant_summary'})
+    elif 'grant_summary' not in df.columns:
+        df['grant_summary'] = None
     df['agency']     = sub_agency
     df['source']     = source
     df['scraped_at'] = datetime.today().strftime('%Y-%m-%d')
@@ -137,7 +142,7 @@ def _embed_and_save(df: pd.DataFrame, broad_agency: str, oai_key: str) -> list[s
         group    = group.copy()
         progress = st.progress(0, text=f'Embedding topics for **{sub_agency}**…')
         embeddings = []
-        for i, desc in enumerate(group['description'].astype(str)):
+        for i, desc in enumerate(group['grant_summary'].astype(str)):
             embeddings.append(tp.get_embedding(desc) if desc.strip() else None)
             progress.progress((i + 1) / len(group), text=f'Embedding {i + 1}/{len(group)} — {sub_agency}')
         group['embeddings'] = embeddings
@@ -293,7 +298,7 @@ if st.session_state.topics_df is not None:
             'due_date':     st.column_config.TextColumn('Due Date',       width='small'),
             'funding_amount':st.column_config.TextColumn('Funding Amount', width='small'),
             'scraped_at':   st.column_config.TextColumn('Scraped At',    width='small'),
-            'description':  st.column_config.TextColumn('Description',  width='large'),
+            'grant_summary': st.column_config.TextColumn('Description',  width='large'),
         },
         hide_index=True,
         key='topics_editor',
@@ -402,7 +407,7 @@ if st.session_state.topics_df is not None:
 
     save_disabled = not broad_agency
     if st.button('💾 Save & Embed', type='primary', disabled=save_disabled):
-        descriptions = edited_df['description'].astype(str).str.strip()
+        descriptions = edited_df['grant_summary'].astype(str).str.strip()
         if descriptions.eq('').all() or descriptions.eq('None').all():
             st.error('All descriptions are empty — nothing to embed.')
         else:

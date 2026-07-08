@@ -173,6 +173,7 @@ _CANDIDATES: dict[str, list[str]] = {
     'agency':       ['department/ind.agency', 'department', 'agency', 'department name'],
     'posted_date':  ['posted date', 'post date', 'posted_date'],
     'deadline':     ['response deadline', 'response_deadline', 'deadline', 'close date'],
+    'source_url':   ['contract opportunity url', 'opportunity url', 'sam url', 'url', 'link'],
 }
 
 
@@ -296,7 +297,7 @@ def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
 
 _SAM_RESERVED_COLS = frozenset({
     'topic_number', 'agency', 'title', 'description', 'open_date', 'due_date',
-    'scraped_at', 'sam_confidence', 'sam_reason', 'grant_summary', 'embeddings',
+    'scraped_at', 'sam_confidence', 'sam_reason', 'grant_summary', 'embeddings', 'source',
 })
 
 
@@ -318,6 +319,7 @@ def _embed_and_save(
     out['description']  = df[col_map['description']].astype(str)
     out['open_date']    = df[col_map['posted_date']].astype(str)  if col_map.get('posted_date') else ''
     out['due_date']     = df[col_map['deadline']].astype(str)     if col_map.get('deadline')    else ''
+    out['source']       = df[col_map['source_url']].astype(str)  if col_map.get('source_url')  else ''
     out['scraped_at']   = today
     out['sam_confidence'] = df['_confidence'].values
     out['sam_reason']   = df['_reason'].values
@@ -770,6 +772,7 @@ with right_col:
     m_agency = _sel('agency',      'Agency / Department')
     m_posted = _sel('posted_date', 'Posted Date')
     m_dl     = _sel('deadline',    'Response Deadline')
+    m_url    = _sel('source_url',  'Contract URL')
 
 col_map = {
     'title':       m_title,
@@ -779,6 +782,7 @@ col_map = {
     'agency':      m_agency,
     'posted_date': m_posted,
     'deadline':    m_dl,
+    'source_url':  m_url,
 }
 
 if not m_title or not m_desc:
