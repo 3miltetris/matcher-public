@@ -41,6 +41,7 @@ pages = [
     st.Page("views/hubspot_import.py", title="HubSpot Import", icon="🔗"),
     st.Page("views/suggestions.py",    title="Suggestions",    icon="💡"),
     st.Page("views/contact_importer.py", title="Contact Importer", icon="👤"),
+    st.Page("views/client_editor.py",    title="Client Editor",    icon="✏️"),
     st.Page("views/resume_importer.py", title="Resume Importer",  icon="📄"),
     st.Page("views/resume_search.py",   title="Resume Search",    icon="🔎"),
     # Uncomment as pages are built:
