@@ -1,14 +1,22 @@
 """
-sam_gov_job.py — Cloud Run Job for SAM.gov topic ingestion.
+sam_gov_job.py — Cloud Run Job for SAM.gov topic ingestion and revision tracking.
 
-Reads a job config from GCS, then:
+Ingest modes ("api" / "csv") read a job config from GCS, then:
   1. Loads input data (SAM.gov API or CSV blob uploaded to GCS by Streamlit)
   2. Screens rows with Claude Haiku (async, up to 20 concurrent)
   3. Deduplicates against existing records in data/all-topics/processed/SAM-GOV/
+     — dup rows whose SAM.gov noticeId changed (amended notices, e.g. revised
+     CSOs) are routed to the update path instead of being dropped
   4. Summarizes passing rows with Claude Haiku (async, up to 20 concurrent)
   5. Generates OpenAI text-embedding-ada-002 embeddings (8 concurrent workers)
   6. Saves a parquet to data/all-topics/processed/SAM-GOV/
   7. Writes sam-gov-jobs/{run_id}/status.json
+
+"revision_check" mode sweeps every stored open notice: queries SAM.gov by
+solicitation number, detects new versions (noticeId changed), diffs old vs new
+content with Claude (including attachment PDF text), re-summarizes/re-embeds
+changed notices, rewrites their rows in place, and marks archived notices with
+sam_status='archived'.
 
 Usage:
     python jobs/sam_gov_job.py sam-gov-configs/<run_id>.json
@@ -20,7 +28,7 @@ Environment variables (injected by Cloud Run from Secret Manager):
 Config schema:
 {
   "run_id":      "sam_gov_2026-06-01_10-30-00",
-  "input_mode":  "api" | "csv",
+  "input_mode":  "api" | "csv" | "revision_check",
 
   // CSV mode only:
   "csv_blob_path": "sam-gov-uploads/sam_gov_2026-06-01_10-30-00.csv",
@@ -37,6 +45,10 @@ Config schema:
     "sam_gov_api_key":  "..."
   },
 
+  // revision_check mode only:
+  //   "api_params": {"sam_gov_api_key": "...", "include_attachments": true},
+  //   "dry_run": true   — report what would change without writing anything
+
   "custom_cols": {"campaign_name": "Spring 2026"}
 }
 """
@@ -45,6 +57,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import secrets as _secrets
 import sys
 import threading
@@ -53,10 +66,12 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
+import fitz  # pymupdf — attachment PDF text extraction
 import pandas as pd
+import pyarrow.parquet as pq
 import requests
 import tiktoken
-from anthropic import AsyncAnthropic
+from anthropic import Anthropic, AsyncAnthropic
 from bs4 import BeautifulSoup
 from google.cloud import storage
 from openai import OpenAI
@@ -82,6 +97,14 @@ _EMBED_WORKERS    = 8
 _SCREEN_MODEL     = 'claude-haiku-4-5-20251001'
 _SCREEN_MAX_CHARS = 3000
 _TOKEN_LIMIT      = 7500
+
+# Revision handling
+_ATTACH_MAX_FILES     = 8      # attachments fetched per notice
+_ATTACH_MAX_PAGES     = 30     # pages extracted per PDF
+_ATTACH_MAX_CHARS     = 40000  # total attachment text per notice
+_REV_WORKERS          = 4      # concurrent revised notices (each makes SAM + Claude calls)
+_REVCHECK_MAX_WINDOWS = 5      # one-year postedFrom/postedTo windows walked back per solnum lookup
+_NOTICE_ID_RE         = re.compile(r'sam\.gov/opp/([^/]+)/view')
 
 _SCREEN_SYSTEM = """\
 You are a grant opportunity screening filter for a consultancy that serves innovative startups, R&D companies, and deep tech small businesses.
@@ -130,6 +153,24 @@ Summarize the opportunity in 3–5 sentences. Focus exclusively on:
 - Relevant domain, technology, or sector (e.g., AI/ML, biotech, defense electronics, advanced manufacturing)
 
 Strip out all procurement boilerplate: FAR clauses, set-aside language, submission deadlines, page limits, administrative instructions, and points of contact. Write in plain technical language. If the description is already short and technical, return it as-is.\
+"""
+
+_REVISION_SYSTEM = """\
+You are comparing two versions of a federal contract opportunity (often a Commercial Solutions Opening) to identify substantive changes between the version we have stored and the latest version on SAM.gov.
+
+You will be given the OLD version (our stored summary and description) and the NEW version (the latest description plus text extracted from attached documents).
+
+Identify:
+- Topics, technology areas, or focus areas ADDED in the new version
+- Topics, technology areas, or focus areas REMOVED in the new version
+- Other substantive changes (deadline, scope, eligibility, funding)
+
+Ignore formatting differences, boilerplate, administrative or points-of-contact changes. Note that the NEW version may include attachment text the OLD version lacked — only report a topic as ADDED if it is genuinely new subject matter, not merely text we did not previously capture for an existing topic.
+
+OUTPUT FORMAT:
+Respond only with valid JSON. No preamble, no markdown, no explanation outside the JSON.
+{"changed": true, "notes": "One to three sentences describing what changed.", "topics_added": ["..."], "topics_removed": ["..."]}
+If nothing substantive changed: {"changed": false, "notes": "No substantive changes.", "topics_added": [], "topics_removed": []}\
 """
 
 
@@ -275,6 +316,10 @@ def _fetch_from_sam(api_params: dict) -> pd.DataFrame:
         'posted_date': [item.get('postedDate', '')                                               for item in all_items],
         'deadline':    [(item.get('responseDeadLine') or '')[:10]                                for item in all_items],
         'sam_url':     [f"https://sam.gov/opp/{item['noticeId']}/view" if item.get('noticeId') else '' for item in all_items],
+        # Kept for revision detection — the version-specific noticeId and attachment links.
+        # Dropped before saving (the output frame selects its columns explicitly).
+        '_raw_notice_id':  [item.get('noticeId', '')          for item in all_items],
+        '_resource_links': [item.get('resourceLinks') or []   for item in all_items],
     })
 
 
@@ -437,21 +482,435 @@ def _embed_all(texts: list[str], openai_key: str) -> list:
     return results
 
 
-# ── Dedup ──────────────────────────────────────────────────────────────────────
+# ── Dedup / store metadata ─────────────────────────────────────────────────────
 
-def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
-    notice_ids: set[str] = set()
-    titles:     set[str] = set()
+def _clean(v) -> str:
+    if v is None:
+        return ''
+    try:
+        if pd.isna(v):
+            return ''
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return '' if s.lower() in ('nan', 'none') else s
+
+
+def _parse_notice_id(source_url) -> str:
+    m = _NOTICE_ID_RE.search(_clean(source_url))
+    return m.group(1) if m else ''
+
+
+def _iso_date(s) -> str:
+    """Best-effort YYYY-MM-DD from a stored date string; '' if unparseable."""
+    s = _clean(s)[:10]
+    if not s:
+        return ''
+    if '/' in s:
+        try:
+            return datetime.strptime(s, '%m/%d/%Y').strftime('%Y-%m-%d')
+        except ValueError:
+            return ''
+    return s if len(s) == 10 and s[:4].isdigit() else ''
+
+
+_META_COLS = ['topic_number', 'title', 'source', 'open_date', 'due_date',
+              'grant_summary', 'description', 'notice_version_id', 'sam_status']
+
+
+def _load_store_meta(client: storage.Client) -> tuple[dict[str, dict], set[str]]:
+    """Load SAM-GOV store metadata: (topic_number → record info, all stored titles).
+
+    The per-topic info carries everything revision handling needs — the current
+    noticeId (from the notice_version_id column, falling back to the source URL),
+    the stored text for diffing, and the parquet blob(s) holding the rows.
+    """
+    meta:   dict[str, dict] = {}
+    titles: set[str] = set()
     for blob in client.list_blobs(_BUCKET, prefix=_SAM_STORE_PREFIX):
         if not blob.name.endswith('.parquet'):
             continue
         try:
-            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()), columns=['topic_number', 'title'])
-            notice_ids.update(df['topic_number'].dropna().astype(str).str.strip())
-            titles.update(df['title'].dropna().astype(str).str.lower().str.strip())
+            pf   = pq.ParquetFile(io.BytesIO(blob.download_as_bytes()))
+            cols = [c for c in _META_COLS if c in set(pf.schema_arrow.names)]
+            df   = pf.read(columns=cols).to_pandas()
         except Exception:
-            pass
-    return notice_ids, titles
+            continue
+        if 'title' in df.columns:
+            titles.update(df['title'].dropna().astype(str).str.lower().str.strip())
+        for _, row in df.iterrows():
+            tn = _clean(row.get('topic_number'))
+            if not tn:
+                continue
+            entry = meta.get(tn)
+            if entry is None:
+                entry = meta[tn] = {
+                    'title':             _clean(row.get('title')),
+                    'open_date':         _clean(row.get('open_date')),
+                    'due_date':          _clean(row.get('due_date')),
+                    'grant_summary':     _clean(row.get('grant_summary')),
+                    'description':       _clean(row.get('description')),
+                    'sam_status':        _clean(row.get('sam_status')) or 'active',
+                    'notice_version_id': _clean(row.get('notice_version_id')) or _parse_notice_id(row.get('source')),
+                    'blobs':             [],
+                }
+            if blob.name not in entry['blobs']:
+                entry['blobs'].append(blob.name)
+    return meta, titles
+
+
+# ── Revision handling ──────────────────────────────────────────────────────────
+
+def _extract_pdf_text(data: bytes, max_chars: int) -> str:
+    try:
+        chunks: list[str] = []
+        total = 0
+        with fitz.open(stream=data, filetype='pdf') as doc:
+            for i, page in enumerate(doc):
+                if i >= _ATTACH_MAX_PAGES or total >= max_chars:
+                    break
+                text = page.get_text().strip()
+                if text:
+                    chunks.append(text)
+                    total += len(text)
+        return '\n'.join(chunks)[:max_chars]
+    except Exception:
+        return ''
+
+
+def _fetch_attachments_text(resource_links, api_key: str) -> str:
+    """Download a notice's attachments and extract text from the PDFs among them."""
+    if resource_links is None or isinstance(resource_links, float):
+        return ''
+    try:
+        links = [str(l).strip() for l in list(resource_links) if str(l).strip()]
+    except TypeError:
+        return ''
+    parts: list[str] = []
+    remaining = _ATTACH_MAX_CHARS
+    for url in links[:_ATTACH_MAX_FILES]:
+        if remaining <= 0:
+            break
+        try:
+            r = _sam_get(url, {'api_key': api_key}, timeout=60)
+        except Exception:
+            continue
+        if not r.content.startswith(b'%PDF'):
+            continue
+        text = _extract_pdf_text(r.content, remaining)
+        if text:
+            parts.append(text)
+            remaining -= len(text)
+    return '\n\n'.join(parts)
+
+
+def _revision_diff(anth: Anthropic, old_summary: str, old_desc: str, new_text: str) -> dict:
+    user_msg = (
+        f"OLD VERSION (stored summary):\n{old_summary[:3000]}\n\n"
+        f"OLD VERSION (stored description):\n{old_desc[:6000]}\n\n"
+        f"NEW VERSION (latest description + attachment text):\n{new_text[:12000]}"
+    )
+    try:
+        resp = anth.messages.create(
+            model=_SCREEN_MODEL,
+            max_tokens=500,
+            system=_REVISION_SYSTEM,
+            messages=[{'role': 'user', 'content': user_msg}],
+        )
+        raw = resp.content[0].text.strip()
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
+        return json.loads(raw)
+    except Exception as e:
+        # Default to changed=True so the stored content still gets refreshed.
+        return {'changed': True, 'notes': f'Could not diff versions ({e}) — content refreshed.',
+                'topics_added': [], 'topics_removed': []}
+
+
+def _format_revision_notes(diff: dict) -> str:
+    parts = [_clean(diff.get('notes'))]
+    added   = [str(t).strip() for t in (diff.get('topics_added') or [])  if str(t).strip()]
+    removed = [str(t).strip() for t in (diff.get('topics_removed') or []) if str(t).strip()]
+    if added:
+        parts.append('Topics added: ' + '; '.join(added))
+    if removed:
+        parts.append('Topics removed: ' + '; '.join(removed))
+    return ' | '.join(p for p in parts if p)[:2000]
+
+
+def _summarize_sync(anth: Anthropic, title: str, text: str) -> str:
+    try:
+        resp = anth.messages.create(
+            model=_SCREEN_MODEL,
+            max_tokens=400,
+            system=_SUMMARY_SYSTEM,
+            messages=[{'role': 'user', 'content': f"Title: {title}\n\nDescription:\n{text[:10000]}"}],
+        )
+        return resp.content[0].text.strip()
+    except Exception:
+        return ''
+
+
+def _process_revisions(
+    items: list[dict],
+    api_key: str,
+    anth_key: str,
+    openai_key: str,
+    include_attachments: bool,
+    dry_run: bool,
+) -> tuple[list[dict], list[dict]]:
+    """Fetch latest content for revised notices, diff with Claude, build row updates.
+
+    items: [{topic_number, title, new_notice_id, deadline, resource_links,
+             old_summary, old_desc, blobs}]
+    Returns (updates for _apply_updates, report entries for status.json).
+    In dry_run mode the diff still runs (so the report is useful) but no updates
+    are produced.
+    """
+    anth  = Anthropic(api_key=anth_key)
+    oai   = OpenAI(api_key=openai_key)
+    enc   = tiktoken.get_encoding('cl100k_base')
+    today = datetime.today().strftime('%Y-%m-%d')
+
+    updates: list[dict | None] = [None] * len(items)
+    reports: list[dict | None] = [None] * len(items)
+
+    def _one(i: int) -> None:
+        item     = items[i]
+        new_desc = _fetch_one_desc(item['new_notice_id'], api_key)
+        attach   = _fetch_attachments_text(item.get('resource_links'), api_key) if include_attachments else ''
+        new_text = '\n\n'.join(t for t in (new_desc, attach) if t).strip()
+
+        if new_text:
+            diff = _revision_diff(anth, item['old_summary'], item['old_desc'], new_text)
+        else:
+            diff = {'changed': False, 'topics_added': [], 'topics_removed': [],
+                    'notes': 'New version detected but no description or attachment text could be fetched.'}
+        notes = _format_revision_notes(diff)
+        reports[i] = {
+            'topic_number': item['topic_number'],
+            'title':        item['title'],
+            'changed':      bool(diff.get('changed')),
+            'notes':        notes,
+        }
+        if dry_run:
+            return
+
+        fields: dict = {
+            'notice_version_id':  item['new_notice_id'],
+            'source':             f"https://sam.gov/opp/{item['new_notice_id']}/view",
+            'sam_status':         'active',
+            'revised_at':         today,
+            'sam_revision_notes': notes,
+        }
+        if item.get('title'):
+            fields['title'] = item['title']
+        if item.get('deadline'):
+            fields['due_date'] = item['deadline']
+        # Only re-summarize/re-embed when the content substantively changed —
+        # deadline-only amendments keep the existing summary and embedding.
+        if diff.get('changed') and new_text:
+            summary   = _summarize_sync(anth, item['title'], new_text)
+            embedding = _get_embedding(summary or new_text, oai, enc)
+            fields['description'] = new_text
+            if summary:
+                fields['grant_summary'] = summary
+            if embedding is not None:
+                fields['embeddings'] = embedding
+        updates[i] = {'topic_number': item['topic_number'], 'blobs': item['blobs'], 'fields': fields}
+
+    with ThreadPoolExecutor(max_workers=_REV_WORKERS) as pool:
+        futures = {pool.submit(_one, i): i for i in range(len(items))}
+        done = 0
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                reports[i] = {'topic_number': items[i]['topic_number'], 'title': items[i]['title'],
+                              'changed': False, 'notes': f'Error processing revision: {e}'}
+            done += 1
+            print(f'  revisions: {done}/{len(items)}', flush=True)
+
+    return [u for u in updates if u], [r for r in reports if r]
+
+
+def _apply_updates(client: storage.Client, updates: list[dict]) -> int:
+    """Rewrite the parquet blob(s) holding each updated notice, patching rows in place.
+
+    Returns the number of distinct notices whose rows were actually updated.
+    """
+    by_blob: dict[str, list[dict]] = {}
+    for u in updates:
+        for blob_name in u.get('blobs', []):
+            by_blob.setdefault(blob_name, []).append(u)
+
+    updated_topics: set[str] = set()
+    for blob_name, blob_updates in by_blob.items():
+        blob = client.bucket(_BUCKET).blob(blob_name)
+        try:
+            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+        except Exception as e:
+            print(f'  could not read {blob_name} for update: {e}', flush=True)
+            continue
+        for col, default in (('notice_version_id', ''), ('sam_status', 'active'),
+                             ('revised_at', ''), ('sam_revision_notes', '')):
+            if col not in df.columns:
+                df[col] = default
+        keys    = df['topic_number'].astype(str).str.strip()
+        touched = False
+        for u in blob_updates:
+            mask = keys == u['topic_number']
+            if not mask.any():
+                continue
+            for idx in df.index[mask]:
+                for col, val in u['fields'].items():
+                    if col not in df.columns:
+                        df[col] = ''
+                    df.at[idx, col] = val
+            touched = True
+            updated_topics.add(u['topic_number'])
+        if touched:
+            buf = io.BytesIO()
+            df.to_parquet(buf, index=False)
+            blob.upload_from_string(buf.getvalue(), content_type='application/octet-stream')
+            print(f'  rewrote {blob_name} ({len(df)} rows)', flush=True)
+    return len(updated_topics)
+
+
+def _lookup_latest(solnum: str, api_key: str, stored_open_date: str) -> tuple[str, dict | None]:
+    """Query SAM.gov for the latest version of a solicitation number.
+
+    The search API requires postedFrom/postedTo (max 1 year apart) and returns
+    only the latest active version, so walk one-year windows back from today
+    until we find it or pass the original posting date.
+    Returns ('found', record) | ('not_found', None) | ('error', None).
+    """
+    today  = datetime.today()
+    open_d = _iso_date(stored_open_date)
+    for i in range(_REVCHECK_MAX_WINDOWS):
+        w_to   = today - timedelta(days=364 * i)
+        w_from = today - timedelta(days=364 * (i + 1))
+        params = {
+            'api_key':    api_key,
+            'solnum':     solnum,
+            'postedFrom': w_from.strftime('%m/%d/%Y'),
+            'postedTo':   w_to.strftime('%m/%d/%Y'),
+            'limit':      10,
+            'offset':     0,
+        }
+        try:
+            data = _sam_get(_SAM_API_BASE, params).json()
+        except Exception as e:
+            print(f'  lookup failed for {solnum}: {e}', flush=True)
+            return 'error', None
+        items = [it for it in (data.get('opportunitiesData') or [])
+                 if _clean(it.get('solicitationNumber')) == solnum]
+        if items:
+            return 'found', max(items, key=lambda it: _clean(it.get('postedDate')))
+        if open_d and w_from.strftime('%Y-%m-%d') < open_d:
+            break  # searched back past the original posting — it is gone
+    return 'not_found', None
+
+
+def _run_revision_check(gcs: storage.Client, config: dict, run_id: str,
+                        anth_key: str, openai_key: str) -> None:
+    api_params          = config.get('api_params', {})
+    api_key             = api_params['sam_gov_api_key']
+    include_attachments = bool(api_params.get('include_attachments', True))
+    dry_run             = bool(config.get('dry_run', False))
+    today               = datetime.today().strftime('%Y-%m-%d')
+
+    print(f'Revision check starting (dry_run={dry_run})…', flush=True)
+    print('Loading stored SAM-GOV records…', flush=True)
+    meta, _ = _load_store_meta(gcs)
+
+    candidates = {
+        tn: m for tn, m in meta.items()
+        if m['sam_status'] != 'archived'
+        and (not _iso_date(m['due_date']) or _iso_date(m['due_date']) >= today)
+    }
+    print(f'  {len(meta):,} stored notices, {len(candidates):,} open candidates to check', flush=True)
+
+    revised:   list[dict] = []
+    archived:  list[dict] = []
+    backfills: list[dict] = []
+    errors  = 0
+    checked = 0
+    for tn, m in candidates.items():
+        checked += 1
+        if checked % 25 == 0 or checked == len(candidates):
+            print(f'  checked {checked}/{len(candidates)} — '
+                  f'{len(revised)} revised, {len(archived)} archived', flush=True)
+        status, rec = _lookup_latest(tn, api_key, m['open_date'])
+        if status == 'error':
+            errors += 1
+            continue
+        if status == 'not_found' or _clean((rec or {}).get('active')).lower() == 'no':
+            archived.append({'topic_number': tn, 'title': m['title'], 'blobs': m['blobs']})
+            continue
+        new_id = _clean(rec.get('noticeId'))
+        old_id = m['notice_version_id']
+        if not new_id or (old_id and new_id == old_id):
+            continue
+        if not old_id:
+            # No stored version id (older imports without a source URL) — fall back
+            # to comparing description text before treating it as a revision.
+            new_desc = _fetch_one_desc(new_id, api_key)
+            if ' '.join(new_desc.split()) == ' '.join(m['description'].split()):
+                backfills.append({'topic_number': tn, 'blobs': m['blobs'], 'fields': {
+                    'notice_version_id': new_id,
+                    'source':            f'https://sam.gov/opp/{new_id}/view',
+                }})
+                continue
+        revised.append({
+            'topic_number':   tn,
+            'title':          _clean(rec.get('title')) or m['title'],
+            'new_notice_id':  new_id,
+            'deadline':       _clean(rec.get('responseDeadLine'))[:10],
+            'resource_links': rec.get('resourceLinks') or [],
+            'old_summary':    m['grant_summary'],
+            'old_desc':       m['description'],
+            'blobs':          m['blobs'],
+        })
+
+    print(f'  {len(revised)} revised, {len(archived)} archived/gone, {errors} lookup errors', flush=True)
+
+    updates: list[dict] = []
+    reports: list[dict] = []
+    if revised:
+        print(f'Processing {len(revised)} revised notices…', flush=True)
+        updates, reports = _process_revisions(
+            revised, api_key, anth_key, openai_key, include_attachments, dry_run
+        )
+
+    rows_updated = 0
+    if not dry_run:
+        for a in archived:
+            updates.append({'topic_number': a['topic_number'], 'blobs': a['blobs'], 'fields': {
+                'sam_status':         'archived',
+                'sam_revision_notes': f'No longer active on SAM.gov as of {today}.',
+            }})
+        updates.extend(backfills)
+        if updates:
+            print(f'Applying updates for {len(updates)} notices…', flush=True)
+            rows_updated = _apply_updates(gcs, updates)
+
+    _write_status(gcs, run_id, {
+        'run_id':          run_id,
+        'mode':            'revision_check',
+        'dry_run':         dry_run,
+        'rows_checked':    checked,
+        'revisions_found': len(revised),
+        'rows_archived':   len(archived),
+        'rows_updated':    rows_updated,
+        'lookup_errors':   errors,
+        'revisions':       reports[:200],
+        'archived':        [{'topic_number': a['topic_number'], 'title': a['title']}
+                            for a in archived[:200]],
+        'error':           None,
+    })
+    print('Revision check complete.', flush=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -472,6 +931,10 @@ def main(config_blob_path: str) -> None:
 
     anth_key   = _get_secret('anthropic-api-key')
     openai_key = _get_secret('openai-api-key')
+
+    if input_mode == 'revision_check':
+        _run_revision_check(gcs, config, run_id, anth_key, openai_key)
+        return
 
     # ── Step 1: Load input ─────────────────────────────────────────────────────
     print(f'Loading input data (mode={input_mode})…', flush=True)
@@ -512,7 +975,8 @@ def main(config_blob_path: str) -> None:
 
     # ── Step 3: Dedup ──────────────────────────────────────────────────────────
     print('Loading existing records for dedup…', flush=True)
-    existing_ids, existing_titles = _load_existing_keys(gcs)
+    store_meta, existing_titles = _load_store_meta(gcs)
+    existing_ids = set(store_meta.keys())
     print(f'  {len(existing_ids):,} existing notice IDs, {len(existing_titles):,} existing titles', flush=True)
 
     def _is_dup(row: pd.Series) -> bool:
@@ -530,11 +994,50 @@ def main(config_blob_path: str) -> None:
         flush=True,
     )
 
+    # ── Step 3b (API mode): update stored notices whose SAM.gov version changed ─
+    # Amendments (e.g. revised CSOs) arrive as duplicates by solicitation number
+    # but carry a new noticeId. Instead of dropping them, fetch the new content,
+    # diff it with Claude, and rewrite the stored rows in place.
+    rows_revised = 0
+    revision_reports: list[dict] = []
+    if input_mode == 'api' and '_raw_notice_id' in passing.columns:
+        rev_items: list[dict] = []
+        seen: set[str] = set()
+        for _, row in passing[dup_mask].iterrows():
+            tn = _clean(row.get('notice_id'))
+            stored = store_meta.get(tn)
+            if not stored or tn in seen:
+                continue
+            new_id = _clean(row.get('_raw_notice_id'))
+            old_id = stored['notice_version_id']
+            if not new_id or not old_id or new_id == old_id:
+                continue
+            seen.add(tn)
+            rev_items.append({
+                'topic_number':   tn,
+                'title':          _clean(row.get('title')) or stored['title'],
+                'new_notice_id':  new_id,
+                'deadline':       _clean(row.get('deadline'))[:10],
+                'resource_links': row.get('_resource_links'),
+                'old_summary':    stored['grant_summary'],
+                'old_desc':       stored['description'],
+                'blobs':          stored['blobs'],
+            })
+        if rev_items:
+            print(f'{len(rev_items)} stored notices have new versions — updating…', flush=True)
+            rev_updates, revision_reports = _process_revisions(
+                rev_items, config['api_params']['sam_gov_api_key'],
+                anth_key, openai_key, include_attachments=True, dry_run=False,
+            )
+            rows_revised = _apply_updates(gcs, rev_updates)
+            print(f'  {rows_revised} stored notices updated', flush=True)
+
     if new_rows.empty:
         _write_status(gcs, run_id, {
             'run_id': run_id, 'rows_fetched': rows_fetched,
             'rows_passed_screening': rows_passed, 'rows_after_dedup': 0,
-            'rows_saved': 0, 'gcs_path': None, 'error': None,
+            'rows_saved': 0, 'rows_revised': rows_revised,
+            'revisions': revision_reports[:200], 'gcs_path': None, 'error': None,
         })
         print('All passing rows already in the store — exiting.', flush=True)
         return
@@ -565,7 +1068,7 @@ def main(config_blob_path: str) -> None:
     if n_thin:
         print(f'  {n_thin:,} rows dropped — description too sparse to summarize', flush=True)
         keep = [not t for t in thin_mask]
-        new_rows  = new_rows[[i for i, k in enumerate(keep) if k]].reset_index(drop=True)
+        new_rows  = new_rows[keep].reset_index(drop=True)
         summaries = [s for s, k in zip(summaries, keep) if k]
         rows_dedup = len(new_rows)
 
@@ -573,7 +1076,8 @@ def main(config_blob_path: str) -> None:
         _write_status(gcs, run_id, {
             'run_id': run_id, 'rows_fetched': rows_fetched,
             'rows_passed_screening': rows_passed, 'rows_after_dedup': 0,
-            'rows_saved': 0, 'gcs_path': None, 'error': None,
+            'rows_saved': 0, 'rows_revised': rows_revised,
+            'revisions': revision_reports[:200], 'gcs_path': None, 'error': None,
         })
         print('All rows had insufficient descriptions — exiting.', flush=True)
         return
@@ -585,19 +1089,27 @@ def main(config_blob_path: str) -> None:
 
     # ── Step 6: Build output ───────────────────────────────────────────────────
     today = datetime.today().strftime('%Y-%m-%d')
-    out   = pd.DataFrame({
-        'topic_number':   new_rows['notice_id'].astype(str),
-        'agency':         new_rows['agency'].astype(str),
-        'title':          new_rows['title'].astype(str),
-        'description':    new_rows['description'].astype(str),
-        'open_date':      new_rows['posted_date'].astype(str),
-        'due_date':       new_rows['deadline'].astype(str),
-        'source':         new_rows['sam_url'].astype(str) if 'sam_url' in new_rows.columns else '',
-        'scraped_at':     today,
-        'sam_confidence': new_rows['_confidence'].values,
-        'sam_reason':     new_rows['_reason'].values,
-        'grant_summary':  summaries,
-        'embeddings':     embeddings,
+    if '_raw_notice_id' in new_rows.columns:
+        version_ids = new_rows['_raw_notice_id'].astype(str)
+    else:
+        version_ids = new_rows['sam_url'].astype(str).map(_parse_notice_id) if 'sam_url' in new_rows.columns else ''
+    out = pd.DataFrame({
+        'topic_number':       new_rows['notice_id'].astype(str),
+        'agency':             new_rows['agency'].astype(str),
+        'title':              new_rows['title'].astype(str),
+        'description':        new_rows['description'].astype(str),
+        'open_date':          new_rows['posted_date'].astype(str),
+        'due_date':           new_rows['deadline'].astype(str),
+        'source':             new_rows['sam_url'].astype(str) if 'sam_url' in new_rows.columns else '',
+        'scraped_at':         today,
+        'sam_confidence':     new_rows['_confidence'].values,
+        'sam_reason':         new_rows['_reason'].values,
+        'grant_summary':      summaries,
+        'embeddings':         embeddings,
+        'notice_version_id':  version_ids,
+        'sam_status':         'active',
+        'revised_at':         '',
+        'sam_revision_notes': '',
     })
 
     for col_name, col_val in custom_cols.items():
@@ -621,6 +1133,8 @@ def main(config_blob_path: str) -> None:
         'rows_passed_screening': rows_passed,
         'rows_after_dedup':      rows_dedup,
         'rows_saved':            rows_saved,
+        'rows_revised':          rows_revised,
+        'revisions':             revision_reports[:200],
         'gcs_path':              gcs_path,
         'error':                 None,
     })

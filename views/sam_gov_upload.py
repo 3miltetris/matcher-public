@@ -495,6 +495,67 @@ with st.expander('⏰ Daily API Parameters', expanded=not _daily_exists):
                 '`gcloud scheduler jobs update http sam-gov-daily --schedule="..." --location=us-central1`'
             )
 
+# ── Revision Check ─────────────────────────────────────────────────────────────
+
+with st.expander('🔁 Revision Check', expanded=False):
+    st.caption(
+        'Sweep every stored open SAM.gov notice (CSOs included) for revisions: '
+        'each solicitation number is looked up on SAM.gov, notices with a new '
+        'version get their description and attachments re-fetched, Claude diffs '
+        'the content (topics added/removed), and the stored record is updated in '
+        'place — new summary, embedding, deadline, and revision notes. Notices '
+        'no longer on SAM.gov are marked archived and skipped by matching. '
+        'Revisions that arrive in the daily pull are handled automatically; use '
+        'this to catch anything the daily filters missed.'
+    )
+
+    _rc_key = st.secrets.get('sam_gov_api_key')
+    if not _rc_key:
+        st.warning('Add `sam_gov_api_key` to `.streamlit/secrets.toml` to run revision checks.')
+    else:
+        rc_l, rc_r = st.columns(2)
+        with rc_l:
+            rc_dry = st.checkbox(
+                'Report only (dry run)',
+                value=True,
+                key='rc_dry_run',
+                help='Detect and diff revisions but write nothing — review the report before applying.',
+            )
+        with rc_r:
+            rc_attach = st.checkbox(
+                'Include attachments (PDF text)',
+                value=True,
+                key='rc_attachments',
+                help='Download attached PDFs and include their text in the diff and updated summary. '
+                     'CSO topics often live only in attachments.',
+            )
+
+        if st.button('🔍 Check stored notices for revisions', type='primary', key='rc_run_btn'):
+            rc_run_id = f"sam_gov_revcheck_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+            rc_config = {
+                'run_id':     rc_run_id,
+                'input_mode': 'revision_check',
+                'api_params': {
+                    'sam_gov_api_key':     _rc_key,
+                    'include_attachments': bool(rc_attach),
+                },
+                'dry_run':    bool(rc_dry),
+            }
+            try:
+                rc_gcs = _get_storage_client()
+                with st.spinner('Uploading job config…'):
+                    rc_blob = _write_sam_config(rc_gcs, rc_config)
+                with st.spinner('Triggering Cloud Run job…'):
+                    _trigger_sam_job(rc_blob)
+                st.session_state.sam_active_run = {
+                    'run_id':      rc_run_id,
+                    'config_blob': rc_blob,
+                }
+                st.rerun()
+            except Exception as exc:
+                st.error(f'Failed to trigger revision check: {exc}')
+                st.code(traceback.format_exc())
+
 st.divider()
 
 # ── Active run: polling UI ────────────────────────────────────────────────────
@@ -524,14 +585,44 @@ if st.session_state.sam_active_run:
             st.session_state.sam_active_run = None
 
         else:
-            st.success(
-                f'Import complete — **{status["rows_saved"]:,}** topics saved '
-                f'(fetched {status["rows_fetched"]:,}, '
-                f'passed screening {status["rows_passed_screening"]:,}, '
-                f'after dedup {status["rows_after_dedup"]:,}).'
-            )
-            if status.get('gcs_path'):
-                st.caption(f'Saved to `{status["gcs_path"]}`')
+            if status.get('mode') == 'revision_check':
+                dr = ' (dry run — nothing was written)' if status.get('dry_run') else ''
+                st.success(
+                    f"Revision check complete{dr} — "
+                    f"**{status.get('rows_checked', 0):,}** notices checked, "
+                    f"**{status.get('revisions_found', 0):,}** revised, "
+                    f"**{status.get('rows_archived', 0):,}** archived, "
+                    f"**{status.get('rows_updated', 0):,}** updated in store."
+                )
+                if status.get('lookup_errors'):
+                    st.warning(
+                        f"{status['lookup_errors']} notice(s) could not be checked "
+                        f"due to SAM.gov lookup errors — they will be retried on the next run."
+                    )
+            else:
+                st.success(
+                    f'Import complete — **{status.get("rows_saved", 0):,}** topics saved '
+                    f'(fetched {status.get("rows_fetched", 0):,}, '
+                    f'passed screening {status.get("rows_passed_screening", 0):,}, '
+                    f'after dedup {status.get("rows_after_dedup", 0):,}).'
+                )
+                if status.get('rows_revised'):
+                    st.info(
+                        f"**{status['rows_revised']}** previously stored notice(s) had new "
+                        f"SAM.gov versions and were updated in place."
+                    )
+                if status.get('gcs_path'):
+                    st.caption(f'Saved to `{status["gcs_path"]}`')
+
+            _revs = status.get('revisions') or []
+            if _revs:
+                with st.expander(f'📝 Revision details ({len(_revs)})', expanded=True):
+                    st.dataframe(pd.DataFrame(_revs), hide_index=True, use_container_width=True)
+            _arch = status.get('archived') or []
+            if _arch:
+                with st.expander(f'🗄️ Archived notices ({len(_arch)})', expanded=False):
+                    st.dataframe(pd.DataFrame(_arch), hide_index=True, use_container_width=True)
+
             st.session_state.sam_active_run = None
 
     except Exception as e:
@@ -790,24 +881,75 @@ if not m_title or not m_desc:
     st.stop()
 
 
-# ── Section 3 · Screening ─────────────────────────────────────────────────────
+# ── Section 3 · Dedup against existing store ──────────────────────────────────
 
 st.divider()
-st.subheader('3 · Screen with Claude')
+st.subheader('3 · Dedup against existing store')
 
-n_rows   = len(df_raw)
+if st.session_state.sam_existing_keys is None:
+    with st.spinner('Checking existing records for duplicates…'):
+        try:
+            st.session_state.sam_existing_keys = _load_existing_keys(_get_storage_client())
+        except Exception as e:
+            st.warning(f'Could not load existing records for dedup check: {e}')
+            st.session_state.sam_existing_keys = (set(), set())
+
+existing_ids, existing_titles = st.session_state.sam_existing_keys
+
+
+def _is_dup(row: pd.Series) -> bool:
+    if m_notice and str(row.get(m_notice, '')).strip() in existing_ids:
+        return True
+    return str(row.get(m_title, '')).strip().lower() in existing_titles
+
+
+dup_mask = df_raw.apply(_is_dup, axis=1)
+dupes    = df_raw[dup_mask]
+df_new   = df_raw[~dup_mask].reset_index(drop=True)
+
+d1, d2, d3 = st.columns(3)
+d1.metric('Uploaded rows',    f'{len(df_raw):,}')
+d2.metric('Already in store', f'{len(dupes):,}')
+d3.metric('New rows',         f'{len(df_new):,}')
+
+if not dupes.empty:
+    with st.expander(f'Skipped duplicates ({len(dupes)})', expanded=False):
+        st.dataframe(
+            dupes[[m_title] + ([m_notice] if m_notice else [])].reset_index(drop=True),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+if df_new.empty:
+    st.success('All uploaded rows are already in the store — nothing new to screen.')
+    st.stop()
+
+# Invalidate stale screening results if the dedup output changed (e.g. mapping edited)
+if (
+    st.session_state.sam_screened_df is not None
+    and len(st.session_state.sam_screened_df) != len(df_new)
+):
+    st.session_state.sam_screened_df = None
+
+
+# ── Section 4 · Screening ─────────────────────────────────────────────────────
+
+st.divider()
+st.subheader('4 · Screen with Claude')
+
+n_rows   = len(df_new)
 est_mins = max(1, n_rows // 60)
 screened = st.session_state.sam_screened_df
 
 if screened is None:
     st.caption(
-        f'Claude Haiku will screen **{n_rows:,}** rows for relevance. '
+        f'Claude Haiku will screen **{n_rows:,}** new rows for relevance. '
         f'Estimated time: ~{est_mins} min at {_SCREEN_WORKERS} concurrent workers.'
     )
     if st.button('⚡ Run Screening', type='primary'):
         anth_key = st.secrets['anthropic_api_key']
         try:
-            st.session_state.sam_screened_df = _run_screening(df_raw, col_map, anth_key)
+            st.session_state.sam_screened_df = _run_screening(df_new, col_map, anth_key)
             st.rerun()
         except Exception as e:
             st.error(f'Screening failed: {e}')
@@ -857,55 +999,16 @@ with st.expander(f'❌ Filtered out ({len(failing)})', expanded=False):
         )
 
 
-# ── Section 4 · Save ─────────────────────────────────────────────────────────
+# ── Section 5 · Save ─────────────────────────────────────────────────────────
 
 st.divider()
-st.subheader('4 · Save to topic store')
+st.subheader('5 · Save to topic store')
 
 if passing.empty:
     st.warning('No passing rows to save — nothing to embed.')
     st.stop()
 
-if st.session_state.sam_existing_keys is None:
-    with st.spinner('Checking existing records for duplicates…'):
-        try:
-            existing_ids, existing_titles = _load_existing_keys(_get_storage_client())
-            st.session_state.sam_existing_keys = (existing_ids, existing_titles)
-        except Exception as e:
-            st.warning(f'Could not load existing records for dedup check: {e}')
-            st.session_state.sam_existing_keys = (set(), set())
-
-existing_ids, existing_titles = st.session_state.sam_existing_keys
-
-
-def _is_dup(row: pd.Series) -> bool:
-    if m_notice:
-        if str(row.get(m_notice, '')).strip() in existing_ids:
-            return True
-    if str(row.get(m_title, '')).strip().lower() in existing_titles:
-        return True
-    return False
-
-
-dup_mask = passing.apply(_is_dup, axis=1)
-dupes    = passing[dup_mask]
-new_rows = passing[~dup_mask]
-
-if not dupes.empty:
-    st.info(
-        f'**{len(dupes)}** row(s) skipped — notice ID or title already exists in the store.',
-        icon='ℹ️',
-    )
-    with st.expander(f'Skipped duplicates ({len(dupes)})', expanded=False):
-        st.dataframe(
-            dupes[[m_title] + ([m_notice] if m_notice else [])].reset_index(drop=True),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-if new_rows.empty:
-    st.success('All passing rows are already in the store — nothing new to save.')
-    st.stop()
+new_rows = passing
 
 with st.expander('➕ Custom columns', expanded=bool(st.session_state.sam_custom_cols)):
     st.caption(

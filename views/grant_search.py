@@ -56,7 +56,13 @@ def _load_topics(agencies: list[str]) -> pd.DataFrame:
                 df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
                 df['broad_agency'] = agency
                 frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    topics = pd.concat(frames, ignore_index=True)
+    # Notices marked archived by the SAM.gov revision check are no longer live
+    if 'sam_status' in topics.columns:
+        topics = topics[topics['sam_status'].fillna('').astype(str) != 'archived'].reset_index(drop=True)
+    return topics
 
 
 def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:

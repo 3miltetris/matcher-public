@@ -141,7 +141,11 @@ def _load_topics(client: storage.Client, agencies: list[str]) -> pd.DataFrame:
         return pd.DataFrame()
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', FutureWarning)
-        return pd.concat(frames, ignore_index=True)
+        topics = pd.concat(frames, ignore_index=True)
+    # Notices marked archived by the SAM.gov revision check are no longer live
+    if 'sam_status' in topics.columns:
+        topics = topics[topics['sam_status'].fillna('').astype(str) != 'archived'].reset_index(drop=True)
+    return topics
 
 
 def _list_contact_blobs(client: storage.Client, sources: list[str]) -> list[tuple]:
