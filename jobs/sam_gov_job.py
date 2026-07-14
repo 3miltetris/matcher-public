@@ -86,11 +86,13 @@ _SAM_DESC_BASE    = 'https://api.sam.gov/opportunities/v2/noticedesc'
 _SAM_PAGE_SIZE    = 1000
 _DESC_WORKERS     = 6   # SAM.gov allows 10 req/s — 6 workers is the concurrency cap
 _SAM_PAGE_SLEEP   = 3.0  # seconds between pagination requests
-_SAM_MAX_RETRIES  = 8   # max retries on 429
-_SAM_RETRY_BASE   = 30  # seconds — SAM.gov quota resets on a minutes timescale
+_SAM_MAX_RETRIES  = 8   # max retries on throttle 429s (daily-quota 429s abort immediately)
+_SAM_RETRY_BASE   = 30  # seconds — throttle 429s clear on a minutes timescale
 _SAM_RATE_LOCK    = threading.Lock()
 _SAM_LAST_REQ     = [0.0]  # mutable for closure; protected by _SAM_RATE_LOCK
 _SAM_MIN_INTERVAL = 1.0 / 8  # 8 req/s — conservative under 10 req/s limit
+_SAM_CALL_COUNT   = [0]    # total SAM.gov HTTP requests this run; protected by _SAM_RATE_LOCK
+_SAM_QUOTA_FLAG   = threading.Event()  # set once the daily quota 429 is seen — fail fast after
 _SCREEN_CONCUR    = 20
 _SUMMARY_CONCUR   = 20
 _EMBED_WORKERS    = 8
@@ -104,6 +106,8 @@ _ATTACH_MAX_PAGES     = 30     # pages extracted per PDF
 _ATTACH_MAX_CHARS     = 40000  # total attachment text per notice
 _REV_WORKERS          = 4      # concurrent revised notices (each makes SAM + Claude calls)
 _REVCHECK_MAX_WINDOWS = 5      # one-year postedFrom/postedTo windows walked back per solnum lookup
+_REVCHECK_STATE_BLOB  = 'sam-gov-configs/revcheck_state.json'  # last-checked cursor per topic_number
+_REVCHECK_DEFAULT_BUDGET = 600  # SAM.gov API calls per revision-check run (daily key quota is 1,000)
 _NOTICE_ID_RE         = re.compile(r'sam\.gov/opp/([^/]+)/view')
 
 _SCREEN_SYSTEM = """\
@@ -198,27 +202,58 @@ def _write_status(client: storage.Client, run_id: str, payload: dict) -> None:
 
 # ── SAM.gov API helpers ────────────────────────────────────────────────────────
 
+class QuotaExhaustedError(Exception):
+    """SAM.gov daily request quota is spent — it resets only at midnight UTC."""
+
+
+def _is_quota_429(r: requests.Response) -> bool:
+    """Distinguish daily-quota exhaustion from a transient throttle 429.
+
+    Quota 429s carry a "you have exceeded your quota" body and a Retry-After
+    pointing at midnight UTC; throttle 429s clear within seconds to minutes.
+    """
+    body = r.text.lower()
+    if 'quota' in body and 'exceeded' in body:
+        return True
+    try:
+        return int(r.headers.get('Retry-After', 0)) > 1800
+    except (TypeError, ValueError):
+        return False
+
+
 def _sam_get(url: str, params: dict, timeout: int = 30) -> requests.Response:
-    """GET with proactive rate limiting (8 req/s global) and exponential backoff on 429."""
+    """GET with proactive rate limiting (8 req/s global) and exponential backoff on 429.
+
+    Raises QuotaExhaustedError as soon as SAM.gov reports the daily quota is
+    spent — retrying is pointless until midnight UTC, so callers stop cleanly
+    instead of burning the task timeout on doomed backoff waits.
+    """
+    if _SAM_QUOTA_FLAG.is_set():
+        raise QuotaExhaustedError('SAM.gov daily quota already exhausted this run.')
     with _SAM_RATE_LOCK:
         gap = _SAM_MIN_INTERVAL - (time.time() - _SAM_LAST_REQ[0])
         if gap > 0:
             time.sleep(gap)
         _SAM_LAST_REQ[0] = time.time()
 
-    for attempt in range(_SAM_MAX_RETRIES):
+    for attempt in range(_SAM_MAX_RETRIES + 1):
+        with _SAM_RATE_LOCK:
+            _SAM_CALL_COUNT[0] += 1
         r = requests.get(url, params=params, timeout=timeout)
         if r.status_code == 429:
-            wait = min(_SAM_RETRY_BASE * (2 ** attempt), 600)  # 30, 60, 120, 240, 480, 600, 600, 600s
-            print(f'  SAM.gov 429 — waiting {wait}s before retry {attempt + 1}/{_SAM_MAX_RETRIES}', flush=True)
-            time.sleep(wait)
-            continue
+            if _is_quota_429(r):
+                _SAM_QUOTA_FLAG.set()
+                raise QuotaExhaustedError(
+                    'SAM.gov daily request quota exhausted — resets at midnight UTC.'
+                )
+            if attempt < _SAM_MAX_RETRIES:
+                wait = min(_SAM_RETRY_BASE * (2 ** attempt), 600)  # 30, 60, 120, 240, 480, 600, 600, 600s
+                print(f'  SAM.gov 429 — waiting {wait}s before retry {attempt + 1}/{_SAM_MAX_RETRIES}', flush=True)
+                time.sleep(wait)
+                continue
         r.raise_for_status()
         return r
-    # Final attempt — let the caller handle any error
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r
+    raise RuntimeError('unreachable')  # loop always returns or raises
 
 
 def _fetch_one_desc(notice_id: str, api_key: str) -> str:
@@ -228,6 +263,8 @@ def _fetch_one_desc(notice_id: str, api_key: str) -> str:
         if '<' in content:
             return BeautifulSoup(content, 'html.parser').get_text(separator=' ', strip=True)
         return content.strip()
+    except QuotaExhaustedError:
+        raise
     except Exception:
         return ''
 
@@ -593,6 +630,8 @@ def _fetch_attachments_text(resource_links, api_key: str) -> str:
             break
         try:
             r = _sam_get(url, {'api_key': api_key}, timeout=60)
+        except QuotaExhaustedError:
+            raise
         except Exception:
             continue
         if not r.content.startswith(b'%PDF'):
@@ -658,12 +697,14 @@ def _process_revisions(
     openai_key: str,
     include_attachments: bool,
     dry_run: bool,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[str]]:
     """Fetch latest content for revised notices, diff with Claude, build row updates.
 
     items: [{topic_number, title, new_notice_id, deadline, resource_links,
              old_summary, old_desc, blobs}]
-    Returns (updates for _apply_updates, report entries for status.json).
+    Returns (updates for _apply_updates, report entries for status.json,
+    topic_numbers deferred because the SAM.gov daily quota ran out mid-fetch —
+    those produce no update and get re-detected on the next run).
     In dry_run mode the diff still runs (so the report is useful) but no updates
     are produced.
     """
@@ -719,6 +760,7 @@ def _process_revisions(
                 fields['embeddings'] = embedding
         updates[i] = {'topic_number': item['topic_number'], 'blobs': item['blobs'], 'fields': fields}
 
+    deferred: list[str] = []
     with ThreadPoolExecutor(max_workers=_REV_WORKERS) as pool:
         futures = {pool.submit(_one, i): i for i in range(len(items))}
         done = 0
@@ -726,13 +768,21 @@ def _process_revisions(
             i = futures[future]
             try:
                 future.result()
+            except QuotaExhaustedError:
+                # Quota died mid-fetch — drop any partial result so nothing
+                # half-fetched is written; the notice re-detects next run.
+                updates[i] = None
+                reports[i] = None
+                deferred.append(items[i]['topic_number'])
             except Exception as e:
                 reports[i] = {'topic_number': items[i]['topic_number'], 'title': items[i]['title'],
                               'changed': False, 'notes': f'Error processing revision: {e}'}
             done += 1
             print(f'  revisions: {done}/{len(items)}', flush=True)
 
-    return [u for u in updates if u], [r for r in reports if r]
+    if deferred:
+        print(f'  {len(deferred)} revision(s) deferred — SAM.gov daily quota exhausted', flush=True)
+    return [u for u in updates if u], [r for r in reports if r], deferred
 
 
 def _apply_updates(client: storage.Client, updates: list[dict]) -> int:
@@ -778,6 +828,25 @@ def _apply_updates(client: storage.Client, updates: list[dict]) -> int:
     return len(updated_topics)
 
 
+def _load_revcheck_state(client: storage.Client) -> dict[str, str]:
+    """Load the sweep cursor: topic_number → ISO date of its last completed check.
+
+    Advanced only by apply (non-dry) runs, so a dry run and the apply run that
+    follows it cover the same chunk of notices.
+    """
+    try:
+        raw = client.bucket(_BUCKET).blob(_REVCHECK_STATE_BLOB).download_as_text()
+        return {str(k): str(v) for k, v in (json.loads(raw).get('last_checked') or {}).items()}
+    except Exception:
+        return {}
+
+
+def _save_revcheck_state(client: storage.Client, last_checked: dict[str, str]) -> None:
+    client.bucket(_BUCKET).blob(_REVCHECK_STATE_BLOB).upload_from_string(
+        json.dumps({'last_checked': last_checked}), content_type='application/json'
+    )
+
+
 def _lookup_latest(solnum: str, api_key: str, stored_open_date: str) -> tuple[str, dict | None]:
     """Query SAM.gov for the latest version of a solicitation number.
 
@@ -801,6 +870,8 @@ def _lookup_latest(solnum: str, api_key: str, stored_open_date: str) -> tuple[st
         }
         try:
             data = _sam_get(_SAM_API_BASE, params).json()
+        except QuotaExhaustedError:
+            raise
         except Exception as e:
             print(f'  lookup failed for {solnum}: {e}', flush=True)
             return 'error', None
@@ -818,10 +889,11 @@ def _run_revision_check(gcs: storage.Client, config: dict, run_id: str,
     api_params          = config.get('api_params', {})
     api_key             = api_params['sam_gov_api_key']
     include_attachments = bool(api_params.get('include_attachments', True))
+    budget              = int(api_params.get('max_api_calls') or _REVCHECK_DEFAULT_BUDGET)
     dry_run             = bool(config.get('dry_run', False))
     today               = datetime.today().strftime('%Y-%m-%d')
 
-    print(f'Revision check starting (dry_run={dry_run})…', flush=True)
+    print(f'Revision check starting (dry_run={dry_run}, budget={budget} API calls)…', flush=True)
     print('Loading stored SAM-GOV records…', flush=True)
     meta, _ = _load_store_meta(gcs)
 
@@ -832,37 +904,59 @@ def _run_revision_check(gcs: storage.Client, config: dict, run_id: str,
     }
     print(f'  {len(meta):,} stored notices, {len(candidates):,} open candidates to check', flush=True)
 
-    revised:   list[dict] = []
-    archived:  list[dict] = []
-    backfills: list[dict] = []
+    # Sweep least-recently-checked first so a budget-capped run resumes where
+    # the previous apply run left off (never-checked notices sort first).
+    last_checked = _load_revcheck_state(gcs)
+    ordered      = sorted(candidates.items(), key=lambda kv: last_checked.get(kv[0], ''))
+
+    revised:    list[dict] = []
+    archived:   list[dict] = []
+    backfills:  list[dict] = []
+    checked_ok: set[str]   = set()
+    stopped_early: str | None = None  # 'quota' | 'budget'
     errors  = 0
     checked = 0
-    for tn, m in candidates.items():
+    for tn, m in ordered:
+        if _SAM_CALL_COUNT[0] >= budget:
+            stopped_early = 'budget'
+            break
         checked += 1
         if checked % 25 == 0 or checked == len(candidates):
             print(f'  checked {checked}/{len(candidates)} — '
-                  f'{len(revised)} revised, {len(archived)} archived', flush=True)
-        status, rec = _lookup_latest(tn, api_key, m['open_date'])
-        if status == 'error':
-            errors += 1
-            continue
-        if status == 'not_found' or _clean((rec or {}).get('active')).lower() == 'no':
-            archived.append({'topic_number': tn, 'title': m['title'], 'blobs': m['blobs']})
-            continue
-        new_id = _clean(rec.get('noticeId'))
-        old_id = m['notice_version_id']
-        if not new_id or (old_id and new_id == old_id):
-            continue
-        if not old_id:
-            # No stored version id (older imports without a source URL) — fall back
-            # to comparing description text before treating it as a revision.
-            new_desc = _fetch_one_desc(new_id, api_key)
-            if ' '.join(new_desc.split()) == ' '.join(m['description'].split()):
-                backfills.append({'topic_number': tn, 'blobs': m['blobs'], 'fields': {
-                    'notice_version_id': new_id,
-                    'source':            f'https://sam.gov/opp/{new_id}/view',
-                }})
+                  f'{len(revised)} revised, {len(archived)} archived, '
+                  f'{_SAM_CALL_COUNT[0]}/{budget} API calls', flush=True)
+        try:
+            status, rec = _lookup_latest(tn, api_key, m['open_date'])
+            if status == 'error':
+                errors += 1
                 continue
+            if status == 'not_found' or _clean((rec or {}).get('active')).lower() == 'no':
+                checked_ok.add(tn)
+                archived.append({'topic_number': tn, 'title': m['title'], 'blobs': m['blobs']})
+                continue
+            new_id = _clean(rec.get('noticeId'))
+            old_id = m['notice_version_id']
+            if not new_id or (old_id and new_id == old_id):
+                checked_ok.add(tn)
+                continue
+            if not old_id:
+                # No stored version id (older imports without a source URL) — fall back
+                # to comparing description text before treating it as a revision.
+                new_desc = _fetch_one_desc(new_id, api_key)
+                if ' '.join(new_desc.split()) == ' '.join(m['description'].split()):
+                    checked_ok.add(tn)
+                    backfills.append({'topic_number': tn, 'blobs': m['blobs'], 'fields': {
+                        'notice_version_id': new_id,
+                        'source':            f'https://sam.gov/opp/{new_id}/view',
+                    }})
+                    continue
+        except QuotaExhaustedError:
+            checked -= 1
+            stopped_early = 'quota'
+            print('  SAM.gov daily quota exhausted — stopping sweep '
+                  '(resumes from here on the next run)', flush=True)
+            break
+        checked_ok.add(tn)
         revised.append({
             'topic_number':   tn,
             'title':          _clean(rec.get('title')) or m['title'],
@@ -876,13 +970,21 @@ def _run_revision_check(gcs: storage.Client, config: dict, run_id: str,
 
     print(f'  {len(revised)} revised, {len(archived)} archived/gone, {errors} lookup errors', flush=True)
 
-    updates: list[dict] = []
-    reports: list[dict] = []
-    if revised:
+    revisions_detected = len(revised)
+    updates:  list[dict] = []
+    reports:  list[dict] = []
+    deferred: list[str]  = []
+    if revised and stopped_early == 'quota':
+        # No quota left to fetch revision content — leave these unchecked so the
+        # next run re-detects them.
+        deferred = [r['topic_number'] for r in revised]
+        revised  = []
+    elif revised:
         print(f'Processing {len(revised)} revised notices…', flush=True)
-        updates, reports = _process_revisions(
+        updates, reports, deferred = _process_revisions(
             revised, api_key, anth_key, openai_key, include_attachments, dry_run
         )
+    checked_ok.difference_update(deferred)
 
     rows_updated = 0
     if not dry_run:
@@ -896,19 +998,31 @@ def _run_revision_check(gcs: storage.Client, config: dict, run_id: str,
             print(f'Applying updates for {len(updates)} notices…', flush=True)
             rows_updated = _apply_updates(gcs, updates)
 
+        # Advance the sweep cursor (apply runs only — dry runs preview the same
+        # chunk the next apply run will process). Prune notices no longer stored.
+        for tn in checked_ok:
+            last_checked[tn] = today
+        _save_revcheck_state(gcs, {tn: d for tn, d in last_checked.items() if tn in meta})
+
     _write_status(gcs, run_id, {
-        'run_id':          run_id,
-        'mode':            'revision_check',
-        'dry_run':         dry_run,
-        'rows_checked':    checked,
-        'revisions_found': len(revised),
-        'rows_archived':   len(archived),
-        'rows_updated':    rows_updated,
-        'lookup_errors':   errors,
-        'revisions':       reports[:200],
-        'archived':        [{'topic_number': a['topic_number'], 'title': a['title']}
-                            for a in archived[:200]],
-        'error':           None,
+        'run_id':             run_id,
+        'mode':               'revision_check',
+        'dry_run':            dry_run,
+        'rows_candidates':    len(candidates),
+        'rows_checked':       checked,
+        'rows_remaining':     len(candidates) - checked,
+        'revisions_found':    revisions_detected,
+        'revisions_deferred': len(deferred),
+        'rows_archived':      len(archived),
+        'rows_updated':       rows_updated,
+        'lookup_errors':      errors,
+        'api_calls_used':     _SAM_CALL_COUNT[0],
+        'api_call_budget':    budget,
+        'stopped_early':      stopped_early,
+        'revisions':          reports[:200],
+        'archived':           [{'topic_number': a['topic_number'], 'title': a['title']}
+                               for a in archived[:200]],
+        'error':              None,
     })
     print('Revision check complete.', flush=True)
 
@@ -1025,12 +1139,14 @@ def main(config_blob_path: str) -> None:
             })
         if rev_items:
             print(f'{len(rev_items)} stored notices have new versions — updating…', flush=True)
-            rev_updates, revision_reports = _process_revisions(
+            rev_updates, revision_reports, rev_deferred = _process_revisions(
                 rev_items, config['api_params']['sam_gov_api_key'],
                 anth_key, openai_key, include_attachments=True, dry_run=False,
             )
             rows_revised = _apply_updates(gcs, rev_updates)
-            print(f'  {rows_revised} stored notices updated', flush=True)
+            print(f'  {rows_revised} stored notices updated'
+                  + (f', {len(rev_deferred)} deferred (quota)' if rev_deferred else ''),
+                  flush=True)
 
     if new_rows.empty:
         _write_status(gcs, run_id, {

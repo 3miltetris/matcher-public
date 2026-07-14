@@ -506,28 +506,46 @@ with st.expander('🔁 Revision Check', expanded=False):
         'place — new summary, embedding, deadline, and revision notes. Notices '
         'no longer on SAM.gov are marked archived and skipped by matching. '
         'Revisions that arrive in the daily pull are handled automatically; use '
-        'this to catch anything the daily filters missed.'
+        'this to catch anything the daily filters missed. '
+        '**SAM.gov allows 1,000 API requests per key per day** (shared with the '
+        'daily fetch), so each run checks a budgeted chunk of notices, oldest-'
+        'checked first, and resumes where the last apply run left off — a full '
+        'sweep of a large store completes over several days.'
     )
 
     _rc_key = st.secrets.get('sam_gov_api_key')
     if not _rc_key:
         st.warning('Add `sam_gov_api_key` to `.streamlit/secrets.toml` to run revision checks.')
     else:
-        rc_l, rc_r = st.columns(2)
+        rc_l, rc_m, rc_r = st.columns(3)
         with rc_l:
             rc_dry = st.checkbox(
                 'Report only (dry run)',
                 value=True,
                 key='rc_dry_run',
-                help='Detect and diff revisions but write nothing — review the report before applying.',
+                help='Detect and diff revisions but write nothing — review the report before applying. '
+                     'Dry runs do not advance the sweep cursor, so the next apply run '
+                     'processes the same chunk of notices.',
             )
-        with rc_r:
+        with rc_m:
             rc_attach = st.checkbox(
                 'Include attachments (PDF text)',
                 value=True,
                 key='rc_attachments',
                 help='Download attached PDFs and include their text in the diff and updated summary. '
                      'CSO topics often live only in attachments.',
+            )
+        with rc_r:
+            rc_budget = st.number_input(
+                'API call budget',
+                min_value=50,
+                max_value=950,
+                value=600,
+                step=50,
+                key='rc_budget',
+                help='SAM.gov requests this run may spend. Your key allows 1,000/day total, '
+                     'shared with the daily 5 AM fetch — leave headroom. The sweep stops '
+                     'cleanly at the budget and resumes on the next run.',
             )
 
         if st.button('🔍 Check stored notices for revisions', type='primary', key='rc_run_btn'):
@@ -538,6 +556,7 @@ with st.expander('🔁 Revision Check', expanded=False):
                 'api_params': {
                     'sam_gov_api_key':     _rc_key,
                     'include_attachments': bool(rc_attach),
+                    'max_api_calls':       int(rc_budget),
                 },
                 'dry_run':    bool(rc_dry),
             }
@@ -594,6 +613,30 @@ if st.session_state.sam_active_run:
                     f"**{status.get('rows_archived', 0):,}** archived, "
                     f"**{status.get('rows_updated', 0):,}** updated in store."
                 )
+                if status.get('stopped_early'):
+                    _why = (
+                        'the SAM.gov **daily quota** ran out (resets midnight UTC)'
+                        if status['stopped_early'] == 'quota'
+                        else f"the run's API call budget ({status.get('api_call_budget', 0):,}) was reached"
+                    )
+                    st.warning(
+                        f"Sweep stopped early because {_why} — "
+                        f"**{status.get('rows_remaining', 0):,}** of "
+                        f"{status.get('rows_candidates', 0):,} open notices still unchecked. "
+                        f"Run again (tomorrow, if quota) to continue; apply runs resume "
+                        f"from the least-recently-checked notices."
+                    )
+                if status.get('revisions_deferred'):
+                    st.warning(
+                        f"{status['revisions_deferred']} detected revision(s) could not be "
+                        f"processed before the quota ran out — they will be re-detected "
+                        f"on the next run."
+                    )
+                if status.get('api_calls_used'):
+                    st.caption(
+                        f"SAM.gov API calls used: {status['api_calls_used']:,} "
+                        f"of {status.get('api_call_budget', 0):,} budgeted."
+                    )
                 if status.get('lookup_errors'):
                     st.warning(
                         f"{status['lookup_errors']} notice(s) could not be checked "
