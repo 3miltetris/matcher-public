@@ -7,6 +7,7 @@ Select agencies, apply keyword filters, describe your technology, and find match
 
 import io
 import json
+from datetime import date, datetime, timedelta
 
 import anthropic
 import numpy as np
@@ -65,17 +66,53 @@ def _load_topics(agencies: list[str]) -> pd.DataFrame:
     return topics
 
 
+# Topic dates arrive as strings in mixed formats (ISO from Topic Importer,
+# mm/dd/yyyy from SAM.gov, sometimes with a time suffix) — try each.
+_DATE_FORMATS = ('%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d', '%m-%d-%Y', '%b %d, %Y')
+
+
+def _parse_date_str(value) -> date | None:
+    s = str(value).strip()
+    if not s:
+        return None
+    for fmt in _DATE_FORMATS:
+        for candidate in (s, s[:10]):
+            try:
+                return datetime.strptime(candidate, fmt).date()
+            except ValueError:
+                pass
+    return None
+
+
+def _filter_is_active(f: dict) -> bool:
+    if not f.get('column'):
+        return False
+    if f.get('type') == 'date_range':
+        return bool(f.get('date_from') and f.get('date_to'))
+    return bool(f.get('keyword', '').strip())
+
+
+def _filter_mask(df: pd.DataFrame, f: dict) -> pd.Series:
+    if f.get('type') == 'date_range':
+        d_from, d_to = f['date_from'], f['date_to']
+
+        def _in_range(v) -> bool:
+            d = _parse_date_str(v)
+            return d is not None and d_from <= d <= d_to
+
+        return df[f['column']].map(_in_range)
+    return df[f['column']].astype(str).str.lower().str.contains(
+        f['keyword'].lower(), na=False
+    )
+
+
 def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
-    active = [f for f in filters if f['keyword'].strip() and f['column']]
+    active = [f for f in filters if _filter_is_active(f)]
     if not active:
         return df
-    mask = df[active[0]['column']].astype(str).str.lower().str.contains(
-        active[0]['keyword'].lower(), na=False
-    )
+    mask = _filter_mask(df, active[0])
     for f in active[1:]:
-        m = df[f['column']].astype(str).str.lower().str.contains(
-            f['keyword'].lower(), na=False
-        )
+        m = _filter_mask(df, f)
         mask = (mask & m) if f['operator'] == 'AND' else (mask | m)
     return df[mask]
 
@@ -246,7 +283,7 @@ for _k in ['gs_topics_df', 'gs_results_df', 'gs_aspects', 'gs_search_mode', 'gs_
     if _k not in st.session_state:
         st.session_state[_k] = None
 if 'gs_filters' not in st.session_state:
-    st.session_state.gs_filters = [{'column': None, 'keyword': '', 'operator': 'AND'}]
+    st.session_state.gs_filters = [{'column': None, 'type': 'keyword', 'keyword': '', 'operator': 'AND'}]
 
 
 # ── Page ───────────────────────────────────────────────────────────────────
@@ -301,9 +338,9 @@ for f in st.session_state.gs_filters:
 
 for i, f in enumerate(st.session_state.gs_filters):
     if i == 0:
-        col_sel, kw_input, _, remove_col = st.columns([2, 3, 1, 0.5])
+        col_sel, mode_col, val_input, remove_col = st.columns([2, 1.4, 3, 0.5])
     else:
-        op_col, col_sel, kw_input, remove_col = st.columns([1, 2, 3, 0.5])
+        op_col, col_sel, mode_col, val_input, remove_col = st.columns([1, 2, 1.4, 3, 0.5])
         f['operator'] = op_col.radio(
             'op', ['AND', 'OR'], index=0 if f['operator'] == 'AND' else 1,
             key=f'gs_op_{i}', horizontal=True, label_visibility='collapsed'
@@ -314,17 +351,40 @@ for i, f in enumerate(st.session_state.gs_filters):
         index=filterable_cols.index(f['column']) if f['column'] in filterable_cols else 0,
         key=f'gs_col_{i}', label_visibility='collapsed'
     )
-    f['keyword'] = kw_input.text_input(
-        'Keyword', value=f['keyword'],
-        placeholder=f'Filter by {f["column"]}…',
-        key=f'gs_kw_{i}', label_visibility='collapsed'
+    mode_label = mode_col.selectbox(
+        'Filter type', ['Keyword', 'Date range'],
+        index=1 if f.get('type') == 'date_range' else 0,
+        key=f'gs_type_{i}', label_visibility='collapsed'
     )
+    f['type'] = 'date_range' if mode_label == 'Date range' else 'keyword'
+    if f['type'] == 'date_range':
+        picked = val_input.date_input(
+            'Date range',
+            value=(
+                f.get('date_from') or date.today() - timedelta(days=30),
+                f.get('date_to') or date.today(),
+            ),
+            key=f'gs_dr_{i}', label_visibility='collapsed',
+        )
+        if isinstance(picked, tuple) and len(picked) == 2:
+            f['date_from'], f['date_to'] = picked
+        elif isinstance(picked, tuple) and len(picked) == 1:
+            # Mid-selection: only the start date is chosen so far.
+            f['date_from'], f['date_to'] = picked[0], None
+    else:
+        f['keyword'] = val_input.text_input(
+            'Keyword', value=f.get('keyword', ''),
+            placeholder=f'Filter by {f["column"]}…',
+            key=f'gs_kw_{i}', label_visibility='collapsed'
+        )
     if remove_col.button('✕', key=f'gs_rm_{i}', disabled=len(st.session_state.gs_filters) == 1):
         st.session_state.gs_filters.pop(i)
         st.rerun()
 
 if st.button('+ Add filter'):
-    st.session_state.gs_filters.append({'column': filterable_cols[0], 'keyword': '', 'operator': 'AND'})
+    st.session_state.gs_filters.append(
+        {'column': filterable_cols[0], 'type': 'keyword', 'keyword': '', 'operator': 'AND'}
+    )
     st.rerun()
 
 filtered = _apply_filters(df, st.session_state.gs_filters)
