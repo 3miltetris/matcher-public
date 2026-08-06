@@ -7,6 +7,7 @@ Review, set the agency, then save with embeddings to the processed store.
 """
 
 import json
+import secrets
 from datetime import datetime
 
 import fitz  # PyMuPDF
@@ -42,19 +43,24 @@ For each topic, extract:
 - title: The verbatim title of the topic. If no explicit title exists, create a concise 8-10 word snippet from the start of the description.
 - description: The full verbatim description text for that topic. Include all technical requirements, objectives, and scope language. Do not truncate.
 - due_date: Any due date, close date, or submission deadline associated with the topic. Null if not present. Use ISO format YYYY-MM-DD if possible.
+- funding_amount: The award amount or funding range for this topic. Include the dollar sign and use the exact wording from the document (e.g., "$150,000", "$50,000-$250,000", "Up to $2,000,000"). Null if not stated.
 
 Return ONLY a valid JSON array. No preamble, no markdown, no backticks.
 CRITICAL: All string values must be properly JSON-escaped. Do NOT include literal newline characters inside JSON string values, use \\n instead.
 
 Example:
-[{"topic_number":"A24-001","title":"Autonomous UUV Navigation Systems","description":"Full verbatim description here.","due_date":"2024-09-15"}]
+[{"topic_number":"A24-001","title":"Autonomous UUV Navigation Systems","description":"Full verbatim description here.","due_date":"2024-09-15","funding_amount":"$150,000"}]
 
-If the document has a single global due date, apply it to all topics. Extract ALL topics.\
+If the document has a single global due date or funding amount, apply it to all topics. Extract ALL topics.\
 """
 
 _EXTRACT_MODEL = 'claude-sonnet-4-6'
 _EMBED_MODEL   = 'text-embedding-ada-002'
-_COL_ORDER     = ['topic_number', 'title', 'agency', 'due_date', 'scraped_at', 'description']
+_COL_ORDER     = ['topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount', 'scraped_at', 'grant_summary']
+_RESERVED_COLS = frozenset({
+    'topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount',
+    'scraped_at', 'description', 'embeddings', 'grant_summary',
+})
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -86,14 +92,21 @@ def _extract_topics(text: str, anth_key: str) -> list[dict]:
     client = Anthropic(api_key=anth_key)
     with client.messages.stream(
         model=_EXTRACT_MODEL,
-        max_tokens=16384,
+        max_tokens=64000,
         system=_EXTRACTION_PROMPT,
         messages=[{
             'role': 'user',
             'content': text,
         }],
     ) as stream:
-        raw = stream.get_final_text().strip()
+        final = stream.get_final_message()
+    if final.stop_reason == 'max_tokens':
+        raise ValueError(
+            'Claude hit the output token limit before finishing — the document '
+            'is too large to process in one pass. Try splitting it into smaller '
+            'sections (e.g. one agency or one batch of topics at a time).'
+        )
+    raw = final.content[0].text.strip()
     # Strip markdown code fences if Claude wrapped the output anyway
     if raw.startswith('```'):
         raw = raw.split('\n', 1)[-1]
@@ -101,12 +114,18 @@ def _extract_topics(text: str, anth_key: str) -> list[dict]:
     return json.loads(raw)
 
 
-def _build_df(topics: list[dict], sub_agency: str) -> pd.DataFrame:
+def _build_df(topics: list[dict], sub_agency: str, source: str = '') -> pd.DataFrame:
     df = pd.DataFrame(topics)
-    for col in ['topic_number', 'title', 'description', 'due_date']:
+    for col in ['topic_number', 'title', 'description', 'due_date', 'funding_amount']:
         if col not in df.columns:
             df[col] = None
+    # Normalise to canonical column name before saving
+    if 'description' in df.columns:
+        df = df.rename(columns={'description': 'grant_summary'})
+    elif 'grant_summary' not in df.columns:
+        df['grant_summary'] = None
     df['agency']     = sub_agency
+    df['source']     = source
     df['scraped_at'] = datetime.today().strftime('%Y-%m-%d')
     present = [c for c in _COL_ORDER if c in df.columns]
     extra   = [c for c in df.columns if c not in _COL_ORDER]
@@ -123,13 +142,14 @@ def _embed_and_save(df: pd.DataFrame, broad_agency: str, oai_key: str) -> list[s
         group    = group.copy()
         progress = st.progress(0, text=f'Embedding topics for **{sub_agency}**…')
         embeddings = []
-        for i, desc in enumerate(group['description'].astype(str)):
+        for i, desc in enumerate(group['grant_summary'].astype(str)):
             embeddings.append(tp.get_embedding(desc) if desc.strip() else None)
             progress.progress((i + 1) / len(group), text=f'Embedding {i + 1}/{len(group)} — {sub_agency}')
         group['embeddings'] = embeddings
         progress.empty()
 
-        gcs_path = f'{_TOPICS_PREFIX}{broad_agency}/{sub_agency}_{today}.parquet'
+        hex_suffix = secrets.token_hex(3)  # 6-char hex, e.g. "a3f9c1"
+        gcs_path = f'{_TOPICS_PREFIX}{broad_agency}/{sub_agency}_{today}_{hex_suffix}.parquet'
         bm.upload_file(gcs_path, group)
         saved.append(gcs_path)
 
@@ -142,6 +162,8 @@ if 'topics_df' not in st.session_state:
     st.session_state.topics_df = None
 if 'save_results' not in st.session_state:
     st.session_state.save_results = []
+if 'topic_custom_cols' not in st.session_state:
+    st.session_state.topic_custom_cols = []
 
 
 # ── Page ───────────────────────────────────────────────────────────────────
@@ -171,10 +193,17 @@ with text_tab:
         label_visibility='collapsed',
     )
 
-sub_agency_input = st.text_input(
-    'Sub-agency',
-    placeholder='e.g. ARMY, USSOCOM, NCI — pre-fills the agency column for all extracted topics',
-)
+input_col1, input_col2 = st.columns(2)
+with input_col1:
+    sub_agency_input = st.text_input(
+        'Sub-agency',
+        placeholder='e.g. ARMY, USSOCOM, NCI — pre-fills the agency column for all extracted topics',
+    )
+with input_col2:
+    source_input = st.text_input(
+        'Source',
+        placeholder='e.g. SAM.gov, Agency website — pre-fills the source column for all extracted topics',
+    )
 
 extract_btn = st.button('⚡ Extract Topics', type='primary')
 
@@ -211,8 +240,9 @@ if extract_btn:
         if not topics:
             st.warning('No topics found in the document.')
         else:
-            st.session_state.topics_df   = _build_df(topics, sub_agency_input.strip())
-            st.session_state.save_results = []
+            st.session_state.topics_df        = _build_df(topics, sub_agency_input.strip(), source_input.strip())
+            st.session_state.save_results      = []
+            st.session_state.topic_custom_cols = []
             st.success(f'Extracted **{len(topics)}** topic(s). Review and edit below.')
 
 # ── Section 2 · Review & edit ──────────────────────────────────────────────
@@ -232,30 +262,113 @@ if st.session_state.topics_df is not None:
             key='agency_fill_input',
         )
     with fill_right:
-        if st.button('Apply to all rows', use_container_width=True):
+        if st.button('Apply to all rows', key='apply_agency', width='stretch'):
             df = st.session_state.topics_df.copy()
             df['agency'] = fill_value.strip()
+            st.session_state.topics_df = df
+            st.rerun()
+
+    # Source quick-fill bar
+    src_left, src_right, _ = st.columns([2, 1, 3])
+    with src_left:
+        source_fill_value = st.text_input(
+            'Source',
+            value=source_input.strip(),
+            placeholder='e.g. SAM.gov, Agency website…',
+            label_visibility='collapsed',
+            key='source_fill_input',
+        )
+    with src_right:
+        if st.button('Apply to all rows', key='apply_source', width='stretch'):
+            df = st.session_state.topics_df.copy()
+            df['source'] = source_fill_value.strip()
             st.session_state.topics_df = df
             st.rerun()
 
     # Data editor — always sync edits back to session state so they survive reruns
     edited_df = st.data_editor(
         st.session_state.topics_df,
-        use_container_width=True,
+        width='stretch',
         num_rows='dynamic',
         column_config={
             'topic_number': st.column_config.TextColumn('Topic #',      width='small'),
             'title':        st.column_config.TextColumn('Title',        width='medium'),
             'agency':       st.column_config.TextColumn('Agency',       width='small'),
-            'due_date':     st.column_config.TextColumn('Due Date',     width='small'),
-            'scraped_at':   st.column_config.TextColumn('Scraped At',   width='small'),
-            'description':  st.column_config.TextColumn('Description',  width='large'),
+            'source':       st.column_config.TextColumn('Source',       width='small'),
+            'due_date':     st.column_config.TextColumn('Due Date',       width='small'),
+            'funding_amount':st.column_config.TextColumn('Funding Amount', width='small'),
+            'scraped_at':   st.column_config.TextColumn('Scraped At',    width='small'),
+            'grant_summary': st.column_config.TextColumn('Description',  width='large'),
         },
         hide_index=True,
         key='topics_editor',
     )
     # Persist edits so "Apply to all rows" and Save see the latest table state
     st.session_state.topics_df = edited_df
+
+    # ── Custom columns ──────────────────────────────────────────────────────
+
+    with st.expander('➕ Custom columns', expanded=bool(st.session_state.topic_custom_cols)):
+        st.caption(
+            'Add extra columns to tag every topic with campaign-specific metadata. '
+            'Columns are saved to the parquet and available as optional fields in HubSpot import.'
+        )
+
+        for col_name in list(st.session_state.topic_custom_cols):
+            cc1, cc2, cc3, cc4 = st.columns([2, 3, 2, 1])
+            with cc1:
+                st.text(col_name)
+            with cc2:
+                cur_val = (
+                    str(st.session_state.topics_df[col_name].iloc[0])
+                    if col_name in st.session_state.topics_df.columns and len(st.session_state.topics_df) > 0
+                    else ''
+                )
+                fill_v = st.text_input(
+                    'Value', value=cur_val,
+                    key=f'ccfill_{col_name}', label_visibility='collapsed',
+                )
+            with cc3:
+                if st.button('Apply to all', key=f'ccapply_{col_name}', use_container_width=True):
+                    _df = st.session_state.topics_df.copy()
+                    _df[col_name] = fill_v
+                    st.session_state.topics_df = _df
+                    st.rerun()
+            with cc4:
+                if st.button('✕', key=f'ccrm_{col_name}', use_container_width=True):
+                    _df = st.session_state.topics_df.copy()
+                    _df = _df.drop(columns=[col_name], errors='ignore')
+                    st.session_state.topics_df = _df
+                    st.session_state.topic_custom_cols.remove(col_name)
+                    st.rerun()
+
+        if st.session_state.topic_custom_cols:
+            st.divider()
+
+        na1, na2, na3 = st.columns([2, 3, 1])
+        with na1:
+            new_cc_name = st.text_input(
+                'Column name', placeholder='e.g. campaign_name',
+                key='new_cc_name', label_visibility='collapsed',
+            )
+        with na2:
+            new_cc_val = st.text_input(
+                'Default value', placeholder='e.g. Spring 2026',
+                key='new_cc_val', label_visibility='collapsed',
+            )
+        with na3:
+            if st.button('Add', key='add_cc_btn', use_container_width=True):
+                clean = new_cc_name.strip().replace(' ', '_').lower()
+                if (
+                    clean
+                    and clean not in _RESERVED_COLS
+                    and clean not in st.session_state.topic_custom_cols
+                ):
+                    _df = st.session_state.topics_df.copy()
+                    _df[clean] = new_cc_val.strip()
+                    st.session_state.topics_df = _df
+                    st.session_state.topic_custom_cols.append(clean)
+                    st.rerun()
 
     # ── Section 3 · Save ──────────────────────────────────────────────────
 
@@ -289,12 +402,12 @@ if st.session_state.topics_df is not None:
 
     st.caption(
         f'**{n_topics}** topic(s) across **{n_agencies}** {agency_word} → {dest_label}  '
-        f'— one parquet per unique sub-agency, named `{{sub_agency}}_{{date}}.parquet`'
+        f'— one parquet per unique sub-agency, named `{{sub_agency}}_{{date}}_{{hex}}.parquet`'
     )
 
     save_disabled = not broad_agency
     if st.button('💾 Save & Embed', type='primary', disabled=save_disabled):
-        descriptions = edited_df['description'].astype(str).str.strip()
+        descriptions = edited_df['grant_summary'].astype(str).str.strip()
         if descriptions.eq('').all() or descriptions.eq('None').all():
             st.error('All descriptions are empty — nothing to embed.')
         else:

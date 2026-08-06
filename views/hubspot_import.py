@@ -1,9 +1,17 @@
 """
 HubSpot Import
 --------------
-Builds a deduplicated contacts-only CSV from a completed matching run and
-submits it to HubSpot via the CRM Imports API (crm.import scope).
-Polls for completion and surfaces the imported/updated/error counts.
+Imports companies to HubSpot via the CRM Imports API (crm.import scope)
+from either of two sources:
+
+- **Matching run** — concatenates segment CSVs from matching-results/{run_id}/
+  and imports the standard matcher_* property set (original flow).
+- **Financial research run** — loads a completed Client Financials run from
+  finance-research-runs/{run_id}/state.json and imports the Deep Research
+  fields. Users map each financial field to an existing HubSpot company
+  property or a new auto-created matcher_fin_* property.
+
+Both modes dedupe by companyWebsite → domain and poll the import until done.
 """
 
 import io
@@ -17,20 +25,75 @@ import streamlit as st
 from google.cloud import storage
 from google.oauth2 import service_account
 
-_BUCKET         = 'cc-matcher-bucket-jeg-v1'
-_RESULTS_PREFIX = 'matching-results/'
-_HS_BASE        = 'https://api.hubapi.com'
-_POLL_INTERVAL  = 3   # seconds between status polls
+import src.modules.finance_research as fr
 
-# (CSV column name, HubSpot property name, idColumnType or None)
-_COL_MAP = [
-    ('companyWebsite', 'domain', 'HUBSPOT_ALTERNATE_ID'),
-    ('companyName',    'name',   None),
-]
+_BUCKET          = 'cc-matcher-bucket-jeg-v1'
+_RESULTS_PREFIX  = 'matching-results/'
+_FIN_RUNS_PREFIX = 'finance-research-runs/'
+_HS_BASE         = 'https://api.hubapi.com'
+_POLL_INTERVAL   = 3   # seconds between status polls
 
 _OBJECT_TYPE = 'COMPANY'
 
-for _k in ['hs_import_id', 'hs_import_rows', 'hs_df', 'hs_run_id']:
+# Standard HubSpot company properties — no creation needed
+# (csv_col, hs_property, idColumnType or None)
+_STANDARD_COLS = [
+    ('companyWebsite', 'domain',      'HUBSPOT_ALTERNATE_ID'),
+    ('companyName',    'name',        None),
+    ('company_summary','description', None),
+]
+
+# Custom properties created automatically if missing (matching-run mode)
+# csv_col: (hs_internal_name, display_label, type, fieldType)
+_CUSTOM_PROPS: dict[str, tuple[str, str, str, str]] = {
+    'source':        ('matcher_contact_source', 'Matcher Contact Source', 'string', 'text'),
+    'grant_source':  ('matcher_grant_source',  'Matcher Grant Source',  'string', 'text'),
+    'topic_number':  ('matcher_topic_number',  'Matcher Topic Number',  'string', 'text'),
+    'title':         ('matcher_grant_title',   'Matcher Grant Title',   'string', 'text'),
+    'agency':        ('matcher_agency',        'Matcher Agency',        'string', 'text'),
+    'broad_agency':  ('matcher_broad_agency',  'Matcher Broad Agency',  'string', 'text'),
+    'due_date':      ('matcher_due_date',        'Matcher Due Date',      'string', 'text'),
+    'funding_amount':('matcher_funding_amount', 'Matcher Funding Amount', 'string', 'text'),
+    'grant_summary': ('matcher_grant_summary', 'Matcher Grant Summary', 'string', 'textarea'),
+    'good_match':    ('matcher_good_match',    'Matcher Good Match',    'string', 'text'),
+    'subject_line':  ('matcher_subject_line',  'Matcher Subject Line',  'string', 'text'),
+    'ai_message':    ('matcher_ai_message',    'Matcher AI Message',    'string', 'textarea'),
+}
+
+_KNOWN_COLS    = frozenset([src for src, _, _ in _STANDARD_COLS] + list(_CUSTOM_PROPS.keys()))
+_IMPORT_EXCLUDE = frozenset({'embeddings', 'uuid'})
+
+# ── Financial-mode constants ──────────────────────────────────────────────────
+
+# All mappable financial fields: the digest first, then the 54 research fields
+_FIN_FIELDS = ['financial_summary'] + fr.ALL_FIELDS
+
+# Sentinel dropdown option — resolves per-row to matcher_fin_{field}
+_CREATE_OPT = '➕ create new (matcher_fin_…)'
+_SKIP_OPT   = '— skip —'
+
+# Long-form fields get textarea properties when auto-created
+_FIN_TEXTAREA = frozenset({
+    'financial_summary', 'award_detail_json', 'sources_used',
+    'outreach_angle', 'outreach_triggers', 'risks_red_flags',
+    'confidence_notes',
+})
+
+# Fields included by default in the mapping table (headline findings)
+_FIN_DEFAULT_ON = frozenset({
+    'financial_summary', 'revenue_estimate', 'revenue_year',
+    'total_venture_funding', 'total_grant_funding',
+    'federal_awards_count_3yr', 'federal_awards_total_3yr',
+    'employee_count_current', 'headcount_trend',
+    'score_total', 'recommendation', 'confidence_score',
+})
+
+
+def _col_to_label(col: str) -> str:
+    return col.replace('_', ' ').title()
+
+
+for _k in ['hs_import_id', 'hs_import_rows', 'hs_df', 'hs_run_id', 'hs_mode_last']:
     if _k not in st.session_state:
         st.session_state[_k] = None
 
@@ -79,14 +142,84 @@ def _load_run(client: storage.Client, run_id: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _list_fin_runs(client: storage.Client) -> list[str]:
+    """Financial research runs whose state.json has ≥1 completed company."""
+    blobs = client.list_blobs(_BUCKET, prefix=_FIN_RUNS_PREFIX, delimiter='/')
+    list(blobs)
+    run_ids = sorted(
+        (p.replace(_FIN_RUNS_PREFIX, '').strip('/') for p in blobs.prefixes),
+        reverse=True,
+    )
+    completed = []
+    for run_id in run_ids:
+        blob = client.bucket(_BUCKET).blob(f'{_FIN_RUNS_PREFIX}{run_id}/state.json')
+        if not blob.exists():
+            continue
+        try:
+            state = json.loads(blob.download_as_text())
+        except Exception:
+            continue
+        if any(c.get('output') for c in state.get('companies', [])):
+            completed.append(run_id)
+    return completed
+
+
+def _load_fin_run(client: storage.Client, run_id: str) -> pd.DataFrame:
+    """One row per researched company: identity + digest + all research fields."""
+    blob = client.bucket(_BUCKET).blob(f'{_FIN_RUNS_PREFIX}{run_id}/state.json')
+    state = json.loads(blob.download_as_text())
+    rows = []
+    for c in state.get('companies', []):
+        output = c.get('output')
+        if not output:
+            continue
+        rows.append({
+            'companyName':       c.get('company_name') or '',
+            'companyWebsite':    c.get('website') or '',
+            'financial_summary': fr.build_financial_digest(output),
+            **{f: output.get(f, '') for f in fr.ALL_FIELDS},
+        })
+    return pd.DataFrame(rows)
+
+
 # ── HubSpot helpers ───────────────────────────────────────────────────────────
 
-def _submit_import(df: pd.DataFrame, run_id: str) -> tuple[str, int]:
+def _fetch_company_properties() -> list[dict]:
+    """Writable HubSpot company properties, for the mapping dropdown."""
+    resp = requests.get(
+        f'{_HS_BASE}/crm/v3/properties/companies',
+        headers=_hs_headers(),
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f'Could not read HubSpot company properties: HTTP {resp.status_code}: {resp.text[:200]}')
+    props = []
+    for p in resp.json().get('results', []):
+        if p.get('modificationMetadata', {}).get('readOnlyValue'):
+            continue
+        props.append({'name': p['name'], 'label': p.get('label', p['name'])})
+    return sorted(props, key=lambda p: p['name'])
+
+
+def _submit_import(
+    df: pd.DataFrame,
+    run_id: str,
+    extra_col_map: dict[str, str] | None = None,
+) -> tuple[str, int]:
     """
-    Build a deduplicated contacts CSV and submit to HubSpot imports API.
+    Build a deduplicated companies CSV and submit to HubSpot imports API.
     Returns (import_id, row_count).
     """
-    present = [(src, hs, id_type) for src, hs, id_type in _COL_MAP if src in df.columns]
+    # Build full column map: standard props + any custom props present in the DataFrame
+    col_map = [(src, hs, id_type) for src, hs, id_type in _STANDARD_COLS if src in df.columns]
+    for csv_col, (hs_name, _label, _type, _field) in _CUSTOM_PROPS.items():
+        if csv_col in df.columns:
+            col_map.append((csv_col, hs_name, None))
+    for csv_col, hs_name in (extra_col_map or {}).items():
+        if csv_col in df.columns:
+            col_map.append((csv_col, hs_name, None))
+
+    present = col_map
     if not present:
         raise ValueError('Run CSV has none of the expected company columns (companyName, companyWebsite).')
 
@@ -140,6 +273,59 @@ def _submit_import(df: pd.DataFrame, run_id: str) -> tuple[str, int]:
     return str(resp.json()['id']), len(export)
 
 
+def _ensure_properties(
+    extra_props: dict[str, tuple] | None = None,
+    include_defaults: bool = True,
+) -> list[str]:
+    """
+    Create any missing custom company properties in HubSpot.
+    Returns a list of property names that were created.
+    include_defaults=False skips the matching-run _CUSTOM_PROPS set
+    (financial mode creates only what the mapping table asks for).
+    Requires crm.schemas.companies.write scope on the Private App token.
+    """
+    resp = requests.get(
+        f'{_HS_BASE}/crm/v3/properties/companies',
+        headers=_hs_headers(),
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f'Could not read HubSpot company properties: HTTP {resp.status_code}: {resp.text[:200]}')
+
+    existing = {p['name'] for p in resp.json().get('results', [])}
+    created  = []
+
+    all_props = dict(_CUSTOM_PROPS) if include_defaults else {}
+    if extra_props:
+        all_props.update(extra_props)
+
+    for _csv_col, (hs_name, label, prop_type, field_type) in all_props.items():
+        if hs_name in existing:
+            continue
+        create_resp = requests.post(
+            f'{_HS_BASE}/crm/v3/properties/companies',
+            headers={**_hs_headers(), 'Content-Type': 'application/json'},
+            json={
+                'name':      hs_name,
+                'label':     label,
+                'type':      prop_type,
+                'fieldType': field_type,
+                'groupName': 'companyinformation',
+            },
+            timeout=15,
+        )
+        if create_resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f'Could not create property `{hs_name}`: '
+                f'HTTP {create_resp.status_code}: {create_resp.text[:200]}\n'
+                'Make sure your Private App token has the '
+                '`crm.schemas.companies.write` scope.'
+            )
+        created.append(hs_name)
+
+    return created
+
+
 def _poll_import(import_id: str) -> dict:
     resp = requests.get(
         f'{_HS_BASE}/crm/v3/imports/{import_id}',
@@ -154,7 +340,7 @@ def _poll_import(import_id: str) -> dict:
 # ── Page ──────────────────────────────────────────────────────────────────────
 
 st.title('🔗 HubSpot Import')
-st.caption('Load a completed matching run and import companies to HubSpot via the Imports API.')
+st.caption('Import companies to HubSpot from a matching run or a financial research run.')
 
 if 'hubspot_api_key' not in st.secrets:
     st.info(
@@ -208,16 +394,36 @@ if st.session_state.hs_import_id:
 
     st.stop()
 
-# ── Run selector ──────────────────────────────────────────────────────────────
+# ── Source & run selector ─────────────────────────────────────────────────────
+
+mode = st.radio(
+    'Import source',
+    ['Matching run', 'Financial research run'],
+    horizontal=True,
+    help='Matching runs import grant-match results; financial research runs '
+         'import Deep Research findings from the Client Financials view.',
+)
+
+if st.session_state.hs_mode_last != mode:
+    st.session_state.hs_df        = None
+    st.session_state.hs_run_id    = None
+    st.session_state.hs_mode_last = mode
 
 gcs = _gcs_client()
 
-with st.spinner('Fetching completed runs from GCS…'):
-    runs = _list_completed_runs(gcs)
-
-if not runs:
-    st.warning('No completed matching runs found in GCS.')
-    st.stop()
+if mode == 'Matching run':
+    with st.spinner('Fetching completed runs from GCS…'):
+        runs = _list_completed_runs(gcs)
+    if not runs:
+        st.warning('No completed matching runs found in GCS.')
+        st.stop()
+else:
+    with st.spinner('Fetching financial research runs from GCS…'):
+        runs = _list_fin_runs(gcs)
+    if not runs:
+        st.warning('No completed financial research runs found in GCS. '
+                   'Run one from the Client Financials view first.')
+        st.stop()
 
 run_id = st.selectbox('Select a completed run', runs)
 
@@ -226,11 +432,11 @@ if st.session_state.hs_run_id != run_id:
     st.session_state.hs_run_id = run_id
 
 if st.button('Load run data', type='primary'):
-    with st.spinner('Concatenating segment CSVs…'):
-        df = _load_run(gcs, run_id)
+    with st.spinner('Loading run data…'):
+        df = _load_run(gcs, run_id) if mode == 'Matching run' else _load_fin_run(gcs, run_id)
     st.session_state.hs_df = df if not df.empty else None
     if df.empty:
-        st.warning('No CSV segments found for this run.')
+        st.warning('No importable data found for this run.')
 
 df: pd.DataFrame | None = st.session_state.hs_df
 if df is None:
@@ -249,13 +455,186 @@ unique_sites = (
 ) if 'companyWebsite' in df.columns else 0
 
 c1, c2, c3 = st.columns(3)
-c1.metric('Total rows',              f'{len(df):,}')
-c2.metric('Unique websites',         f'{unique_sites:,}')
-c3.metric('Companies to import',     f'{unique_sites:,}')
+c1.metric('Total rows',          f'{len(df):,}')
+c2.metric('Unique websites',     f'{unique_sites:,}')
+c3.metric('Companies to import', f'{unique_sites:,}')
 
-import_cols = [c[0] for c in _COL_MAP if c[0] in df.columns]
+if unique_sites < len(df):
+    st.caption(
+        'Rows without a website are skipped — `domain` is the HubSpot dedup key.'
+    )
+
+# ═══ MODE: Financial research run ═════════════════════════════════════════════
+
+if mode == 'Financial research run':
+
+    preview_cols = ['companyName', 'companyWebsite', 'financial_summary',
+                    'revenue_estimate', 'score_total', 'recommendation']
+    st.dataframe(
+        df[[c for c in preview_cols if c in df.columns]].head(50),
+        use_container_width=True, hide_index=True,
+    )
+
+    # ── Field mapping ─────────────────────────────────────────────────────────
+
+    st.divider()
+    st.subheader('Map financial fields to HubSpot properties')
+    st.caption(
+        'Company name → `name` and website → `domain` are always mapped. '
+        'For each financial field, choose an existing HubSpot company property '
+        f'or keep "{_CREATE_OPT}" to auto-create `matcher_fin_<field>`. '
+        'Uncheck **Import** to leave a field out.'
+    )
+
+    col_props, col_refresh = st.columns([5, 1])
+    with col_refresh:
+        if st.button('↺ Refresh', help='Re-fetch HubSpot company properties'):
+            st.session_state.pop('hs_company_props', None)
+            st.rerun()
+    if 'hs_company_props' not in st.session_state:
+        with st.spinner('Fetching HubSpot company properties…'):
+            try:
+                st.session_state.hs_company_props = _fetch_company_properties()
+            except Exception as e:
+                st.error(str(e))
+                st.stop()
+    hs_props: list[dict] = st.session_state.hs_company_props
+    with col_props:
+        st.caption(f'{len(hs_props)} writable company properties available in your HubSpot portal.')
+
+    prop_options = [_CREATE_OPT, _SKIP_OPT] + [p['name'] for p in hs_props]
+
+    default_map = pd.DataFrame({
+        'Import':           [f in _FIN_DEFAULT_ON for f in _FIN_FIELDS],
+        'Financial field':  _FIN_FIELDS,
+        'HubSpot property': [_CREATE_OPT] * len(_FIN_FIELDS),
+    })
+    edited = st.data_editor(
+        default_map,
+        hide_index=True,
+        use_container_width=True,
+        height=560,
+        disabled=['Financial field'],
+        column_config={
+            'Import': st.column_config.CheckboxColumn(
+                'Import', help='Include this field in the HubSpot import'),
+            'Financial field': st.column_config.TextColumn('Financial field'),
+            'HubSpot property': st.column_config.SelectboxColumn(
+                'HubSpot property',
+                options=prop_options,
+                required=True,
+                help='Target company property. The create option makes '
+                     'matcher_fin_<field> automatically.',
+            ),
+        },
+        key=f'hs_fin_map_{run_id}',
+    )
+
+    # Resolve the mapping
+    fin_col_map: dict[str, str] = {}
+    create_props: dict[str, tuple] = {}
+    for _, row in edited.iterrows():
+        if not row['Import'] or row['HubSpot property'] == _SKIP_OPT:
+            continue
+        field = row['Financial field']
+        if row['HubSpot property'] == _CREATE_OPT:
+            hs_name = f'matcher_fin_{field}'
+            create_props[field] = (
+                hs_name,
+                f'Matcher Fin {_col_to_label(field)}',
+                'string',
+                'textarea' if field in _FIN_TEXTAREA else 'text',
+            )
+        else:
+            hs_name = row['HubSpot property']
+        fin_col_map[field] = hs_name
+
+    if not fin_col_map:
+        st.warning('No financial fields selected for import.')
+        st.stop()
+
+    dupe_targets = pd.Series(list(fin_col_map.values()))
+    dupes = sorted(dupe_targets[dupe_targets.duplicated()].unique())
+    if dupes:
+        st.error(
+            'Two or more fields are mapped to the same HubSpot property: '
+            f'`{"`, `".join(dupes)}`. Each field needs its own target.'
+        )
+        st.stop()
+
+    n_create = len(create_props)
+    st.caption(
+        f'**{len(fin_col_map)}** field{"s" if len(fin_col_map) != 1 else ""} will be imported'
+        + (f' — {n_create} new `matcher_fin_*` propert{"ies" if n_create != 1 else "y"} will be created.'
+           if n_create else '.')
+    )
+
+    # ── Import ────────────────────────────────────────────────────────────────
+
+    st.divider()
+    if not st.button('▶ Import to HubSpot', type='primary'):
+        st.stop()
+
+    try:
+        if create_props:
+            with st.spinner('Creating HubSpot custom properties…'):
+                created_props = _ensure_properties(
+                    extra_props=create_props, include_defaults=False)
+            if created_props:
+                st.info(f'Created {len(created_props)} new HubSpot property/ies: '
+                        f'`{"`, `".join(created_props)}`')
+
+        with st.spinner('Building CSV and submitting to HubSpot…'):
+            import_id, row_count = _submit_import(df, run_id, extra_col_map=fin_col_map)
+
+        st.session_state.hs_import_id   = import_id
+        st.session_state.hs_import_rows = row_count
+        st.success(f'Submitted — **{row_count:,}** companies · Import ID: `{import_id}`')
+        time.sleep(1)
+        st.rerun()
+
+    except Exception as e:
+        st.error(f'Failed to submit import: {e}')
+        st.code(traceback.format_exc())
+
+    st.stop()
+
+# ═══ MODE: Matching run (original flow) ═══════════════════════════════════════
+
+all_mapped_cols = (
+    [src for src, _, _ in _STANDARD_COLS] +
+    list(_CUSTOM_PROPS.keys())
+)
+import_cols = [c for c in all_mapped_cols if c in df.columns]
 st.caption(f'Columns that will be imported: `{"`, `".join(import_cols)}`')
 st.dataframe(df[import_cols].head(50), use_container_width=True, hide_index=True)
+
+# ── Optional custom columns ───────────────────────────────────────────────────
+
+extra_df_cols = [
+    c for c in df.columns
+    if c not in _KNOWN_COLS
+    and c not in _IMPORT_EXCLUDE
+    and not c.startswith('_')
+]
+
+selected_extras: dict[str, tuple] = {}
+if extra_df_cols:
+    st.divider()
+    st.subheader('Optional custom columns')
+    st.caption(
+        'These columns were added during topic import and are not part of the standard HubSpot property set. '
+        'Check the ones you want to include — HubSpot properties will be created automatically.'
+    )
+    for col in extra_df_cols:
+        hs_name = f'matcher_{col}'
+        if st.checkbox(
+            f'`{col}` → `{hs_name}`',
+            value=True,
+            key=f'hs_extra_{col}',
+            help=f'Creates HubSpot company property `{hs_name}` (label: "{_col_to_label(col)}") if it does not exist.',
+        ):
+            selected_extras[col] = (hs_name, _col_to_label(col), 'string', 'text')
 
 # ── Import ────────────────────────────────────────────────────────────────────
 
@@ -263,9 +642,16 @@ st.divider()
 if not st.button('▶ Import to HubSpot', type='primary'):
     st.stop()
 
+extra_col_map_flat = {csv_col: tup[0] for csv_col, tup in selected_extras.items()}
+
 try:
+    with st.spinner('Ensuring HubSpot custom properties exist…'):
+        created_props = _ensure_properties(extra_props=selected_extras or None)
+    if created_props:
+        st.info(f'Created {len(created_props)} new HubSpot property/ies: `{"`, `".join(created_props)}`')
+
     with st.spinner('Building CSV and submitting to HubSpot…'):
-        import_id, row_count = _submit_import(df, run_id)
+        import_id, row_count = _submit_import(df, run_id, extra_col_map=extra_col_map_flat or None)
 
     st.session_state.hs_import_id   = import_id
     st.session_state.hs_import_rows = row_count

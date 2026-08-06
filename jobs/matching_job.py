@@ -1,0 +1,547 @@
+"""
+matching_job.py — Cloud Run Job entry point.
+
+Reads a job config JSON from GCS, runs the full matching pipeline
+(vector scoring → AI validation → email pre-write), saves 1 000-row
+CSV segments to GCS, then writes a status.json when finished.
+
+Invoked as:
+    python jobs/matching_job.py <config_blob_path>
+e.g.
+    python jobs/matching_job.py job-configs/2026-03-31_14-00-00.json
+
+Secrets come from Google Secret Manager — no st.secrets, no .env files.
+The job's service account must have:
+  - roles/storage.objectAdmin       (GCS read/write)
+  - roles/secretmanager.secretAccessor
+"""
+
+import asyncio
+import gc
+import io
+import json
+import random
+import sys
+import traceback
+import warnings
+from datetime import date, datetime
+
+import numpy as np
+import pandas as pd
+from anthropic import AsyncAnthropic
+from google.cloud import storage
+from openai import AsyncOpenAI
+
+# ── src modules are on the path because the Dockerfile sets PYTHONPATH ────────
+from src.modules.email_generator import async_generate_subject_line, async_josiah_copy, async_custom_prompt
+from src.modules.grant_utils import normalize_grant_columns
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+_BUCKET           = 'cc-matcher-bucket-jeg-v1'
+_CONTACTS_PREFIX  = 'data/all-contacts/'
+_TOPICS_PREFIX    = 'data/all-topics/processed/'
+_RESULTS_PREFIX   = 'matching-results/'
+_SEGMENT_SIZE     = 1000
+_VALIDATION_BATCH = 10
+_EMAIL_BATCH      = 5
+_SCORE_CHUNK      = 2000
+_MAX_RETRIES      = 5
+_VALIDATION_SYSTEM = (
+    'You are evaluating whether a company could potentially benefit from or be relevant to a government grant. '
+    'Answer "yes" if there is any reasonable connection, even if indirect. '
+    'Answer "no" only if there is clearly no connection. '
+    'Only respond with a single word: yes or no.'
+)
+
+
+# ── Secret Manager ────────────────────────────────────────────────────────────
+
+def _get_secret(secret_id: str) -> str:
+    """Read secret from environment variable (injected by Cloud Run at startup)."""
+    import os
+    env_var = secret_id.upper().replace('-', '_')
+    value = os.environ.get(env_var, '')
+    if not value:
+        raise RuntimeError(f'Environment variable {env_var} is not set.')
+    return value
+
+
+# ── Filter helpers ───────────────────────────────────────────────────────────
+
+# Topic dates are strings in mixed formats (ISO from Topic Importer,
+# mm/dd/yyyy from SAM.gov, sometimes with a time suffix) — try each.
+_DATE_FORMATS = ('%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d', '%m-%d-%Y', '%b %d, %Y')
+
+
+def _parse_date_str(value) -> date | None:
+    s = str(value).strip()
+    if not s:
+        return None
+    for fmt in _DATE_FORMATS:
+        for candidate in (s, s[:10]):
+            try:
+                return datetime.strptime(candidate, fmt).date()
+            except ValueError:
+                pass
+    return None
+
+
+def _filter_is_active(f: dict) -> bool:
+    if not f.get('column'):
+        return False
+    if f.get('type') == 'date_range':
+        return bool(f.get('date_from') and f.get('date_to'))
+    return bool(f.get('keyword', '').strip())
+
+
+def _filter_mask(df: pd.DataFrame, f: dict) -> pd.Series:
+    if f.get('type') == 'date_range':
+        d_from = date.fromisoformat(f['date_from'])
+        d_to   = date.fromisoformat(f['date_to'])
+
+        def _in_range(v) -> bool:
+            d = _parse_date_str(v)
+            return d is not None and d_from <= d <= d_to
+
+        return df[f['column']].map(_in_range)
+    return df[f['column']].astype(str).str.lower().str.contains(
+        f['keyword'].lower(), na=False
+    )
+
+
+def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+    active = [f for f in filters if _filter_is_active(f)]
+    if not active:
+        return df
+    mask = _filter_mask(df, active[0])
+    for f in active[1:]:
+        m = _filter_mask(df, f)
+        mask = (mask & m) if f.get('operator', 'AND') == 'AND' else (mask | m)
+    return df[mask]
+
+
+# ── GCS helpers ───────────────────────────────────────────────────────────────
+
+def _gcs() -> storage.Client:
+    return storage.Client()   # uses ADC — the job's attached service account
+
+
+def _load_topics(client: storage.Client, agencies: list[str]) -> pd.DataFrame:
+    frames = []
+    for agency in agencies:
+        prefix = f'{_TOPICS_PREFIX}{agency}/'
+        for blob in client.list_blobs(_BUCKET, prefix=prefix):
+            if blob.name.endswith('.parquet'):
+                df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+                df['broad_agency'] = agency
+                frames.append(df)
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', FutureWarning)
+        topics = pd.concat(frames, ignore_index=True)
+    # Notices marked archived by the SAM.gov revision check are no longer live
+    if 'sam_status' in topics.columns:
+        topics = topics[topics['sam_status'].fillna('').astype(str) != 'archived'].reset_index(drop=True)
+    return topics
+
+
+def _list_contact_blobs(client: storage.Client, sources: list[str]) -> list[tuple]:
+    result = []
+    for source in sources:
+        for blob in client.list_blobs(_BUCKET, prefix=f'{_CONTACTS_PREFIX}{source}/'):
+            if blob.name.endswith('.parquet'):
+                result.append((source, blob))
+    return result
+
+
+def _upload_csv(client: storage.Client, df: pd.DataFrame, blob_path: str) -> None:
+    client.bucket(_BUCKET).blob(blob_path).upload_from_string(
+        df.to_csv(index=False).encode('utf-8'), content_type='text/csv'
+    )
+
+
+def _write_status(client: storage.Client, results_prefix: str, payload: dict) -> None:
+    client.bucket(_BUCKET).blob(f'{results_prefix}status.json').upload_from_string(
+        json.dumps(payload), content_type='application/json'
+    )
+
+
+# ── Async helpers ─────────────────────────────────────────────────────────────
+
+async def _validate_rows(
+    rows: list[tuple[int, dict]],
+    anth_key: str,
+) -> list[tuple[int, str]]:
+    async with AsyncAnthropic(api_key=anth_key) as client:
+        async def _one(idx: int, row: dict) -> tuple[int, str]:
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    msg = await client.messages.create(
+                        model='claude-haiku-4-5-20251001',
+                        max_tokens=15,
+                        temperature=0,
+                        system=_VALIDATION_SYSTEM,
+                        messages=[{
+                            'role': 'user',
+                            'content': (
+                                f"company summary: {row.get('company_summary', '')}\n\n"
+                                f"grant summary: {row.get('grant_summary', '')}"
+                            ),
+                        }],
+                    )
+                    return idx, msg.content[0].text.strip().lower()
+                except Exception as e:
+                    err = str(e)
+                    if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):
+                        await asyncio.sleep((2 ** attempt) + random.random())
+                    else:
+                        raise
+            return idx, 'no'
+
+        return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
+
+
+async def _generate_email_batch(
+    rows: list[tuple[int, dict]],
+    openai_key: str,
+    anth_key: str,
+    email_config: dict,
+) -> list[tuple[int, dict]]:
+    subject_cfg    = email_config.get('subject_line', {})
+    message_cfg    = email_config.get('ai_message', {})
+    custom_prompts = email_config.get('custom_prompts', [])
+
+    async with AsyncOpenAI(api_key=openai_key) as oai, \
+               AsyncAnthropic(api_key=anth_key) as anth:
+        async def _one(idx: int, row: dict) -> tuple[int, dict]:
+            subject, body = await asyncio.gather(
+                async_generate_subject_line(
+                    company_summary=str(row.get('company_summary', '') or ''),
+                    agency=str(row.get('agency', row.get('broad_agency', '')) or ''),
+                    openai_client=oai,
+                    anth_client=anth,
+                    word_limit=subject_cfg.get('word_limit', 15),
+                    system_override=subject_cfg.get('system') or None,
+                ),
+                async_josiah_copy(
+                    company_summary=str(row.get('company_summary', '') or ''),
+                    grant_summary=str(row.get('grant_summary', '') or ''),
+                    word_limit=message_cfg.get('word_limit', 15),
+                    anth_client=anth,
+                    system_override=message_cfg.get('system') or None,
+                ),
+            )
+            outputs: dict = {'subject_line': subject, 'ai_message': body}
+            for cp in custom_prompts:
+                col_text = '\n'.join(
+                    f"{col}: {str(row.get(col, '') or '')}"
+                    for col in cp.get('columns', [])
+                )
+                outputs[cp['output_column']] = await async_custom_prompt(
+                    text=col_text,
+                    system=cp['system'],
+                    anth_client=anth,
+                )
+            return idx, outputs
+
+        return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
+
+
+# ── Segment flush ─────────────────────────────────────────────────────────────
+
+def _flush_segment(
+    rows: list[dict],
+    seg_num: int,
+    results_prefix: str,
+    gcs_client: storage.Client,
+    ai_validation: bool,
+    prewrite_email: bool,
+    anth_key: str,
+    openai_key: str,
+    seen_websites: dict[str, str],
+    email_config: dict,
+) -> int:
+    """
+    Build DataFrame from rows, validate, optionally generate emails,
+    upload CSV to GCS. Returns number of rows saved (0 if all filtered).
+    seen_websites is mutated in-place for cross-segment dedup.
+    """
+    segment = pd.DataFrame(rows)
+
+    for col in ('scraped_at', 'open_date', 'close_date'):
+        if col in segment.columns:
+            segment[col] = segment[col].astype(str)
+
+    # ── AI validation ──────────────────────────────────────────────────────
+    if ai_validation:
+        segment = segment.copy()
+        segment['good_match'] = None
+
+        website_map:  dict[str, list[int]] = {}
+        unique_tasks: list[tuple[int, dict]] = []
+
+        for idx, row in segment.iterrows():
+            site = str(row.get('companyWebsite', '') or '').strip()
+            if site and site in seen_websites:
+                segment.at[idx, 'good_match'] = seen_websites[site]
+                continue
+            slim = {
+                'company_summary': row.get('company_summary', ''),
+                'grant_summary':   row.get('grant_summary',   ''),
+            }
+            if site:
+                if site not in website_map:
+                    website_map[site] = []
+                    unique_tasks.append((idx, slim))
+                website_map[site].append(idx)
+            else:
+                unique_tasks.append((idx, slim))
+
+        total_tasks   = len(unique_tasks)
+        idx_to_result: dict[int, str] = {}
+
+        for i in range(0, total_tasks, _VALIDATION_BATCH):
+            batch   = unique_tasks[i : i + _VALIDATION_BATCH]
+            results = asyncio.run(_validate_rows(batch, anth_key))
+            idx_to_result.update(results)
+            done = i + len(batch)
+            print(f'  segment {seg_num} · validated {done}/{total_tasks}', flush=True)
+
+        for site, indices in website_map.items():
+            result = idx_to_result.get(indices[0], 'no')
+            seen_websites[site] = result
+            for idx in indices:
+                segment.at[idx, 'good_match'] = result
+        for idx in segment.index:
+            if segment.at[idx, 'good_match'] is None:
+                segment.at[idx, 'good_match'] = idx_to_result.get(idx, 'no')
+
+        del unique_tasks, website_map, idx_to_result
+        gc.collect()
+
+        segment = segment[
+            segment['good_match'].str.contains('yes', na=False)
+        ].reset_index(drop=True)
+
+    if segment.empty:
+        print(f'  segment {seg_num} · 0 rows after validation — skipping', flush=True)
+        return 0
+
+    # ── Email pre-write ────────────────────────────────────────────────────
+    if prewrite_email:
+        segment = segment.copy()
+        custom_cols = [cp['output_column'] for cp in email_config.get('custom_prompts', [])]
+        for col in ['subject_line', 'ai_message'] + custom_cols:
+            segment[col] = None
+
+        email_rows = [(idx, row.to_dict()) for idx, row in segment.iterrows()]
+        total      = len(email_rows)
+
+        for i in range(0, total, _EMAIL_BATCH):
+            batch   = email_rows[i : i + _EMAIL_BATCH]
+            results = asyncio.run(_generate_email_batch(batch, openai_key, anth_key, email_config))
+            for idx, outputs in results:
+                for col, val in outputs.items():
+                    segment.at[idx, col] = val
+            done = i + len(batch)
+            print(f'  segment {seg_num} · emails {done}/{total}', flush=True)
+
+        del email_rows
+        gc.collect()
+
+    # ── Upload ─────────────────────────────────────────────────────────────
+    blob_path = f'{results_prefix}segment_{seg_num:03d}.csv'
+    _upload_csv(gcs_client, segment, blob_path)
+    row_count = len(segment)
+    print(f'  segment {seg_num} · saved {row_count} rows → {blob_path}', flush=True)
+
+    del segment
+    gc.collect()
+    return row_count
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main(config_blob_path: str) -> None:
+    gcs_client = _gcs()
+
+    # ── Load config ────────────────────────────────────────────────────────
+    print(f'Loading config from {config_blob_path}', flush=True)
+    config = json.loads(
+        gcs_client.bucket(_BUCKET).blob(config_blob_path).download_as_text()
+    )
+
+    run_id          = config['run_id']
+    threshold       = float(config['threshold'])
+    top_k           = int(config['top_k'])
+    sources         = config['sources']
+    agencies        = config['agencies']
+    topic_filters   = config.get('topic_filters', [])
+    ai_validation   = bool(config.get('ai_validation', True))
+    prewrite_email  = bool(config.get('prewrite_email', False))
+    email_config    = config.get('email_config', {})
+    results_prefix  = f'{_RESULTS_PREFIX}{run_id}/'
+
+    # ── Secrets ────────────────────────────────────────────────────────────
+    anth_key   = _get_secret('anthropic-api-key')
+    openai_key = _get_secret('openai-api-key') if prewrite_email else ''
+
+    # ── Load topics ────────────────────────────────────────────────────────
+    print('Loading grant topics…', flush=True)
+    topics_df = _load_topics(gcs_client, agencies)
+    if topics_df.empty:
+        raise RuntimeError('No topic parquet files found for selected agencies.')
+
+    topics_df = normalize_grant_columns(topics_df)
+
+    if topic_filters:
+        topics_df = _apply_filters(topics_df, topic_filters)
+        if topics_df.empty:
+            raise RuntimeError('No topics remain after applying topic filters.')
+        print(f'  {len(topics_df):,} topics after filtering', flush=True)
+
+    grant_embeddings = np.stack(topics_df['embeddings'].values).astype(np.float32)
+    topics_df        = topics_df.drop(columns=['embeddings'])
+
+    grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'funding_amount', 'grant_summary', 'source']
+    grant_meta = topics_df[[c for c in grant_cols if c in topics_df.columns]].reset_index(drop=True)
+    if 'source' in grant_meta.columns:
+        grant_meta = grant_meta.rename(columns={'source': 'grant_source'})
+    del topics_df
+    gc.collect()
+    print(f'  {len(grant_meta):,} topics loaded', flush=True)
+
+    # ── List contact blobs ─────────────────────────────────────────────────
+    print('Listing contact files…', flush=True)
+    blob_list = _list_contact_blobs(gcs_client, sources)
+    if not blob_list:
+        raise RuntimeError('No contact parquet files found for selected sources.')
+    print(f'  {len(blob_list)} contact file(s)', flush=True)
+
+    # ── Stream contacts → score in chunks → flush segments inline ─────────
+    match_buffer:   list[dict]     = []
+    seen_websites:  dict[str, str] = {}
+    seg_num         = 0
+    total_candidates = 0
+    total_saved      = 0
+
+    for file_i, (source, blob) in enumerate(blob_list):
+        print(f'[{file_i+1}/{len(blob_list)}] {blob.name}', flush=True)
+        df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+        df = df[df['embeddings'].notna()].reset_index(drop=True)
+        if df.empty:
+            continue
+
+        if 'company_summary' not in df.columns and 'summary' in df.columns:
+            df = df.rename(columns={'summary': 'company_summary'})
+
+        for chunk_start in range(0, len(df), _SCORE_CHUNK):
+            chunk            = df.iloc[chunk_start : chunk_start + _SCORE_CHUNK]
+            chunk_embeddings = np.stack(chunk['embeddings'].values).astype(np.float32)
+            scores           = np.dot(chunk_embeddings, grant_embeddings.T)
+            del chunk_embeddings
+
+            for ci in range(len(chunk)):
+                contact_scores = scores[ci]
+                above = np.where(contact_scores >= threshold)[0]
+                if len(above) == 0:
+                    continue
+                top_indices = above[np.argsort(contact_scores[above])[::-1][:top_k]]
+                contact_row = chunk.iloc[ci]
+                for gi in top_indices:
+                    row = {
+                        'companyName':     str(contact_row.get('companyName', '') or contact_row.get('company_name', '') or ''),
+                        'companyWebsite':  str(contact_row.get('companyWebsite', '') or ''),
+                        'firstName':       str(contact_row.get('firstName',      '') or ''),
+                        'lastName':        str(contact_row.get('lastName',       '') or ''),
+                        'email':           str(contact_row.get('email',          '') or ''),
+                        'company_summary': str(contact_row.get('company_summary', '') or ''),
+                        'source':          source,
+                    }
+                    for col in grant_meta.columns:
+                        row[col] = grant_meta.iloc[gi].get(col, '')
+                    match_buffer.append(row)
+                    total_candidates += 1
+
+                if len(match_buffer) >= _SEGMENT_SIZE:
+                    seg_num += 1
+                    print(f'Flushing segment {seg_num} ({_SEGMENT_SIZE} rows)…', flush=True)
+                    saved = _flush_segment(
+                        rows           = match_buffer[:_SEGMENT_SIZE],
+                        seg_num        = seg_num,
+                        results_prefix = results_prefix,
+                        gcs_client     = gcs_client,
+                        ai_validation  = ai_validation,
+                        prewrite_email = prewrite_email,
+                        anth_key       = anth_key,
+                        openai_key     = openai_key,
+                        seen_websites  = seen_websites,
+                        email_config   = email_config,
+                    )
+                    total_saved  += saved
+                    match_buffer  = match_buffer[_SEGMENT_SIZE:]
+
+            del scores
+
+        del df
+        gc.collect()
+
+    # ── Flush remainder ────────────────────────────────────────────────────
+    if match_buffer:
+        seg_num += 1
+        print(f'Flushing final segment {seg_num} ({len(match_buffer)} rows)…', flush=True)
+        saved = _flush_segment(
+            rows           = match_buffer,
+            seg_num        = seg_num,
+            results_prefix = results_prefix,
+            gcs_client     = gcs_client,
+            ai_validation  = ai_validation,
+            prewrite_email = prewrite_email,
+            anth_key       = anth_key,
+            openai_key     = openai_key,
+            seen_websites  = seen_websites,
+            email_config   = email_config,
+        )
+        total_saved += saved
+
+    del grant_embeddings, grant_meta, seen_websites
+    gc.collect()
+
+    print(
+        f'\nDone. {total_candidates:,} candidates → {total_saved:,} rows saved '
+        f'across {seg_num} segment(s).',
+        flush=True,
+    )
+    _write_status(gcs_client, results_prefix, {
+        'run_id':           run_id,
+        'total_candidates': total_candidates,
+        'total_saved':      total_saved,
+        'segments':         seg_num,
+        'error':            None,
+    })
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print('Usage: python jobs/matching_job.py <config_blob_path>', file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        main(sys.argv[1])
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr, flush=True)
+        # Best-effort status write so Streamlit can surface the error
+        try:
+            run_id = sys.argv[1].split('/')[-1].replace('.json', '')
+            _write_status(
+                _gcs(),
+                f'{_RESULTS_PREFIX}{run_id}/',
+                {'run_id': run_id, 'error': tb, 'total_saved': 0},
+            )
+        except Exception:
+            pass
+        sys.exit(1)

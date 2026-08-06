@@ -1,0 +1,35 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System libraries required by Chromium (Playwright)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget ca-certificates \
+    libnss3 libnspr4 \
+    libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 \
+    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+    libxrandr2 libgbm1 libasound2 \
+    libpango-1.0-0 libcairo2 \
+    libx11-6 libxcb1 libxext6 libx11-xcb1 libxshmfence1 \
+    fonts-liberation \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.contact_import_job.txt .
+RUN pip install --no-cache-dir -r requirements.contact_import_job.txt
+
+# Bake Chromium into the image (Cloud Run containers are read-only at runtime)
+RUN playwright install chromium
+
+COPY jobs/contact_import_job.py jobs/contact_import_job.py
+
+# Shared research schema/prompt modules (Deep Research profiling mode) —
+# streamlit-free, stdlib-only imports, safe inside the job image
+COPY src/__init__.py src/__init__.py
+COPY src/modules/__init__.py src/modules/__init__.py
+COPY src/modules/finance_research.py src/modules/finance_research.py
+COPY src/modules/tech_research.py src/modules/tech_research.py
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "jobs/contact_import_job.py"]

@@ -1,0 +1,16 @@
+# Mirror of .gcloudignore for local docker builds — keeps secrets out of the image.
+.git/
+.gitignore
+.gitignore.txt
+.gcloudignore
+.claude/
+.streamlit/
+notebooks/
+keys/
+*.json
+__pycache__/
+*.pyc
+*.pyo
+.env
+.DS_Store
+Thumbs.db

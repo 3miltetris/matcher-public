@@ -1,0 +1,17 @@
+# Files excluded from the Cloud Build upload context.
+# CRITICAL: keeps local secrets and service-account keys out of builds.
+.git/
+.gitignore
+.gitignore.txt
+.gcloudignore
+.claude/
+.streamlit/
+notebooks/
+keys/
+*.json
+__pycache__/
+*.pyc
+*.pyo
+.env
+.DS_Store
+Thumbs.db

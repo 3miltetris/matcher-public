@@ -2,80 +2,187 @@
 
 ## Project Overview
 
-**The Matcher** is a RAG (Retrieval-Augmented Generation) pipeline that matches companies/contacts to government grant programs (SBIR/STTR and similar). It ingests leads from sources like Apollo and SBA, processes grant topics from federal agencies, and uses OpenAI embeddings + cosine similarity + Claude/GPT LLM verification to identify strong company–grant alignments. Results are exported as Excel files for outreach campaigns.
+**The Matcher** is a RAG (Retrieval-Augmented Generation) pipeline that matches companies/contacts to government grant programs (SBIR/STTR and similar). It ingests leads from sources like Apollo and SBA, processes grant topics from federal agencies, and uses OpenAI embeddings + cosine similarity + Claude/GPT LLM verification to identify strong company–grant alignments. Results are exported as CSV files for outreach campaigns.
 
-The project is being **migrated from Google Colab notebooks + Google Drive** to a **Streamlit application** with consolidated Python modules. All `.ipynb` files are being converted to `.py` files.
+The project has been **migrated from Google Colab notebooks + Google Drive** to a **Streamlit application** with consolidated Python modules.
 
 ---
 
 ## Current Architecture
 
 ```
+app.py                        # Streamlit entry point — auth gate, playwright install, navigation
+packages.txt                  # Streamlit Cloud apt packages (Chromium system libs for Playwright)
+views/
+  contact_importer.py         # Upload a lead spreadsheet OR pull a HubSpot company list → map columns → dedup (per-source or all-sources) → pick profiling method (scrape or Deep Research tech focus) → trigger contact-import-job → poll status
+  client_editor.py            # Edit a client company summary → re-embed → rewrite source parquet in data/all-contacts/clients/
+  finance_researcher.py       # Client Research — OpenAI Deep Research on client companies, two focuses: financials or technology/R&D, written back onto client rows
+  topic_importer.py           # Upload PDF/text solicitations → extract topics → embed → save
+  grant_search.py             # Cosine-similarity search across processed grant topics
+  bulk_matching.py            # Configure + trigger Cloud Run matching job, poll status
+  sam_gov_upload.py           # Upload SAM.gov CSVs or fetch from API → dedup vs store → Claude screening → embed → save
+  grants_gov_fetch.py         # Query Grants.gov public search2 API → Claude Haiku screening → embed → save to GRANTS-GOV/
+  hubspot_import.py           # Import companies to HubSpot via Imports API — from a matching run or a financial research run (per-field mapping)
+  resume_importer.py          # Upload HubSpot contacts CSV → fetch resumes by URL → extract text → GPT expertise summary → embed → save
+  resume_search.py            # Natural-language search across resume embeddings → ranked candidate list
+  suggestions.py              # Team feature-request board with upvoting
+
 src/
   modules/
     Embedding/
-      text_embedder.py      # TextProcessor class — embeddings, chunking, normalization
-    Storage/
-      bucket_manager.py     # BucketManager class — GCS upload/download
+      text_embedder.py        # TextProcessor class — embeddings, chunking, normalization
+    GoogleBucketManager/
+      bucket_manager.py       # BucketManager class — GCS upload/download
     Scraping/
-      web_scraper.py        # WebScraper class — Selenium-based scraper
+      web_scraper.py          # WebScraper class — Selenium-based scraper (legacy)
+    email_generator.py        # async_generate_subject_line, async_josiah_copy
+    grant_utils.py            # normalize_grant_columns() — coalesces description → grant_summary at load time
+    finance_research.py       # Deep Research prompt/schema, JSON parse+repair, digest, cost accounting (Client Research view — financial focus + shared plumbing)
+    tech_research.py          # Technology & R&D research schema/prompt/digest (Client Research view — tech focus; reuses finance_research parse/pricing)
+    lead_importer.py          # Shared scraping/summarization/embedding helpers (reference; not imported by jobs)
 
-notebooks/pipelines/
-  leads-import/             # Lead importers (→ all-contacts/)
-  data/all-topics/          # Grant topic processor (→ processed/)
-  matching-contacts-grants/ # Core matcher
+jobs/
+  matching_job.py             # Cloud Run Job — scoring, AI validation, email pre-write
+  sam_gov_job.py              # Cloud Run Job — SAM.gov fetch metadata → screen (title+NAICS) → dedup → fetch descriptions for survivors → summarize → embed → save
+  contact_import_job.py       # Cloud Run Job — download staged file → map cols → dedup → profile (scrape+GPT or Deep Research tech focus) → embed → save contacts
+  Dockerfile                  # Image for matching-job (uses requirements.job.txt)
+  Dockerfile.sam_gov          # Image for sam-gov-job (uses requirements.sam_gov_job.txt)
+  Dockerfile.contact_import   # Image for contact-import-job — python:3.11-slim + Chromium system libs + playwright install chromium; also COPYs src/modules/{finance,tech}_research.py (shared Deep Research schema)
+
+requirements.txt                    # Streamlit app dependencies (includes aiohttp, tldextract, playwright)
+requirements.job.txt                # matching-job dependencies (lean — no Streamlit)
+requirements.sam_gov_job.txt        # sam-gov-job dependencies (adds requests, beautifulsoup4, tiktoken, pymupdf)
+requirements.contact_import_job.txt # contact-import-job dependencies (aiohttp, playwright, tldextract, openpyxl, tiktoken, openai, pandas/numpy/pyarrow, GCS)
 ```
 
 ### Pipeline Stages
 
 **Stage 1 — Lead Import** (contacts → embeddings)
-- Raw CSVs (Apollo exports, SBA data, free alert lists) are loaded, normalized, and deduplicated
-- Company websites are scraped (aiohttp fast pass → Playwright fallback) to get `page_text`
-- OpenAI (`text-embedding-ada-002`) generates a `summary` and `embeddings` vector per company
-- Output: `.parquet` files saved to `data/all-contacts/{source}/` with filename `{source}_{YYYY-MM-DD}.parquet`
+- **Via Contact Importer view:** Upload any CSV/Excel spreadsheet **or pull a HubSpot company list** (lists search → memberships → batch company read; fetched companies are staged as a standard-columns CSV so the rest of the flow is identical), map columns to standard fields (URL, company name, state, name, email, phone, industry), dedup against existing GCS records by bare domain (per-source folder, or all sources via checkbox — default ON for HubSpot pulls), then trigger the `contact-import-job` Cloud Run Job. The job builds the company profile per the selected **profiling method** — `scrape` (default: aiohttp → Playwright scrape, GPT-3.5-turbo summary) or `deep_research` (one background OpenAI Deep Research task per unique company domain, technology focus, using the shared `tech_research.py` schema; the matching summary is `build_matching_summary()` of the findings and the full output is stored in `technology_data`/`technology_summary`/`technology_updated_at` columns; failed/deadline-exceeded companies are skipped and re-importable later) — then embeds with `text-embedding-ada-002` and saves to GCS. Deep Research mode shows a per-company cost estimate in the UI (unique domains × model rate) with a >$50 confirmation checkbox, and reports actual cost in the status payload. Streamlit polls `contact-import-jobs/{run_id}/status.json` for completion.
+- Supported sources (selectable in UI): `apollo`, `sba`, `free_alert`, or any custom label
+- Excel HYPERLINK formulas (e.g. `=HYPERLINK("url", "COMPANY NAME")` from SBA exports) are automatically stripped to plain text in all mapped columns.
+- Output: `.parquet` files saved to `data/all-contacts/{source}/` with filename `{source}_{YYYY-MM-DD}_{hex6}.parquet`
 
 **Stage 2 — Grant Topic Processing** (grants → embeddings)
-- Grant topic spreadsheets (`.xlsx`) are loaded by agency folder (e.g., `all-topics/unprocessed/HHS/`)
-- Long descriptions optionally summarized via Claude/GPT (5000 char limit)
-- Embeddings generated per topic
-- Output: `.parquet` files saved to `data/all-topics/processed/{AGENCY}/`
+- **Via Topic Importer view:** PDF/text solicitations are parsed by Claude, reviewed/edited in the UI, then embedded and saved to `data/all-topics/processed/{BROAD_AGENCY}/`
+- **Via Grants.gov Fetch view:** query the Grants.gov public `search2` API (no API key required) with keyword, posted-date range, opportunity status, funding instrument, and agency filters → Claude Haiku screens each row for relevance → passing rows embedded and saved to `data/all-topics/processed/GRANTS-GOV/`
+- **Via SAM.gov Upload view:** Three modes — (1) CSV uploads deduped against the existing store (notice ID + title, before any Claude calls), then screened, summarized, and embedded in Streamlit; (2) manual API fetch that writes a config to GCS and triggers `sam-gov-job`, with Streamlit polling `sam-gov-jobs/{run_id}/status.json`; (3) **daily schedule** — configure `lookback_days` + filters in the "Daily API Parameters" section, save to `sam-gov-configs/daily_schedule.json`, and Cloud Scheduler fires `sam-gov-job` daily at 5 AM CST. Results saved to `data/all-topics/processed/SAM-GOV/`.
+- **`sam-gov-job` pipeline order (API mode):** Fetch all record metadata (no descriptions) → Claude screens on title + NAICS → dedup vs existing store → **then** fetch full descriptions from SAM.gov only for rows that passed screening and dedup (typically 20–40% of total, avoiding 3–5× unnecessary API calls). A global 8 req/s rate limiter (proactive token bucket, shared across all workers) prevents thundering-herd 429s. CSV mode is unaffected — descriptions come from the uploaded file.
+- **Revision handling (amended notices, e.g. revised CSOs):** SAM.gov amendments publish a new version with a new `noticeId` but the same `solicitationNumber` (our `topic_number`). Two mechanisms keep the store current:
+  - **Ingest-time (API mode, automatic — including the daily run):** dup rows whose fetched `noticeId` differs from the stored `notice_version_id` are routed to an update path instead of being dropped — new description + attachment PDF text fetched, Claude diffs old vs new content (topics added/removed → `sam_revision_notes`), content re-summarized/re-embedded only when substantively changed (deadline-only amendments keep the old embedding), and the stored parquet rows are rewritten in place.
+  - **`revision_check` job mode (manual budgeted sweep):** triggered from the "🔁 Revision Check" expander in the SAM.gov Upload view. Looks up stored open notices by `solnum` (walking back one-year `postedFrom`/`postedTo` windows — the API requires them and only returns the latest active version), updates revised notices, and marks notices no longer on SAM.gov with `sam_status='archived'` (rows kept; `matching_job` and Grant Search filter them out). Supports `dry_run` (report only — the UI default) so the report can be reviewed before applying. **SAM.gov enforces a hard 1,000 requests/day quota per API key** (shared with the daily fetch; the API exposes no `updatedDate` field, so each notice costs ≥1 lookup call), so each run spends at most `max_api_calls` (UI default 600) and sweeps **least-recently-checked notices first** using a cursor persisted at `sam-gov-configs/revcheck_state.json`. The cursor advances only on apply (non-dry) runs — a dry run and the apply run that follows cover the same chunk. A quota-exhaustion 429 ("exceeded your quota", Retry-After at midnight UTC) aborts the sweep immediately via `QuotaExhaustedError` instead of retrying (throttle 429s still back off); revisions detected but not yet content-fetched when quota dies are deferred (no partial writes) and re-detected next run. A full sweep of a large store completes over several daily runs.
 
 **Stage 3 — Matching**
-- Loads grant topics and contacts from their respective parquet stores
-- Computes cosine similarity (dot product on normalized embeddings) to find candidates above `starting_threshold` (typically `0.79`–`0.82`)
-- Claude (Haiku or Sonnet) performs a binary yes/no alignment check on top candidates
-- De-duplicates against recent matches (last 30 days) pulled from `all-matches/`
-- Output: `.xlsx` files saved to `matches/matches/tier1/{YYYY-MM-DD}/`
+- Streamlit's Bulk Matching view writes a job config JSON to `job-configs/` in GCS and triggers the Cloud Run job via the `google-cloud-run` API
+- The job loads grant topics from `data/all-topics/processed/` and contacts from `data/all-contacts/`
+- Computes cosine similarity (vectorized numpy dot product) to find candidates above threshold (minimum `0.82`)
+- Claude Haiku performs a binary yes/no alignment check on top candidates (async, batched)
+- Optionally pre-writes subject lines and email copy via `email_generator.py`
+- Output: CSV segments saved to `matching-results/{run_id}/segment_NNN.csv`; completion signalled by `matching-results/{run_id}/status.json`
+
+**Stage 4 — Resume Pipeline** (individual contacts → expertise embeddings)
+- **Via Resume Importer view:** Upload a HubSpot contacts CSV that includes a resume URL column → fetch each file (PDF or DOCX) from HubSpot using the private app token as a Bearer header → extract text → GPT-3.5-turbo expertise summary → embed → save to `data/resumes/`
+- Dedup by email (lowercase) against existing parquets in `data/resumes/`
+- Minimum 400 chars of extracted text required before summarizing — prevents hallucination from header-only extractions
+- **Via Resume Search view:** Embed a natural-language query → cosine similarity against all resume parquets → ranked result cards with download. Optional include keyword (single term) and comma-separated exclude keywords pre-filter the pool before scoring.
+- Embeddings are per-person (not per-company); join key is `email`
+
+**Stage 5 — HubSpot Import** (match results or financial research → CRM)
+- The HubSpot Import view has two source modes selected by a radio at the top:
+  - **Matching run** — loads all segment CSVs for a completed matching run and imports the standard `matcher_*` property set (original flow)
+  - **Financial research run** — loads a completed Client Research financial-focus run (`finres_*`) from `finance-research-runs/{run_id}/state.json` (technology runs in `tech-research-runs/` are not listed here) (one row per researched company: identity + `financial_summary` digest + all 54 research fields). A `st.data_editor` mapping table lets users toggle each financial field on/off and point it at either an **existing** writable HubSpot company property (fetched live from the portal) or a new auto-created `matcher_fin_<field>` property (textarea for long-form fields). Headline fields are pre-checked by default; duplicate property targets are rejected before submit.
+- Both modes submit via the CRM Imports API as **Company** objects, deduplicating by `domain` (`companyWebsite`); rows without a website are skipped
+- Standard properties: `domain`, `name`, `description` (from `company_summary`)
+- Custom properties auto-created on first run (prefixed `matcher_`): `matcher_source`, `matcher_topic_number`, `matcher_grant_title`, `matcher_agency`, `matcher_broad_agency`, `matcher_due_date`, `matcher_grant_summary`, `matcher_good_match`, `matcher_subject_line`, `matcher_ai_message`
+- Requires `hubspot_api_key` secret and Private App scopes: `crm.import`, `crm.schemas.companies.write` (full scope list for the shared key is in the Secret reference table)
+
+**Stage 6 — Client Research** (clients → financial diligence or technology/R&D profile data)
+- **Via Client Research view** (`views/finance_researcher.py`): select client companies from `data/all-contacts/clients/`, pick a **research focus** — 💰 Financials or 🔬 Technology & R&D — then launch one **deep-research-style OpenAI** call per company (`gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna` via the Responses API with `background=True` + the `web_search` tool), poll until complete, review results, then apply. The dedicated `o3-deep-research`/`o4-mini-deep-research` models were shut down 2026-07-23; `gpt-5.6-sol` is OpenAI's named replacement.
+- Research calls take minutes and cost real money (~$0.30–$1/company on Luna, ~$0.75–$2.50 on Terra, ~$1.50–$5 on Sol; Terra is the default). The UI shows a pre-run cost estimate and requires a confirmation checkbox above $50 estimated total; actual cost is computed from `response.usage` per call.
+- Background mode means no long-held Streamlit connection: run state (response IDs, per-company status/output/cost) is checkpointed to GCS — financial runs at `finance-research-runs/{run_id}/state.json` (run IDs `finres_*`), technology runs at `tech-research-runs/{run_id}/state.json` (run IDs `techres_*`); raw responses saved under `{runs_prefix}/{run_id}/raw/` for manual inspection. A "Resume monitoring" expander re-attaches to a run by ID after a refresh or from another session (the `finres_`/`techres_` prefix selects the GCS prefix; `state.json` also stores `focus`).
+- **Financial focus output** is a strict-JSON object of 54 fields (identity, revenue/funding, federal awards 3yr, headcount, health signals, grant activity, budget signals, 0–100 proposal-readiness score, qualification, sources) defined in `src/modules/finance_research.py::FIELD_SECTIONS`. **Technology focus output** is a strict-JSON object of ~40 fields (identity, core technology, products & services, R&D activity, IP/patents, TRL/maturity, differentiation, grant-alignment keywords/agency fit, sources) defined in `src/modules/tech_research.py::FIELD_SECTIONS`. Malformed JSON gets one repair attempt via `gpt-4o-mini` before the row is marked error (`finance_research.parse_research_output` is shared — pass `fields=tech_research.ALL_FIELDS` for tech runs).
+- **Apply** writes three focus-specific columns onto every contact row of each researched company in the clients parquets (rewritten in place): financial focus → `financial_data` (full JSON string), `financial_summary` (digest, no AI call), `financials_updated_at` (ISO date); technology focus → `technology_data`, `technology_summary`, `technology_updated_at`. **Financial runs never modify `summary` or `embeddings`.** Technology runs show a checkbox at apply time (on by default): rewrite each company's matching `summary` from `tech_research.build_matching_summary()` (core tech + approach + capabilities + products/services + use cases + R&D focus + keywords, confidence labels stripped, no AI call) and re-embed it (`text-embedding-ada-002`, float64 to match stored dtype) — this intentionally changes grant matching; uncheck to save research columns only.
+- HubSpot Import's "Financial research run" mode only lists `finance-research-runs/` — technology runs are not currently importable to HubSpot.
+
+---
+
+## Streamlit Views
+
+| File | Title | Purpose |
+|------|-------|---------|
+| `views/contact_importer.py` | Contact Importer | Upload any lead spreadsheet **or** pull a HubSpot company list (lists search → memberships → batch company read) → map columns → dedup preview vs GCS (per-source or all-sources scope) → choose profiling method (🌐 scrape+GPT summary or 🔬 Deep Research technology focus, with model picker + cost estimate + >$50 confirmation) → stage file + trigger `contact-import-job` Cloud Run Job → poll `contact-import-jobs/{run_id}/status.json` |
+| `views/client_editor.py` | Client Editor | Select a company from `data/all-contacts/clients/` → edit its `summary` → re-embed (float64, matching stored dtype) → apply to all contact rows of that company → rewrite the source parquet in place |
+| `views/finance_researcher.py` | Client Research | Select clients from `data/all-contacts/clients/` → pick research focus (💰 Financials / 🔬 Technology & R&D) → launch background Deep Research tasks (one per company) → poll `finance-research-runs/` or `tech-research-runs/` `{run_id}/state.json` → review parsed results → apply `financial_data`/`financial_summary`/`financials_updated_at` or `technology_data`/`technology_summary`/`technology_updated_at` back onto client rows |
+| `views/topic_importer.py` | Topic Importer | Upload PDF or paste text → Claude extracts topics → editable table → embed + save to `processed/` |
+| `views/grant_search.py` | Grant Search | Select agencies, apply keyword filters, embed a tech description, find matching topics by cosine similarity |
+| `views/bulk_matching.py` | Bulk Matching | Select contact sources + grant agencies, configure threshold/top-k/AI validation, trigger Cloud Run job, poll status |
+| `views/sam_gov_upload.py` | SAM.gov Upload | Upload SAM.gov CSVs (processed in Streamlit: map columns → dedup vs existing store by notice ID + title **before** screening → Claude screening → summarize → embed → save) **or** configure an API fetch that triggers the `sam-gov-job` Cloud Run Job. Also exposes a **Daily API Parameters** section (daily 5 AM CST schedule config saved to `sam-gov-configs/daily_schedule.json`) and a **Revision Check** expander that triggers the `revision_check` job mode (dry-run by default) to sweep stored open notices for SAM.gov amendments. Streamlit polls `sam-gov-jobs/{run_id}/status.json` for manual run completion and renders revision/archived tables from the status payload. |
+| `views/grants_gov_fetch.py` | Grants.gov Fetch | Query the Grants.gov public `search2` API (keyword, date range, status, funding instrument, agency — no API key) → Claude Haiku relevance screening → embed → save to `data/all-topics/processed/GRANTS-GOV/` |
+| `views/hubspot_import.py` | HubSpot Import | Two source modes: **Matching run** (concatenate segment CSVs → standard `matcher_*` properties) or **Financial research run** (load `finance-research-runs/{run_id}/state.json` → per-field mapping table: each financial field → existing HubSpot property or auto-created `matcher_fin_*`). Both submit as company imports via `/crm/v3/imports` (dedup by `domain`) and poll for completion |
+| `views/resume_importer.py` | Resume Importer | Upload HubSpot contacts CSV with resume URL column → dedup by email → fetch files (PDF/DOCX) via HubSpot Bearer auth → extract text → GPT expertise summary → embed → save to `data/resumes/` |
+| `views/resume_search.py` | Resume Search | Natural-language query → embed → cosine similarity against resume parquets → ranked candidate cards + CSV export. Supports an optional include keyword (single term) and comma-separated exclude keywords to pre-filter the resume pool before scoring. |
+| `views/suggestions.py` | Suggestions | Team feature-request board — submit by name, upvote once per session; stored as JSON blobs in `suggestions/` |
 
 ---
 
 ## Source Files & Their Roles
 
-### Existing `.py` modules (keep and extend)
+### `src/modules/` (keep and extend)
 
-| File | Class | Purpose |
-|------|-------|---------|
+| File | Class / Export | Purpose |
+|------|---------------|---------|
 | `text_embedder.py` | `TextProcessor` | OpenAI embeddings, text chunking, token reduction, normalization, LLM summarization. Constructor takes `api_key: str` directly — NOT a file path. |
-| `bucket_manager.py` | `BucketManager` | Google Cloud Storage upload/download (parquet, CSV). Constructor signature: `BucketManager(bucket_path: str, client=None)` — always pass a `storage.Client` built from `get_storage_client()`. |
-| `web_scraper.py` | `WebScraper` | Selenium-based website scraper — legacy, being phased out in favor of Playwright. |
+| `bucket_manager.py` | `BucketManager` | Google Cloud Storage upload/download (parquet, CSV). Constructor: `BucketManager(bucket_path: str, client=None)` — always pass a `storage.Client` from `get_storage_client()`. |
+| `web_scraper.py` | `WebScraper` | Selenium-based website scraper — legacy, being phased out in favour of Playwright. |
+| `email_generator.py` | `async_generate_subject_line`, `async_josiah_copy` | Async email copy generation. Subject line tries GPT-4o-mini first, falls back to Claude Haiku on 429. Both functions accept async client objects passed in from the caller. |
+| `grant_utils.py` | `normalize_grant_columns` | Call this whenever a topics DataFrame is loaded. Ensures `grant_summary` is always present: renames `description` → `grant_summary` if the column is absent, or fills empty `grant_summary` values from `description` if both exist. |
+| `finance_research.py` | `FIELD_SECTIONS`, `build_research_prompt`, `parse_research_output`, `build_financial_digest`, `response_cost_usd` | Deep Research helpers for the Client Research view (financial focus + shared plumbing) — 54-field output schema, prompt builder, JSON extract + `gpt-4o-mini` repair (`parse_research_output` takes an optional `fields=` list so it can normalize either focus's schema), headline digest (no AI call), and per-response cost from `usage`. Model IDs (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`) drift — verify against developers.openai.com/api/docs/models on API errors. |
+| `tech_research.py` | `FIELD_SECTIONS`, `ALL_FIELDS`, `build_research_prompt`, `build_tech_digest`, `build_matching_summary` | Technology & R&D research schema/prompt/digest for the Client Research view's tech focus — ~40-field output (core technology, products, R&D activity, patents, TRL/maturity, differentiation, grant-alignment keywords). `build_matching_summary()` assembles embedding-ready text (confidence labels stripped) for the optional summary-rewrite at apply time. Reuses finance_research's models, pricing, and JSON parse/repair. |
 
-### Notebooks being converted to `.py`
+### Resume Importer — 5-step UI flow
 
-| Notebook | Target module | Purpose |
-|----------|--------------|---------|
-| `apollo_importer__1_.ipynb` | `importers/apollo_importer.py` | Ingest Apollo CSV exports, normalize columns, scrape websites, generate embeddings |
-| `SBA_importer.ipynb` | `importers/sba_importer.py` | Ingest SBA CSV exports, normalize, scrape, embed |
-| `fwee_alluts_impoatah.ipynb` | `importers/free_alert_importer.py` | Ingest "free alert" lead CSVs; uses async aiohttp + Playwright two-stage scraping |
-| `topic_processor_v2__1_.ipynb` | `processors/topic_processor.py` | Process grant topic spreadsheets per agency, optionally summarize, generate embeddings |
-| `contacts_grants_matcher_v3.ipynb` | `matcher/matcher.py` | Core matching engine: load data, similarity scoring, LLM verification, export results |
+The `views/resume_importer.py` view ingests individual-level resumes from HubSpot:
 
-> **Note on filename:** `fwee_alluts_impoatah.ipynb` = "free alerts importer" (phonetic/scrambled). Canonical name going forward: `free_alert_importer.py`.
+1. **Upload** — HubSpot contacts CSV or Excel (UTF-8 / Latin-1 fallback)
+2. **Column mapping** — email (required, join key) and resume URL (required); firstName, lastName, phone, company optional; auto-detects column names
+3. **Dedup** — loads existing parquets from `data/resumes/`, deduplicates by lowercase email
+4. **Fetch + Extract + Summarise** — fetches each file from its HubSpot URL using `Authorization: Bearer {hubspot_api_key}` on the first request (no retry cycle needed); rejects `text/html` responses immediately; extracts text via three-stage waterfall:
+   - **PDF**: `fitz.open(stream, filetype='pdf')` page by page
+   - **DOCX primary**: parse `word/document.xml` directly as a ZIP to pull every `<w:t>` text run — the only method that captures text boxes (used by most resume templates for sidebar/column layout)
+   - **DOCX fallback**: python-docx paragraphs + table cells, then fitz
+   - Minimum **400 chars** of extracted text required; shorter extractions are discarded before GPT is called to prevent hallucination from header-only content
+   - GPT-3.5-turbo expertise summary (skills, domain, years of experience, project types); responds with `-` if text is too thin — stored as empty string, not embedded
+5. **Embed & Save** — `text-embedding-ada-002` on the `expertise_summary`; rows with empty summary get an empty embedding list and are skipped by the search; saves to `data/resumes/resumes_{YYYY-MM-DD}_{hex6}.parquet`
+
+**Key implementation notes:**
+- HubSpot's `hubspot_api_key` requires the **Files** scope in addition to CRM scopes — missing this causes `fetch_failed` for all URLs
+- HubSpot sometimes returns `200 OK` with an HTML redirect page instead of a 401/403 — the fetch function explicitly rejects `Content-Type: text/html` responses
+- Parquet embeddings column reads back from GCS as `numpy.ndarray`, not `list` — always filter with `isinstance(e, (list, np.ndarray))` not `isinstance(e, list)`
+- Do NOT use `@st.cache_data` wrapping GCS calls in this codebase — use `st.session_state` or load fresh; the grant_search pattern (no cache) is the reference
+- A raw text preview expander appears after fetch so the team can verify extraction quality before committing to the summarization API calls
+
+### Contact Importer — 4-step UI flow
+
+The `views/contact_importer.py` view handles any lead source generically. Steps 1–3 run in Streamlit; the heavy work runs in a Cloud Run Job.
+
+1. **Input source** — radio between two modes:
+   - **📄 Upload spreadsheet** — CSV or Excel (UTF-8 / Latin-1 fallback); file bytes stored in `st.session_state.ci_file_bytes` for staging
+   - **🟠 HubSpot company list** — Load lists (`POST /crm/v3/lists/search`, objectTypeId `0-2`, paged) → pick a list → fetch members (`GET /crm/v3/lists/{id}/memberships`, paged) → batch-read companies (`POST /crm/v3/objects/companies/batch/read`; properties name/domain/website/state/industry/phone). The fetched companies become a DataFrame with the **standard column names** (contact-level fields empty — company lists carry companies only), serialized to CSV bytes and staged exactly like an upload, so steps 2–4 and the job are identical. `companyWebsite` = HubSpot `domain`, falling back to `website`. Requires `hubspot_api_key` scopes `crm.lists.read` + `crm.objects.companies.read`.
+2. **Source & column mapping** — select `apollo`, `sba`, `free_alert`, `hubspot`, or a custom label; auto-detect column names (HubSpot pulls auto-map fully since the columns are already standard); URL column is required, all others optional. Excel HYPERLINK formulas are stripped via `_strip_hyperlink()` on every mapped column.
+3. **Dedup** (preview only) — loads existing parquets from GCS, compares bare domains via `tldextract`, shows already-stored vs new counts. A **"check against all sources"** checkbox (default ON for HubSpot pulls, OFF for uploads) widens the scope from `data/all-contacts/{source}/` to all of `data/all-contacts/` — a HubSpot list can contain companies already imported under any source. The scope is passed to the job as `dedup_all_sources` so the runtime re-dedup uses the same scope. Invalidates if source, URL column, or scope changes.
+4. **Start import job** — choose the **company profiling method**: 🌐 `scrape` (default — scrape + GPT-3.5-turbo summary, near-free) or 🔬 `deep_research` (technology-focus Deep Research per unique company domain; shows a model picker (Luna/Terra/Sol), an estimated-cost metric of unique domains × `fr.EST_COST_PER_COMPANY`, and a confirmation checkbox above $50). Uploads raw file bytes to `contact-import-uploads/{run_id}{ext}`, writes config JSON (including `profile_method` + `research_model`) to `contact-import-configs/{run_id}.json`, triggers `contact-import-job` via `run_v2.JobsClient`; stores `run_id` in `st.session_state.ci_active_run` and polls `contact-import-jobs/{run_id}/status.json` every 10s until complete. The completion screen relabels "Scraped OK" → "Researched OK" and shows companies-researched counts + actual research cost for deep-research runs.
+
+URL normalization (adds `https://` if missing) happens at mapping time. The job re-deduplicates at runtime as a safety check — the Streamlit dedup is for preview only.
+
+**Resume monitoring after refresh:** an expander at the top of the page accepts a `run_id` string to resume polling a job from a previous session.
+
+> The legacy notebooks (`apollo_importer__1_.ipynb`, `SBA_importer.ipynb`, `fwee_alluts_impoatah.ipynb`) are superseded by this view and no longer need conversion.
 
 ---
 
 ## Data Schemas
 
-### Contact record (parquet, `all-contacts/`)
+### Contact record (parquet, `data/all-contacts/`)
 | Field | Type | Notes |
 |-------|------|-------|
 | `companyName` | str | Company name |
@@ -90,23 +197,67 @@ notebooks/pipelines/
 | `scraped_at` | str | ISO date of processing |
 | `uuid` | str | Unique record ID |
 
-### Grant topic record (parquet, `all-topics/processed/`)
+Rows may additionally carry Deep Research columns — financial focus (Client Research view, `data/all-contacts/clients/` only): `financial_data` (JSON string of the full 54-field Deep Research output), `financial_summary` (human-readable digest), `financials_updated_at` (ISO date); technology focus (Client Research view on clients, or any source imported via the Contact Importer's `deep_research` profiling method): `technology_data` (JSON string of the ~40-field tech research output), `technology_summary` (digest), `technology_updated_at` (ISO date). For deep-research imports, `company_summary` holds `tech_research.build_matching_summary()` output (not a scraped-page GPT summary) and `embeddings` is its vector.
+
+### Grant topic record (parquet, `data/all-topics/processed/`)
 | Field | Type | Notes |
 |-------|------|-------|
 | `topic_number` | str | Agency topic/solicitation ID |
-| `agency` | str | e.g. `HHS`, `DOD`, `ARPA` |
+| `agency` | str | Sub-agency (e.g. `ARMY`, `NCI`) |
+| `broad_agency` | str | Folder-level agency key (e.g. `DOD`, `HHS`) — added at load time |
 | `title` | str | |
-| `description` | str | Raw grant description text |
-| `grant_summary` | str | LLM-summarized description (if summarized) |
+| `grant_summary` | str | **Canonical text field** — always present after `normalize_grant_columns()`. Topic Importer and SAM.gov sources write this directly. |
+| `description` | str | Raw source text — present in SAM.gov parquets as a backup alongside `grant_summary`; absent from Topic Importer parquets. Never use this directly; always call `normalize_grant_columns()` after loading. |
 | `embeddings` | list[float] | `text-embedding-ada-002` vector |
-| `open_date` / `close_date` | datetime | |
+| `open_date` / `close_date` | str | |
+| `source` | str | Origin URL or label |
 | `scraped_at` | str | ISO date of processing |
 
-### Match output (`.xlsx`, `all-matches/`)
+### SAM.gov topic record (parquet, `data/all-topics/processed/SAM-GOV/`)
+Same base schema as grant topic, plus extra columns written by `sam_gov_job.py`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `source` | str | SAM.gov opportunity URL — `https://sam.gov/opp/{noticeId}/view`. Auto-populated in API mode; mapped from a CSV column in CSV mode (optional). Updated to the new noticeId when a revision is applied. |
+| `sam_confidence` | str | `"high"` / `"medium"` / `"low"` — Claude screening confidence |
+| `sam_reason` | str | One-sentence explanation of the screening decision |
+| `notice_version_id` | str | Version-specific SAM.gov `noticeId` — revision detection compares this against the latest version. Backfilled from the `source` URL for parquets written before this column existed. |
+| `sam_status` | str | `"active"` / `"archived"` — set to archived by the revision check when the notice is no longer on SAM.gov. Archived rows are kept but filtered out by `matching_job` and Grant Search. |
+| `revised_at` | str | ISO date the last revision was applied; empty if never revised |
+| `sam_revision_notes` | str | Claude-written diff of the last revision — what changed, topics added/removed |
+
+### Match output (CSV, `matching-results/{run_id}/`)
 Includes merged fields from both contact and grant records plus:
-- `similarity_score` — cosine similarity value
-- `good_match` — `"yes"` / `"no"` from LLM verification
-- `alignment_reason` — LLM explanation (when present)
+- `good_match` — `"yes"` / `"no"` from Claude Haiku AI validation
+- `subject_line` — generated subject line (when `prewrite_email` is enabled)
+- `ai_message` — generated email body copy (when `prewrite_email` is enabled)
+
+Results are written in 1 000-row segments (`segment_001.csv`, `segment_002.csv`, …).
+A `status.json` file is written on completion (or failure) and polled by the Streamlit UI.
+
+### Resume record (parquet, `data/resumes/`)
+| Field | Type | Notes |
+|-------|------|-------|
+| `uuid` | str | Unique record ID |
+| `email` | str | **Join key** — lowercase; used for dedup |
+| `firstName` | str | |
+| `lastName` | str | |
+| `phone` | str | |
+| `company` | str | Employer name if present in HubSpot export |
+| `resume_url` | str | Original HubSpot file URL |
+| `file_type` | str | `pdf`, `docx`, `unknown`, `fetch_failed`, `missing` |
+| `expertise_summary` | str | GPT-3.5-turbo 3-5 sentence summary of skills, domain, experience, and project types. Empty string if extraction yielded < 400 chars or GPT returned insufficient text. |
+| `embeddings` | list[float] | `text-embedding-ada-002` vector of `expertise_summary`. Empty list `[]` when `expertise_summary` is blank — these rows are skipped by Resume Search. |
+| `processed_at` | str | ISO date of processing |
+
+### Suggestion record (JSON, `suggestions/`)
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | str | UUID4 |
+| `name` | str | Submitter name |
+| `suggestion` | str | Feature request text |
+| `votes` | int | Upvote count |
+| `created_at` | str | ISO datetime (UTC) |
 
 ---
 
@@ -116,52 +267,97 @@ Bucket name: `cc-matcher-bucket-jeg-v1` (single-region, us-central1). All pipeli
 
 ```
 cc-matcher-bucket-jeg-v1/
-  all-topics/
-    processed/
-      DOD/
-        ARMY_2026-03-01.parquet
-        USSOCOM_2026-03-01.parquet
-      HHS/
-        NCI_2026-03-01.parquet
-      ARPA/
-        ...
-  all-contacts/
-    apollo/
-      apollo_2026-03-01.parquet
-    sba/
-      sba_2026-03-01.parquet
-    free_alert/
-      free_alert_2026-03-01.parquet
-  all-matches/
-    campaign_name_2026-03-01.xlsx
+  data/
+    all-topics/
+      processed/
+        DOD/
+          ARMY_2026-03-01_a3f9c1.parquet
+          USSOCOM_2026-03-01_b2e4d7.parquet
+        HHS/
+          NCI_2026-03-01_c1d8a2.parquet
+        ARPA/
+          ...
+        SAM-GOV/
+          sam_gov_2026-04-16_f3a1b9.parquet
+        GRANTS-GOV/
+          grants_gov_2026-07-01_d4c2e8.parquet
+    all-contacts/
+      apollo/
+        apollo_2026-03-01_a3f9c1.parquet
+      sba/
+        sba_2026-03-01_b2e4d7.parquet
+      free_alert/
+        free_alert_2026-03-01_c1d8a2.parquet
+    resumes/
+      resumes_2026-06-24_a3f9c1.parquet   # individual resume records, deduped by email
+  job-configs/                          # matching-job configs
+    2026-04-16_10-30-00_ag-DOD-HHS_src-apollo.json
+  matching-results/
+    2026-04-16_10-30-00_ag-DOD-HHS_src-apollo/
+      segment_001.csv
+      segment_002.csv
+      status.json
+  sam-gov-configs/                      # sam-gov-job configs
+    sam_gov_2026-06-01_10-30-00.json
+    daily_schedule.json               # persistent daily schedule config (overwritten on save, not versioned)
+    revcheck_state.json               # revision-check sweep cursor: topic_number → last-checked date (advanced by apply runs only)
+  sam-gov-uploads/                      # staging: CSV blobs uploaded by Streamlit (CSV mode)
+    sam_gov_2026-06-01_10-30-00.csv
+  sam-gov-jobs/                         # sam-gov-job completion status
+    sam_gov_2026-06-01_10-30-00/
+      status.json
+  contact-import-uploads/               # staging: raw file bytes uploaded by Streamlit
+    contact_import_2026-06-25_10-30-00_apollo.csv
+  contact-import-configs/               # contact-import-job trigger configs
+    contact_import_2026-06-25_10-30-00_apollo.json
+  contact-import-jobs/                  # contact-import-job completion status
+    contact_import_2026-06-25_10-30-00_apollo/
+      status.json
+  finance-research-runs/                # Client Research run checkpoints — financial focus
+    finres_2026-07-29_10-30-00/
+      state.json                        # per-company response IDs, status, parsed output, cost (+ focus)
+      raw/
+        000_Acme_Robotics.txt           # raw Deep Research response text (for manual review)
+  tech-research-runs/                   # Client Research run checkpoints — technology focus (same layout)
+    techres_2026-07-31_10-30-00/
+      state.json
+      raw/
+  suggestions/
+    <uuid>.json
 ```
 
 ### BucketManager usage pattern
 
 ```python
 # Always instantiate with a client from get_storage_client()
-bm = BucketManager("matcher-data", client=get_storage_client())
+bm = BucketManager('cc-matcher-bucket-jeg-v1', client=get_storage_client())
 
 # Write
-bm.upload_file("all-topics/processed/DOD/ARMY_2026-03-01.parquet", df)
+bm.upload_file('data/all-topics/processed/DOD/ARMY_2026-03-01.parquet', df)
 
 # Read
-df = bm.download_file("all-topics/processed/DOD/ARMY_2026-03-01.parquet")
+df = bm.download_file('data/all-topics/processed/DOD/ARMY_2026-03-01.parquet')
 ```
 
 ### Listing GCS prefixes (replaces os.listdir for agency dropdowns)
 
 ```python
 def list_broad_agencies(client) -> list[str]:
-    bucket = client.bucket("matcher-data")
-    blobs  = client.list_blobs("matcher-data", prefix="all-topics/processed/", delimiter="/")
+    blobs = client.list_blobs(
+        'cc-matcher-bucket-jeg-v1',
+        prefix='data/all-topics/processed/',
+        delimiter='/'
+    )
     list(blobs)  # must consume iterator to populate prefixes
-    return sorted(p.replace("all-topics/processed/", "").strip("/") for p in blobs.prefixes)
+    return sorted(
+        p.replace('data/all-topics/processed/', '').strip('/')
+        for p in blobs.prefixes
+    )
 ```
 
 ---
 
-
+## Agency Short-Codes
 
 Agencies are referenced by short-code keys throughout the codebase:
 
@@ -184,39 +380,44 @@ grants['DOD'] = {
 
 | Package | Use |
 |---------|-----|
-| `openai` | Embeddings (`text-embedding-ada-002`), GPT-3.5/4 summarization |
-| `anthropic` | Claude (Haiku, Sonnet) for match verification — async preferred |
+| `streamlit` | UI framework |
+| `anthropic` | Claude (Haiku, Sonnet) — match verification, topic extraction, SAM.gov screening, email copy |
+| `openai` | Embeddings (`text-embedding-ada-002`), GPT summarization, subject line generation, deep-research-style research (`gpt-5.6-sol`/`terra`/`luna` via Responses API background mode) for Client Research (financial + technology focuses) and the Contact Importer's `deep_research` profiling mode |
 | `tiktoken` | Token counting before embedding (7500 token limit) |
-| `playwright` | Async JS-rendered page scraping (fallback when aiohttp fails) |
-| `aiohttp` + `BeautifulSoup` | Fast async scraping (first-pass) |
-| `selenium` | Legacy scraper in `web_scraper.py` (being phased out in favor of Playwright) |
 | `google-cloud-storage` | GCS bucket I/O via `BucketManager` |
-| `duckdb` | In-notebook data querying (used in importers) |
+| `google-cloud-run` | Programmatic Cloud Run job triggering from Bulk Matching view (`run_v2.JobsClient`) |
+| `requests` | HubSpot API calls in HubSpot Import view |
+| `pymupdf` (`fitz`) | PDF text extraction in Topic Importer, Resume Importer (also used as DOCX fallback), and sam-gov-job (attachment text for revision diffs) |
+| `python-docx` | DOCX text extraction in Resume Importer (paragraphs + table cells; XML parse is primary) |
 | `pandas`, `numpy` | Data manipulation throughout |
-| `tldextract` | Domain normalization |
-| `streamlit` | **Target UI framework** |
+| `pyarrow` | Parquet read/write |
+| `playwright` | Async JS-rendered page scraping (fallback when aiohttp fails). Browser binary downloaded at server start via `@st.cache_resource` in `app.py`. System libs declared in `packages.txt`. |
+| `aiohttp` + `BeautifulSoup` | Fast async scraping (first-pass in Contact Importer) |
+| `tldextract` | Domain normalization (dedup in Contact Importer) |
+| `selenium` | Legacy scraper in `web_scraper.py` (being phased out) |
+| `duckdb` | In-notebook data querying (used in legacy importers) |
 
 ---
 
 ## Secrets / API Keys
 
-All secrets are loaded via `st.secrets` — never from `.txt` files, never hardcoded. The old `_load_key(filename)` helper pattern must not be used in any new code.
+All secrets are loaded via `st.secrets` in Streamlit code — never from `.txt` files, never hardcoded. The Cloud Run job reads secrets from environment variables injected by Cloud Run at startup (no `st.secrets` available outside Streamlit).
 
 ### `.streamlit/secrets.toml` (local dev — gitignored)
 
 ```toml
+app_password      = "..."
 openai_api_key    = "sk-..."
 anthropic_api_key = "sk-ant-..."
 
 [gcp_service_account]
 type                        = "service_account"
-project_id                  = "your-project-id"
+project_id                  = "cc-matcher-v1"
 private_key_id              = "..."
 private_key                 = "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n"
-client_email                = "matcher-app@your-project.iam.gserviceaccount.com"
+client_email                = "matcher-app@cc-matcher-v1.iam.gserviceaccount.com"
 client_id                   = "..."
 auth_uri                    = "https://accounts.google.com/o/oauth2/auth"
-token_uri                   = "https://oauth2.googleapis.com/token"
 token_uri                   = "https://oauth2.googleapis.com/token"
 auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
 client_x509_cert_url        = "..."
@@ -224,16 +425,16 @@ client_x509_cert_url        = "..."
 
 The `[gcp_service_account]` block is the contents of `ServiceKey_GoogleCloud.json` reformatted as TOML. When deploying to Streamlit Cloud, paste the same values into **App Settings → Secrets** in the UI.
 
-### Accessing secrets in code
+### Accessing secrets in Streamlit views
 
 ```python
 import streamlit as st
 
-oai_key  = st.secrets["openai_api_key"]
-anth_key = st.secrets["anthropic_api_key"]
+oai_key    = st.secrets['openai_api_key']
+anth_key   = st.secrets['anthropic_api_key']
 ```
 
-### GCS client (always build this way)
+### GCS client (always build this way in Streamlit)
 
 ```python
 from google.oauth2 import service_account
@@ -241,39 +442,35 @@ from google.cloud import storage
 
 def get_storage_client():
     creds = service_account.Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"]
+        st.secrets['gcp_service_account']
     )
     return storage.Client(credentials=creds)
 ```
 
 Pass this client into `BucketManager` — never rely on the `GOOGLE_APPLICATION_CREDENTIALS` env var in Streamlit code.
 
-### Secret migration reference
+### Cloud Run job secrets
 
-| Secret | Old pattern | New pattern |
-|--------|------------|-------------|
-| OpenAI API key | `keys/openai_key.txt` | `st.secrets["openai_api_key"]` |
-| Anthropic API key | `keys/anthropic.txt` | `st.secrets["anthropic_api_key"]` |
-| GCP service account | `ServiceKey_GoogleCloud.json` file | `st.secrets["gcp_service_account"]` dict |
+The matching job uses `storage.Client()` with no arguments (ADC via the attached service account) and reads API keys from environment variables:
 
----
+```python
+import os
+anth_key   = os.environ['ANTHROPIC_API_KEY']   # injected from Secret Manager by Cloud Run
+openai_key = os.environ['OPENAI_API_KEY']
+```
 
-## Migration Goals (Colab → Streamlit)
+### Secret reference
 
-1. **Remove all `google.colab` imports** — no `drive.mount()`, no `!pip install`, no `%cd` magic
-2. **Convert each notebook to a standalone `.py` module** with a clear class or set of functions (no top-level execution code outside `if __name__ == "__main__":`)
-3. **Centralize config** — paths, thresholds, model names, and agency lists should come from a single config file (e.g., `config.py` or `config.yaml`), not be hardcoded inline
-4. **Use `st.secrets` for all API keys and GCP credentials** — no reading from `.txt` files, no `GOOGLE_APPLICATION_CREDENTIALS` env var in Streamlit code
-5. **All data I/O goes through `BucketManager` against GCS** — no local filesystem reads or writes in production; no `glob` over local paths
-6. **`TextProcessor` takes `api_key: str` directly** — not a file path; update constructor and all call sites
-7. **`BucketManager` takes an optional `client` param** — always pass a `storage.Client` built from `get_storage_client()`; never rely on ambient env var auth in Streamlit code
-8. **Preserve the two-stage scraping pattern** — aiohttp fast pass → Playwright fallback is the standard; do not revert to Selenium or collapse to a single scraper
-9. **Async-first for LLM calls** — use `AsyncAnthropic` / `AsyncOpenAI` wherever batch processing occurs
-10. **Streamlit UI** should expose:
-    - Lead importer runner (select source, upload CSVs, trigger pipeline)
-    - Grant topic processor (select agency, upload files, trigger processing)
-    - Matcher runner (configure grants/contacts/threshold, run, preview results, download Excel)
-    - Match history browser
+| Secret | Where used | How accessed |
+|--------|-----------|--------------|
+| `app_password` | Login gate in `app.py` | `st.secrets['app_password']` |
+| `openai_api_key` | All views that embed + Client Research (Deep Research calls + JSON repair) | `st.secrets['openai_api_key']` |
+| `anthropic_api_key` | Topic Importer, SAM.gov Upload, Bulk Matching | `st.secrets['anthropic_api_key']` |
+| `gcp_service_account` | All views that touch GCS | `st.secrets['gcp_service_account']` dict |
+| `hubspot_api_key` | HubSpot Import view + Resume Importer + Contact Importer (HubSpot list pulls) | `st.secrets['hubspot_api_key']` — must be placed **above** `[gcp_service_account]` in secrets.toml. Private App requires scopes: `crm.import`, `crm.schemas.companies.write`, **`files`** (files scope required for Resume Importer to download attachments), **`crm.lists.read`** + **`crm.objects.companies.read`** (Contact Importer HubSpot list pulls). All five scopes are granted on the current Private App (verified 2026-08) — a 401/403 from HubSpot means an expired/rotated token, not a missing scope. |
+| `sam_gov_api_key` | SAM.gov Upload view (API fetch tab) | `st.secrets['sam_gov_api_key']` — free key from beta.sam.gov → Account Settings → API Keys. Passed into the sam-gov-job config JSON (not a Secret Manager secret). |
+| `anthropic-api-key` (Secret Manager) | Cloud Run matching job + sam-gov-job | `os.environ['ANTHROPIC_API_KEY']` |
+| `openai-api-key` (Secret Manager) | Cloud Run matching job + sam-gov-job + contact-import-job | `os.environ['OPENAI_API_KEY']` |
 
 ---
 
@@ -283,9 +480,482 @@ Pass this client into `BucketManager` — never rely on the `GOOGLE_APPLICATION_
 - **Classes:** `PascalCase` (e.g., `TextProcessor`, `BucketManager`)
 - **Contact fields:** camelCase for legacy compatibility (`companyWebsite`, `companyName`, `firstName`, `lastName`) — preserve these names to avoid breaking downstream column references
 - **Grant fields:** snake_case (`grant_summary`, `open_date`, `close_date`, `scraped_at`)
-- **Parquet output filenames:** `{source_or_agency}_{YYYY-MM-DD}.parquet`
-- **Match output filenames:** `{campaign_name}_{YYYY-MM-DD}.xlsx`
+- **Parquet output filenames:** `{source_or_agency}_{YYYY-MM-DD}_{hex6}.parquet` (hex suffix avoids collisions on same-day re-runs)
+- **Match output filenames:** `segment_{NNN}.csv` under a run-ID prefix
 - **Agency keys:** UPPERCASE short-codes (e.g., `DOD`, `HHS`, `ARPA`)
+
+---
+
+## Streamlit App on Cloud Run (`matcher-app` service)
+
+The Streamlit UI runs as a Cloud Run **service** (not job) named `matcher-app`, replacing Streamlit Cloud. Auth is Google sign-in via **IAP (Identity-Aware Proxy)** enabled directly on the service — access is granted to the `team@bwcoconsulting.com` Google group with `roles/iap.httpsResourceAccessor`. The old password gate in `app.py` remains only as a local-dev fallback: when the `X-Goog-Authenticated-User-Email` header is present (set by IAP, spoof-proof because unauthenticated access is blocked), the session is authenticated automatically and the email shown in the sidebar.
+
+- **Image:** `us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matcher-app:latest` — built from `Dockerfile.app` (repo root) via `cloudbuild.app.yaml`. Installs the `packages.txt` Chromium libs and Playwright's Chromium at build time (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`).
+- **Secrets:** the full local `.streamlit/secrets.toml` is stored in Secret Manager as `streamlit-secrets` and volume-mounted at `/app/.streamlit/secrets.toml`, so `st.secrets` works unchanged. To rotate/edit secrets: `gcloud secrets versions add streamlit-secrets --data-file=.streamlit/secrets.toml --project cc-matcher-v1`, then redeploy (or restart) the service.
+- **`.gcloudignore` / `.dockerignore`** exclude `.streamlit/`, `*.json` (service-account keys), and `notebooks/` from the build context — never remove those entries.
+- **Config:** 4 GiB / 2 CPU, `--timeout 3600`, `--session-affinity`, `--max-instances 1` (Streamlit session state is per-instance; do not scale out without sticky sessions verified), runs as `matcher-app@cc-matcher-v1.iam.gserviceaccount.com`.
+
+### Build and deploy (run every time app/view code changes)
+
+```bash
+gcloud builds submit --config cloudbuild.app.yaml --project cc-matcher-v1 .
+
+gcloud run services update matcher-app \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matcher-app:latest \
+  --region us-central1 --project cc-matcher-v1
+```
+
+### One-time setup (already done — reference only)
+
+```bash
+gcloud services enable iap.googleapis.com --project cc-matcher-v1
+
+# Secrets file into Secret Manager
+gcloud secrets create streamlit-secrets --data-file=.streamlit/secrets.toml --project cc-matcher-v1
+gcloud secrets add-iam-policy-binding streamlit-secrets --project cc-matcher-v1 \
+  --member="serviceAccount:matcher-app@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Deploy with IAP enabled, no public access
+gcloud run deploy matcher-app \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matcher-app:latest \
+  --region us-central1 --project cc-matcher-v1 \
+  --memory 4Gi --cpu 2 --timeout 3600 \
+  --session-affinity --max-instances 1 \
+  --service-account matcher-app@cc-matcher-v1.iam.gserviceaccount.com \
+  --update-secrets=/app/.streamlit/secrets.toml=streamlit-secrets:latest \
+  --no-allow-unauthenticated \
+  --iap
+
+# Grant the workspace group access through IAP
+gcloud iap web add-iam-policy-binding --project cc-matcher-v1 \
+  --resource-type=cloud-run --service=matcher-app --region=us-central1 \
+  --member="group:team@bwcoconsulting.com" \
+  --role="roles/iap.httpsResourceAccessor"
+```
+
+If sign-in loops or 403s for a team member, confirm they're in the `team@bwcoconsulting.com` group and that the IAP service agent (`service-{PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com`) has `roles/run.invoker` on the service (the `--iap` flag normally wires this automatically).
+
+---
+
+## Cloud Run Job Setup
+
+Two Cloud Run Jobs run the heavy pipeline work so Streamlit never hits memory or timeout limits. Both share the same service account and Secret Manager secrets. Streamlit writes a config to GCS, triggers the job, then polls `status.json` for completion.
+
+### GCP details
+- **Project:** `cc-matcher-v1`
+- **Region:** `us-central1`
+- **Artifact Registry repo:** `matcher`
+- **Job service account (shared):** `matching-job@cc-matcher-v1.iam.gserviceaccount.com`
+- **Secret Manager secrets (shared):** `anthropic-api-key`, `openai-api-key`
+
+| Job name | Entry point | Dockerfile | Requirements | Triggered from |
+|----------|------------|------------|--------------|----------------|
+| `matching-job` | `jobs/matching_job.py` | `jobs/Dockerfile` | `requirements.job.txt` | Bulk Matching view |
+| `sam-gov-job` | `jobs/sam_gov_job.py` | `jobs/Dockerfile.sam_gov` | `requirements.sam_gov_job.txt` | SAM.gov Upload view (manual) + Cloud Scheduler (daily) |
+| `contact-import-job` | `jobs/contact_import_job.py` | `jobs/Dockerfile.contact_import` | `requirements.contact_import_job.txt` | Contact Importer view |
+
+### `matching-job` config schema (`job-configs/{run_id}.json`)
+
+```json
+{
+  "run_id":         "2026-04-16_10-30-00_ag-DOD_src-apollo",
+  "threshold":      0.82,
+  "top_k":          5,
+  "sources":        ["apollo", "sba"],
+  "agencies":       ["DOD", "HHS"],
+  "topic_filters":  [
+    {"column": "title", "type": "keyword", "keyword": "cyber", "operator": "AND"},
+    {"column": "open_date", "type": "date_range", "date_from": "2026-06-01", "date_to": "2026-06-30", "operator": "AND"}
+  ],
+  "ai_validation":  true,
+  "prewrite_email": false
+}
+```
+
+### One-time setup (already done — skip if job exists)
+
+```bash
+# Enable APIs
+gcloud services enable \
+  run.googleapis.com \
+  artifactregistry.googleapis.com \
+  secretmanager.googleapis.com \
+  cloudbuild.googleapis.com
+
+# Create Artifact Registry repo
+gcloud artifacts repositories create matcher \
+  --repository-format=docker \
+  --location=us-central1
+
+# Create job service account
+gcloud iam service-accounts create matching-job \
+  --display-name="Matching Job Runner"
+
+# Grant GCS access
+gcloud projects add-iam-policy-binding cc-matcher-v1 \
+  --member="serviceAccount:matching-job@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+
+# Grant Secret Manager access
+gcloud projects add-iam-policy-binding cc-matcher-v1 \
+  --member="serviceAccount:matching-job@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+### Build and deploy (run this every time job code changes)
+
+Run from the repo root (`~/matcher-public` in Cloud Shell):
+
+```bash
+# Step 1 — write cloudbuild.yaml (only needed once or after deleting it)
+printf 'steps:\n- name: "gcr.io/cloud-builders/docker"\n  args: ["build", "-t", "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matching-job:latest", "-f", "jobs/Dockerfile", "."]\nimages:\n- "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matching-job:latest"\n' > cloudbuild.yaml
+
+# Step 2 — build image and push to Artifact Registry
+gcloud builds submit --config cloudbuild.yaml .
+
+# Step 3 — first deploy (only needed once)
+gcloud run jobs create matching-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matching-job:latest \
+  --region us-central1 \
+  --memory 4Gi \
+  --cpu 2 \
+  --task-timeout 3600 \
+  --max-retries 0 \
+  --service-account matching-job@cc-matcher-v1.iam.gserviceaccount.com
+
+# Step 3 (subsequent deploys — use update instead of create)
+gcloud run jobs update matching-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matching-job:latest \
+  --region us-central1
+```
+
+### Verify the job exists
+
+```bash
+gcloud run jobs list --region us-central1
+```
+
+### Trigger a test run manually
+
+```bash
+gcloud run jobs execute matching-job --region us-central1
+```
+
+### View logs
+
+```bash
+gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=matching-job" \
+  --limit 50 --format "value(textPayload)"
+```
+
+---
+
+### `sam-gov-job` — build, deploy, and manage
+
+#### `sam-gov-job` config schema (`sam-gov-configs/{run_id}.json`)
+
+Manual one-off run (date range explicit):
+```json
+{
+  "run_id":      "sam_gov_2026-06-01_10-30-00",
+  "input_mode":  "api",
+
+  // CSV mode only:
+  "csv_blob_path": "sam-gov-uploads/sam_gov_2026-06-01_10-30-00.csv",
+  "col_map": {"title": "Opportunity Title", "description": "Synopsis", "notice_id": "Notice ID", "agency": "Department", "posted_date": "Posted Date", "deadline": "Response Deadline", "source_url": "Contract Opportunity URL"},
+
+  // API mode only:
+  "api_params": {
+    "date_from":       "01/01/2026",
+    "date_to":         "06/01/2026",
+    "notice_types":    ["p", "o", "k", "r"],
+    "keyword":         "",
+    "max_results":     500,
+    "fetch_desc":      true,
+    "sam_gov_api_key": "..."
+  },
+
+  "custom_cols": {"campaign_name": "Spring 2026"}
+}
+```
+
+Revision check run (written by the "🔁 Revision Check" expander in the SAM.gov Upload view):
+```json
+{
+  "run_id":      "sam_gov_revcheck_2026-07-13_10-30-00",
+  "input_mode":  "revision_check",
+  "api_params":  {
+    "sam_gov_api_key":     "...",
+    "include_attachments": true,
+    "max_api_calls":       600
+  },
+  "dry_run":     true
+}
+```
+Its status payload uses a different shape: `{run_id, mode: "revision_check", dry_run, rows_candidates, rows_checked, rows_remaining, revisions_found, revisions_deferred, rows_archived, rows_updated, lookup_errors, api_calls_used, api_call_budget, stopped_early ("quota" | "budget" | null), revisions: [{topic_number, title, changed, notes}], archived: [{topic_number, title}], error}` (revisions/archived lists capped at 200 entries).
+
+Daily schedule config (`sam-gov-configs/daily_schedule.json`) — written by the SAM.gov Upload UI, read by Cloud Scheduler each morning. `run_id: "daily"` is a sentinel; the job replaces it with a timestamped ID at runtime. `lookback_days` replaces explicit `date_from`/`date_to` — the job computes `date_from = today - N days` at execution time:
+```json
+{
+  "run_id":      "daily",
+  "input_mode":  "api",
+  "api_params": {
+    "lookback_days":   1,
+    "notice_types":    ["p", "o", "k", "r"],
+    "keyword":         "",
+    "max_results":     500,
+    "fetch_desc":      true,
+    "sam_gov_api_key": "..."
+  },
+  "custom_cols": {}
+}
+```
+
+#### Status schema (`sam-gov-jobs/{run_id}/status.json`)
+
+```json
+{
+  "run_id":                "sam_gov_2026-06-01_10-30-00",
+  "rows_fetched":          1000,
+  "rows_passed_screening": 300,
+  "rows_after_dedup":      280,
+  "rows_saved":            280,
+  "rows_revised":          4,
+  "revisions":             [{"topic_number": "...", "title": "...", "changed": true, "notes": "..."}],
+  "gcs_path":              "data/all-topics/processed/SAM-GOV/sam_gov_2026-06-01_abc123.parquet",
+  "error":                 null
+}
+```
+
+`rows_revised`/`revisions` report stored notices that were updated in place because the daily/manual pull carried a new version of them (see Revision handling above). Revision-check runs write the different payload documented under the config schema.
+
+#### One-time setup (run once — skip if job already exists)
+
+The service account and Secret Manager secrets are already configured for `matching-job` and are reused here.
+
+```bash
+gcloud run jobs create sam-gov-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/sam-gov-job:latest \
+  --region us-central1 \
+  --memory 2Gi \
+  --cpu 2 \
+  --task-timeout 14400 \
+  --max-retries 0 \
+  --service-account matching-job@cc-matcher-v1.iam.gserviceaccount.com \
+  --set-secrets=ANTHROPIC_API_KEY=anthropic-api-key:latest \
+  --set-secrets=OPENAI_API_KEY=openai-api-key:latest
+```
+
+#### Build and deploy (run every time `sam_gov_job.py` changes)
+
+Run from the repo root after `git pull origin <branch>`:
+
+```bash
+# Step 1 — write the build config (use heredoc, not printf — avoids YAML parse errors)
+cat > cloudbuild.sam_gov.yaml << 'EOF'
+steps:
+- name: "gcr.io/cloud-builders/docker"
+  args:
+  - "build"
+  - "-t"
+  - "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/sam-gov-job:latest"
+  - "-f"
+  - "jobs/Dockerfile.sam_gov"
+  - "."
+images:
+- "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/sam-gov-job:latest"
+EOF
+
+# Step 2 — build and push
+gcloud builds submit \
+  --config cloudbuild.sam_gov.yaml \
+  .
+
+# Step 3 — update the existing job (image + 4-hour timeout)
+gcloud run jobs update sam-gov-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/sam-gov-job:latest \
+  --task-timeout 14400 \
+  --region us-central1
+```
+
+#### View logs
+
+```bash
+gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=sam-gov-job" \
+  --limit 50 --format "value(textPayload)"
+```
+
+---
+
+### Daily SAM.gov Schedule (Cloud Scheduler)
+
+Cloud Scheduler triggers `sam-gov-job` every morning at 5 AM CST by POSTing to the Cloud Run Jobs API. The job reads `sam-gov-configs/daily_schedule.json` from GCS — all parameter changes are made through the SAM.gov Upload UI and saved to that config; no redeploy is needed.
+
+#### One-time Cloud Scheduler setup (run once in Cloud Shell)
+
+The OAuth service account the Scheduler impersonates (`matching-job@`) must be able to run `sam-gov-job` **with overrides** — the trigger body carries `containerOverrides`, so `roles/run.invoker` is NOT enough (`run.jobs.runWithOverrides` lives in `roles/run.admin`, same as the contact-import-job pattern). Granting the wrong role fails silently: the scheduler reports `status.code: 7` (PERMISSION_DENIED) on every attempt and no Cloud Run execution is ever created, so nothing shows up in the job's execution history.
+
+```bash
+# Allow the scheduler's OAuth service account to run the job with overrides
+gcloud run jobs add-iam-policy-binding sam-gov-job \
+  --region us-central1 \
+  --member="serviceAccount:matching-job@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/run.admin"
+
+# Create the daily trigger. NOTE: the cron expression is interpreted in the
+# job's --time-zone, so "0 5 * * *" + America/Chicago = 5 AM Central year-round.
+gcloud scheduler jobs create http sam-gov-daily \
+  --schedule="0 5 * * *" \
+  --uri="https://run.googleapis.com/v2/projects/cc-matcher-v1/locations/us-central1/jobs/sam-gov-job:run" \
+  --message-body='{"overrides":{"containerOverrides":[{"args":["sam-gov-configs/daily_schedule.json"]}]}}' \
+  --oauth-service-account-email=matching-job@cc-matcher-v1.iam.gserviceaccount.com \
+  --location=us-central1 \
+  --time-zone="America/Chicago"
+```
+
+#### Update the schedule time
+
+```bash
+gcloud scheduler jobs update http sam-gov-daily \
+  --schedule="0 5 * * *" \
+  --location=us-central1
+```
+
+#### Check whether the daily trigger is working
+
+Scheduler-triggered executions appear in the same history as manual ones — Cloud Run → Jobs → sam-gov-job → Executions, or `gcloud run jobs executions list --job sam-gov-job --region us-central1`. The **RUN BY** column distinguishes them: `matching-job@` = Cloud Scheduler, `matcher-app@` = triggered from Streamlit. If no `matching-job@` executions exist, check the scheduler itself: `gcloud scheduler jobs describe sam-gov-daily --location=us-central1` — a non-empty `status.code` (7 = PERMISSION_DENIED) means the trigger is failing before any execution is created.
+
+#### Trigger a manual test run of the daily schedule
+
+```bash
+gcloud scheduler jobs run sam-gov-daily --location=us-central1
+```
+
+#### How the daily run_id works
+
+The daily config uses `"run_id": "daily"` as a sentinel. When `sam_gov_job.py` sees this, it generates a real timestamped ID (`sam_gov_YYYY-MM-DD_HH-MM-SS`) at startup. Status is written to `sam-gov-jobs/sam_gov_{date}/status.json` — each day gets its own status file; no file is overwritten.
+
+---
+
+### `contact-import-job` — build, deploy, and manage
+
+#### `contact-import-job` config schema (`contact-import-configs/{run_id}.json`)
+
+```json
+{
+  "run_id":        "contact_import_2026-06-25_10-30-00_apollo",
+  "source":        "apollo",
+  "file_ext":      ".csv",
+  "csv_blob_path": "contact-import-uploads/contact_import_2026-06-25_10-30-00_apollo.csv",
+  "col_map": {
+    "companyWebsite": "Website URL",
+    "companyName":    "Company Name",
+    "state":          null,
+    "segment":        "Industry",
+    "firstName":      "First Name",
+    "lastName":       "Last Name",
+    "email":          "Email",
+    "phone":          "Phone Number"
+  },
+  "profile_method": "scrape",
+  "research_model": "gpt-5.6-terra",
+  "dedup_all_sources": false
+}
+```
+
+`col_map` values are actual column names from the uploaded file; `null` = unmapped optional field. `file_ext` is `.csv`, `.xlsx`, or `.xls`. `profile_method` is `"scrape"` (default) or `"deep_research"`; `research_model` (deep_research only) is one of the `DEEP_RESEARCH_MODELS`. `dedup_all_sources: true` makes the job's runtime dedup compare against all of `data/all-contacts/` instead of only the source's folder (set automatically by the UI's dedup-scope checkbox; default ON for HubSpot-list pulls).
+
+#### Status schema (`contact-import-jobs/{run_id}/status.json`)
+
+```json
+{
+  "run_id":          "contact_import_2026-06-25_10-30-00_apollo",
+  "rows_fetched":    500,
+  "rows_after_dedup": 450,
+  "rows_scraped_ok": 400,
+  "rows_saved":      400,
+  "gcs_path":        "data/all-contacts/apollo/apollo_2026-06-25_abc123.parquet",
+  "error":           null,
+  "profile_method":  "scrape"
+}
+```
+
+Deep-research runs (`profile_method: "deep_research"`) add: `research_model`, `companies_researched`, `companies_research_ok`, `research_cost_usd` (actual, from `response.usage`). `rows_scraped_ok` then counts rows whose company was successfully researched.
+
+#### Job pipeline (`contact_import_job.py`)
+
+Mostly self-contained, but imports the streamlit-free shared research modules `src/modules/finance_research.py` + `src/modules/tech_research.py` (copied into the image by `Dockerfile.contact_import` along with the empty `src/`/`src/modules/` `__init__.py` files — keep those COPY lines when editing the Dockerfile):
+
+1. Download staged file from `contact-import-uploads/` → parse CSV/Excel
+2. Apply `col_map` → standard fields; strip Excel HYPERLINK formulas via `_strip_hyperlink()`; normalize URLs
+3. Load existing bare domains from `data/all-contacts/{source}/` parquets → filter duplicates
+4. Build company profiles per `profile_method`:
+   - **`scrape`** (default) — async scrape: aiohttp (8 concurrent semaphore) → Playwright fallback with `--no-sandbox --disable-dev-shm-usage` (required in Docker; these args are NOT in `lead_importer._playwright_scrape` — always inline Playwright in the job); then summarize: `ThreadPoolExecutor(max_workers=10)` → `gpt-3.5-turbo`
+   - **`deep_research`** — one background Responses-API Deep Research task per unique bare domain (`research_model` from config, `web_search` tool), polled every 30s with a 6000s deadline (leaves headroom in the 7200s task timeout; deadline-exceeded tasks are cancelled best-effort and their rows skipped). Output parsed via `fr.parse_research_output(fields=tr.ALL_FIELDS)`; per-domain results fan out to all contact rows of that domain — `company_summary` = `tr.build_matching_summary()`, plus `technology_data`/`technology_summary`/`technology_updated_at` columns. Actual cost accumulated from `response.usage`.
+5. Free `raw_df`, `mapped_df`, `new_df` (and scrape-path page text) before embedding (prevents OOM on large imports)
+6. Embed: `ThreadPoolExecutor(max_workers=8)` → `text-embedding-ada-002` with 7500-token tiktoken guard
+7. Save parquet to `data/all-contacts/{source}/{source}_{date}_{hex6}.parquet`
+8. Write `contact-import-jobs/{run_id}/status.json` — deep-research runs add `profile_method`, `research_model`, `companies_researched`, `companies_research_ok`, `research_cost_usd`
+
+**Resource config:** 8 GiB RAM, 2 CPU, 7200s timeout. Playwright runs up to 8 concurrent Chromium processes (~200 MB each); large imports (30k+ rows) require the explicit `del` of page text and summaries before embedding to stay within memory.
+
+#### One-time setup (run once — skip if job already exists)
+
+```bash
+gcloud run jobs create contact-import-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/contact-import-job:latest \
+  --region us-central1 \
+  --memory 8Gi \
+  --cpu 2 \
+  --task-timeout 7200 \
+  --max-retries 0 \
+  --service-account matching-job@cc-matcher-v1.iam.gserviceaccount.com \
+  --set-secrets=OPENAI_API_KEY=openai-api-key:latest
+```
+
+The Streamlit app's service account (`matcher-app@`) needs `roles/run.admin` on the job (not just `run.invoker` — `runWithOverrides` requires the higher role):
+
+```bash
+gcloud run jobs add-iam-policy-binding contact-import-job \
+  --region us-central1 \
+  --member="serviceAccount:matcher-app@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/run.admin"
+```
+
+#### Build and deploy (run every time `contact_import_job.py` changes)
+
+```bash
+# cloudbuild.contact_import.yaml is checked into the repo root — recreate only if missing:
+cat > cloudbuild.contact_import.yaml << 'EOF'
+steps:
+- name: "gcr.io/cloud-builders/docker"
+  args:
+  - "build"
+  - "-t"
+  - "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/contact-import-job:latest"
+  - "-f"
+  - "jobs/Dockerfile.contact_import"
+  - "."
+images:
+- "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/contact-import-job:latest"
+EOF
+
+gcloud builds submit --config cloudbuild.contact_import.yaml .
+
+gcloud run jobs update contact-import-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/contact-import-job:latest \
+  --region us-central1
+```
+
+Note: Playwright + Chromium installation adds ~5–8 minutes to the build vs. other jobs.
+
+#### View logs
+
+```bash
+gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=contact-import-job" \
+  --limit 50 --format "value(textPayload)"
+```
 
 ---
 
@@ -295,51 +965,51 @@ Pass this client into `BucketManager` — never rely on the `GOOGLE_APPLICATION_
 
 ```python
 import io, pandas as pd
+from src.modules.grant_utils import normalize_grant_columns
 
-def load_parquets_from_prefix(bm: BucketManager, prefix: str) -> pd.DataFrame:
-    blobs = bm.storage_client.list_blobs(bm.bucket.name, prefix=prefix)
+def load_parquets_from_prefix(client, bucket: str, prefix: str) -> pd.DataFrame:
+    blobs = client.list_blobs(bucket, prefix=prefix)
     frames = [pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
               for blob in blobs if blob.name.endswith('.parquet')]
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return normalize_grant_columns(df)  # ensures grant_summary is always present
 ```
 
 ### Cosine similarity matching (vectorized)
+
 ```python
-# grant_topics['embeddings'] and contacts['embeddings'] are lists of floats
 import numpy as np
 
-contact_matrix = np.stack(contacts['embeddings'])  # shape: (n_contacts, 1536)
-grant_topics['similarity_scores'] = grant_topics['embeddings'].apply(
-    lambda x: np.dot(contact_matrix, x)
-)
+# Both columns contain list[float] vectors of length 1536
+contact_matrix  = np.stack(contacts['embeddings']).astype(np.float32)   # (n_contacts, 1536)
+grant_embeddings = np.stack(topics['embeddings']).astype(np.float32)    # (n_topics, 1536)
+scores = np.dot(contact_matrix, grant_embeddings.T)                     # (n_contacts, n_topics)
 ```
 
 ### LLM match verification (async Claude)
+
 ```python
-system = "Tell me if this company summary and grant summary are aligned. Only give a one-word answer. Either \"yes\" or \"no\"."
+system = (
+    'You are evaluating whether a company could potentially benefit from or be relevant to a government grant. '
+    'Answer "yes" if there is any reasonable connection, even if indirect. '
+    'Answer "no" only if there is clearly no connection. '
+    'Only respond with a single word: yes or no.'
+)
 response = await anth_client_async.messages.create(
-    model="claude-3-haiku-20240307",
-    max_tokens=10,
-    messages=[{"role": "user", "content": f"Company: {company_summary}\n\nGrant: {grant_summary}"}],
-    system=system
+    model='claude-haiku-4-5-20251001',
+    max_tokens=15,
+    system=system,
+    messages=[{'role': 'user', 'content': f'Company: {company_summary}\n\nGrant: {grant_summary}'}],
 )
 result = response.content[0].text.strip().lower()
 ```
 
-### De-duplicating against recent matches (from GCS)
+### Reading SAM.gov CSVs safely (Windows-1252 encoding)
 
 ```python
-from datetime import datetime, timedelta
-import re, io
-import pandas as pd
-
-def load_recent_matches(bm: BucketManager, days: int = 30) -> pd.DataFrame:
-    cutoff = datetime.now() - timedelta(days=days)
-    blobs  = bm.storage_client.list_blobs(bm.bucket.name, prefix="all-matches/")
-    frames = []
-    for blob in blobs:
-        m = re.search(r'(\d{4}-\d{2}-\d{2})', blob.name)
-        if m and datetime.strptime(m.group(1), '%Y-%m-%d') >= cutoff:
-            frames.append(pd.read_parquet(io.BytesIO(blob.download_as_bytes())))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+try:
+    df = pd.read_csv(f, dtype=str, encoding='utf-8')
+except UnicodeDecodeError:
+    f.seek(0)
+    df = pd.read_csv(f, dtype=str, encoding='latin-1')
 ```

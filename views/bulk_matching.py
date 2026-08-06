@@ -1,0 +1,618 @@
+"""
+Bulk Matching
+-------------
+Writes a job config to GCS, triggers the Cloud Run matching job, then polls
+GCS for status.json until the job completes.
+
+The heavy lifting (scoring, AI validation, email pre-write) happens entirely
+inside the Cloud Run job — this page handles config, topic preview/filtering,
+and monitoring only.
+"""
+
+import io
+import json
+import smtplib
+import time
+import traceback
+import warnings
+from datetime import date, datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from google.cloud import run_v2, storage
+from google.oauth2 import service_account
+
+from src.modules.email_generator import DEFAULT_SUBJECT_SYSTEM, DEFAULT_JOSIAH_SYSTEM
+from src.modules.grant_utils import normalize_grant_columns
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+_BUCKET             = 'cc-matcher-bucket-jeg-v1'
+_CONTACTS_PREFIX    = 'data/all-contacts/'
+_TOPICS_PREFIX      = 'data/all-topics/processed/'
+_RESULTS_PREFIX     = 'matching-results/'
+_JOB_CONFIGS_PREFIX = 'job-configs/'
+_MIN_THRESHOLD      = 0.82
+_JOB_NAME           = 'projects/cc-matcher-v1/locations/us-central1/jobs/matching-job'
+_POLL_INTERVAL      = 8  # seconds between status checks
+
+# All columns available in a matched row — used for custom prompt column picker
+_ALL_COLUMNS = [
+    'company_summary', 'companyName', 'companyWebsite',
+    'firstName', 'lastName', 'email', 'source',
+    'grant_summary', 'title', 'topic_number',
+    'agency', 'broad_agency', 'due_date', 'funding_amount',
+]
+
+
+# ── GCS / auth helpers ────────────────────────────────────────────────────────
+
+def _get_credentials():
+    return service_account.Credentials.from_service_account_info(
+        st.secrets['gcp_service_account']
+    )
+
+
+def _get_storage_client() -> storage.Client:
+    return storage.Client(credentials=_get_credentials())
+
+
+def _list_prefixes(client: storage.Client, prefix: str) -> list[str]:
+    try:
+        blobs = client.list_blobs(_BUCKET, prefix=prefix, delimiter='/')
+        list(blobs)
+        return sorted(p.replace(prefix, '').strip('/') for p in blobs.prefixes)
+    except Exception as e:
+        st.error(f'Failed to list GCS prefixes under `{prefix}`: {e}')
+        return []
+
+
+def _load_topics(client: storage.Client, agencies: list[str]) -> pd.DataFrame:
+    frames = []
+    for agency in agencies:
+        prefix = f'{_TOPICS_PREFIX}{agency}/'
+        for blob in client.list_blobs(_BUCKET, prefix=prefix):
+            if blob.name.endswith('.parquet'):
+                df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+                df['broad_agency'] = agency
+                frames.append(df)
+    frames = [f for f in frames if not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', FutureWarning)
+        return pd.concat(frames, ignore_index=True)
+
+
+# ── Filter helpers ────────────────────────────────────────────────────────────
+
+# Topic dates arrive as strings in mixed formats (ISO from Topic Importer,
+# mm/dd/yyyy from SAM.gov, sometimes with a time suffix) — try each.
+_DATE_FORMATS = ('%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d', '%m-%d-%Y', '%b %d, %Y')
+
+
+def _parse_date_str(value) -> date | None:
+    s = str(value).strip()
+    if not s:
+        return None
+    for fmt in _DATE_FORMATS:
+        for candidate in (s, s[:10]):
+            try:
+                return datetime.strptime(candidate, fmt).date()
+            except ValueError:
+                pass
+    return None
+
+
+def _filter_is_active(f: dict) -> bool:
+    if not f.get('column'):
+        return False
+    if f.get('type') == 'date_range':
+        return bool(f.get('date_from') and f.get('date_to'))
+    return bool(f.get('keyword', '').strip())
+
+
+def _filter_mask(df: pd.DataFrame, f: dict) -> pd.Series:
+    if f.get('type') == 'date_range':
+        d_from, d_to = f['date_from'], f['date_to']
+
+        def _in_range(v) -> bool:
+            d = _parse_date_str(v)
+            return d is not None and d_from <= d <= d_to
+
+        return df[f['column']].map(_in_range)
+    return df[f['column']].astype(str).str.lower().str.contains(
+        f['keyword'].lower(), na=False
+    )
+
+
+def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+    active = [f for f in filters if _filter_is_active(f)]
+    if not active:
+        return df
+    mask = _filter_mask(df, active[0])
+    for f in active[1:]:
+        m = _filter_mask(df, f)
+        mask = (mask & m) if f['operator'] == 'AND' else (mask | m)
+    return df[mask]
+
+
+# ── Job helpers ───────────────────────────────────────────────────────────────
+
+def _write_job_config(client: storage.Client, config: dict) -> str:
+    blob_path = f'{_JOB_CONFIGS_PREFIX}{config["run_id"]}.json'
+    client.bucket(_BUCKET).blob(blob_path).upload_from_string(
+        json.dumps(config), content_type='application/json'
+    )
+    return blob_path
+
+
+def _trigger_job(credentials, config_blob_path: str) -> None:
+    job_client = run_v2.JobsClient(credentials=credentials)
+    job_client.run_job(
+        request=run_v2.RunJobRequest(
+            name=_JOB_NAME,
+            overrides=run_v2.RunJobRequest.Overrides(
+                container_overrides=[
+                    run_v2.RunJobRequest.Overrides.ContainerOverride(
+                        args=[config_blob_path]
+                    )
+                ]
+            ),
+        )
+    )
+
+
+def _poll_status(client: storage.Client, run_id: str) -> dict | None:
+    blob = client.bucket(_BUCKET).blob(f'{_RESULTS_PREFIX}{run_id}/status.json')
+    if not blob.exists():
+        return None
+    return json.loads(blob.download_as_text())
+
+
+def _send_notification_email(to_email: str, run_id: str, success: bool, status: dict) -> None:
+    try:
+        smtp_host = st.secrets.get('smtp_host', 'smtp.gmail.com')
+        smtp_port = int(st.secrets.get('smtp_port', 587))
+        smtp_user = st.secrets['smtp_user']
+        smtp_password = st.secrets['smtp_password']
+    except KeyError:
+        st.warning('SMTP credentials not configured — skipping email notification.')
+        return
+
+    if success:
+        subject = f'Matcher run complete: {run_id}'
+        body = (
+            f'Your matching run has finished.\n\n'
+            f'Run ID: {run_id}\n'
+            f'Rows saved: {status.get("total_saved", "N/A"):,}\n'
+            f'Total candidates: {status.get("total_candidates", "N/A"):,}\n'
+            f'Segments: {status.get("segments", "N/A")}\n'
+        )
+    else:
+        subject = f'Matcher run failed: {run_id}'
+        body = (
+            f'Your matching run encountered an error.\n\n'
+            f'Run ID: {run_id}\n'
+            f'Error: {status.get("error", "Unknown error")}\n'
+        )
+
+    msg = MIMEMultipart()
+    msg['From'] = smtp_user
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, to_email, msg.as_string())
+
+
+# ── Session state ─────────────────────────────────────────────────────────────
+
+for _k in ['bm_active_run', 'bm_run_summary', 'bm_topics_df']:
+    if _k not in st.session_state:
+        st.session_state[_k] = None
+if 'bm_filters' not in st.session_state:
+    st.session_state.bm_filters = [{'column': None, 'type': 'keyword', 'keyword': '', 'operator': 'AND'}]
+if 'bm_custom_prompts' not in st.session_state:
+    st.session_state.bm_custom_prompts = []
+
+
+# ── Page ──────────────────────────────────────────────────────────────────────
+
+st.title('⚙️ Bulk Matching')
+st.caption('Configure a matching run, trigger the Cloud Run job, and monitor progress here.')
+
+# ── Active run: polling UI (blocks the rest of the page) ─────────────────────
+
+if st.session_state.bm_active_run:
+    active = st.session_state.bm_active_run
+    run_id = active['run_id']
+
+    st.subheader('🔄 Run in progress')
+    st.caption(f'Run ID: `{run_id}`')
+
+    try:
+        gcs    = _get_storage_client()
+        status = _poll_status(gcs, run_id)
+
+        if status is None:
+            st.info(f'Job is running… checking again in {_POLL_INTERVAL}s.')
+            if st.button('Cancel monitoring (job keeps running)'):
+                st.session_state.bm_active_run = None
+                st.rerun()
+            time.sleep(_POLL_INTERVAL)
+            st.rerun()
+
+        elif status.get('error'):
+            st.error('Job failed.')
+            st.code(status['error'])
+            if active.get('notify_email'):
+                try:
+                    _send_notification_email(active['notify_email'], run_id, False, status)
+                    st.info(f'Notification sent to {active["notify_email"]}')
+                except Exception as _email_err:
+                    st.warning(f'Could not send notification email: {_email_err}')
+            st.session_state.bm_active_run = None
+
+        else:
+            st.success(
+                f'Run complete — **{status["total_saved"]:,}** rows saved across '
+                f'**{status["segments"]}** segment(s) '
+                f'(from {status["total_candidates"]:,} candidates)'
+            )
+            if active.get('notify_email'):
+                try:
+                    _send_notification_email(active['notify_email'], run_id, True, status)
+                    st.info(f'Notification sent to {active["notify_email"]}')
+                except Exception as _email_err:
+                    st.warning(f'Could not send notification email: {_email_err}')
+            st.session_state.bm_run_summary = status
+            st.session_state.bm_active_run  = None
+
+    except Exception as e:
+        st.error(f'Error polling status: {e}')
+        st.code(traceback.format_exc())
+        if st.button('Stop monitoring'):
+            st.session_state.bm_active_run = None
+            st.rerun()
+
+    st.stop()
+
+
+# ── Section 1 · Contact sources ───────────────────────────────────────────────
+
+st.subheader('1 · Select contact sources')
+
+gcs_client = _get_storage_client()
+
+contact_sources = _list_prefixes(gcs_client, _CONTACTS_PREFIX)
+if not contact_sources:
+    st.warning('No contact sources found in GCS.')
+    st.stop()
+
+src_cols = st.columns(min(len(contact_sources), 6))
+selected_sources = [
+    src
+    for i, src in enumerate(contact_sources)
+    if src_cols[i % len(src_cols)].checkbox(src, value=True, key=f'bm_src_{src}')
+]
+
+# ── Section 2 · Grant topics ──────────────────────────────────────────────────
+
+st.divider()
+st.subheader('2 · Select grant topics')
+
+grant_agencies = _list_prefixes(gcs_client, _TOPICS_PREFIX)
+if not grant_agencies:
+    st.warning('No grant agencies found in GCS.')
+    st.stop()
+
+ag_cols = st.columns(min(len(grant_agencies), 6))
+selected_agencies = [
+    ag
+    for i, ag in enumerate(grant_agencies)
+    if ag_cols[i % len(ag_cols)].checkbox(ag, value=True, key=f'bm_agency_{ag}')
+]
+
+if st.button('Load Topics', type='primary', disabled=not selected_agencies):
+    with st.spinner('Loading grant topics…'):
+        _df = _load_topics(gcs_client, selected_agencies)
+    if _df.empty:
+        st.warning('No topics found for the selected agencies.')
+    else:
+        _df = normalize_grant_columns(_df)
+        _df = _df.drop(columns=['embeddings'], errors='ignore')
+        st.session_state.bm_topics_df  = _df
+        st.session_state.bm_filters    = [{'column': None, 'type': 'keyword', 'keyword': '', 'operator': 'AND'}]
+        st.session_state.bm_run_summary = None
+        st.success(f'Loaded **{len(_df):,}** grant topics.')
+
+if st.session_state.bm_topics_df is not None:
+    _topics_df      = st.session_state.bm_topics_df
+    filterable_cols = list(_topics_df.columns)
+
+    for f in st.session_state.bm_filters:
+        if f['column'] not in filterable_cols:
+            f['column'] = filterable_cols[0] if filterable_cols else None
+
+    for i, f in enumerate(st.session_state.bm_filters):
+        if i == 0:
+            col_sel, mode_col, val_input, remove_col = st.columns([2, 1.4, 3, 0.5])
+        else:
+            op_col, col_sel, mode_col, val_input, remove_col = st.columns([1, 2, 1.4, 3, 0.5])
+            f['operator'] = op_col.radio(
+                'op', ['AND', 'OR'],
+                index=0 if f['operator'] == 'AND' else 1,
+                key=f'bm_op_{i}', horizontal=True, label_visibility='collapsed'
+            )
+        f['column'] = col_sel.selectbox(
+            'Column', filterable_cols,
+            index=filterable_cols.index(f['column']) if f['column'] in filterable_cols else 0,
+            key=f'bm_col_{i}', label_visibility='collapsed'
+        )
+        mode_label = mode_col.selectbox(
+            'Filter type', ['Keyword', 'Date range'],
+            index=1 if f.get('type') == 'date_range' else 0,
+            key=f'bm_type_{i}', label_visibility='collapsed'
+        )
+        f['type'] = 'date_range' if mode_label == 'Date range' else 'keyword'
+        if f['type'] == 'date_range':
+            picked = val_input.date_input(
+                'Date range',
+                value=(
+                    f.get('date_from') or date.today() - timedelta(days=30),
+                    f.get('date_to') or date.today(),
+                ),
+                key=f'bm_dr_{i}', label_visibility='collapsed',
+            )
+            if isinstance(picked, tuple) and len(picked) == 2:
+                f['date_from'], f['date_to'] = picked
+            elif isinstance(picked, tuple) and len(picked) == 1:
+                # Mid-selection: only the start date is chosen so far.
+                f['date_from'], f['date_to'] = picked[0], None
+        else:
+            f['keyword'] = val_input.text_input(
+                'Keyword', value=f.get('keyword', ''),
+                placeholder=f'Filter by {f["column"]}…',
+                key=f'bm_kw_{i}', label_visibility='collapsed'
+            )
+        if remove_col.button('✕', key=f'bm_rm_{i}', disabled=len(st.session_state.bm_filters) == 1):
+            st.session_state.bm_filters.pop(i)
+            st.rerun()
+
+    if st.button('+ Add filter', key='bm_add_filter'):
+        st.session_state.bm_filters.append(
+            {'column': filterable_cols[0], 'type': 'keyword', 'keyword': '', 'operator': 'AND'}
+        )
+        st.rerun()
+
+    _filtered_preview = _apply_filters(_topics_df, st.session_state.bm_filters)
+    st.caption(f'**{len(_filtered_preview):,}** topics match current filters — showing first 50')
+    st.dataframe(_filtered_preview.head(50), use_container_width=True, hide_index=True)
+
+# ── Section 3 · Run options ───────────────────────────────────────────────────
+
+st.divider()
+st.subheader('3 · Run options')
+
+opt_left, opt_mid, _ = st.columns([1, 1, 2])
+with opt_left:
+    threshold = st.slider(
+        'Similarity threshold',
+        min_value=_MIN_THRESHOLD, max_value=1.0,
+        value=_MIN_THRESHOLD, step=0.01,
+    )
+    top_k = st.number_input(
+        'Top-K topics per contact',
+        min_value=1, max_value=50,
+        value=1, step=1,
+    )
+with opt_mid:
+    ai_validation  = st.checkbox('AI validation',  value=True)
+    prewrite_email = st.checkbox('Pre-write email', value=False)
+
+notify_email = st.text_input(
+    'Notify when done (optional)',
+    placeholder='you@example.com',
+    key='bm_notify_email',
+    help='Sends a completion email when the run finishes. Requires smtp_user and smtp_password in secrets.toml.',
+)
+
+# ── Email pre-write settings ──────────────────────────────────────────────────
+
+email_config: dict = {}
+
+if prewrite_email:
+    with st.expander('Email pre-write settings', expanded=True):
+
+        # ── Subject line ──────────────────────────────────────────────────
+        st.markdown('**Subject line**')
+        st.caption('Input columns used: `company_summary`, `agency`')
+        sl_left, sl_right = st.columns([4, 1])
+        with sl_left:
+            subj_prompt = st.text_area(
+                'Prompt template',
+                value=DEFAULT_SUBJECT_SYSTEM,
+                height=110,
+                key='bm_subj_prompt',
+                help='Use `{word_limit}` anywhere in the prompt — it will be replaced with the word count at runtime.',
+            )
+        with sl_right:
+            subj_word_limit = st.number_input(
+                'Word limit', min_value=1, max_value=200,
+                value=15, step=1, key='bm_subj_wl',
+            )
+
+        st.divider()
+
+        # ── AI message ────────────────────────────────────────────────────
+        st.markdown('**AI message**')
+        st.caption('Input columns used: `company_summary`, `grant_summary`')
+        msg_left, msg_right = st.columns([4, 1])
+        with msg_left:
+            msg_prompt = st.text_area(
+                'Prompt template',
+                value=DEFAULT_JOSIAH_SYSTEM,
+                height=160,
+                key='bm_msg_prompt',
+                help='Use `{word_limit}` anywhere in the prompt — it will be replaced with the word count at runtime.',
+            )
+        with msg_right:
+            msg_word_limit = st.number_input(
+                'Word limit', min_value=1, max_value=500,
+                value=15, step=1, key='bm_msg_wl',
+            )
+
+        st.divider()
+
+        # ── Custom prompts ────────────────────────────────────────────────
+        st.markdown('**Custom prompts**')
+
+        for ci, cp in enumerate(st.session_state.bm_custom_prompts):
+            with st.container(border=True):
+                hdr_a, hdr_b, hdr_c = st.columns([2, 1, 0.3])
+                with hdr_a:
+                    cp['output_column'] = st.text_input(
+                        'Output column name',
+                        value=cp.get('output_column', f'custom_{ci + 1}'),
+                        key=f'bm_cp_name_{ci}',
+                        placeholder='e.g. tech_summary',
+                    )
+                with hdr_b:
+                    cp['word_limit'] = st.number_input(
+                        'Word limit', min_value=1, max_value=500,
+                        value=cp.get('word_limit', 30), step=1,
+                        key=f'bm_cp_wl_{ci}',
+                    )
+                with hdr_c:
+                    st.write('')
+                    if st.button('✕', key=f'bm_cp_rm_{ci}'):
+                        st.session_state.bm_custom_prompts.pop(ci)
+                        st.rerun()
+
+                cp['columns'] = st.multiselect(
+                    'Input columns',
+                    options=_ALL_COLUMNS,
+                    default=cp.get('columns', ['company_summary', 'grant_summary']),
+                    key=f'bm_cp_cols_{ci}',
+                )
+                cp['system'] = st.text_area(
+                    'Prompt template',
+                    value=cp.get('system', ''),
+                    height=120,
+                    key=f'bm_cp_sys_{ci}',
+                    placeholder='Describe what you want the AI to write…',
+                    help='Use `{word_limit}` anywhere in the prompt — it will be replaced with the word count at runtime.',
+                )
+
+        if st.button('+ Add custom prompt', key='bm_add_cp'):
+            st.session_state.bm_custom_prompts.append({
+                'output_column': f'custom_{len(st.session_state.bm_custom_prompts) + 1}',
+                'columns': ['company_summary', 'grant_summary'],
+                'system': '',
+                'word_limit': 30,
+            })
+            st.rerun()
+
+    email_config = {
+        'subject_line': {
+            'system':     subj_prompt,
+            'word_limit': int(subj_word_limit),
+        },
+        'ai_message': {
+            'system':     msg_prompt,
+            'word_limit': int(msg_word_limit),
+        },
+        'custom_prompts': [
+            {
+                'output_column': cp['output_column'],
+                'columns':       cp['columns'],
+                'system':        cp['system'],
+                'word_limit':    int(cp['word_limit']),
+            }
+            for cp in st.session_state.bm_custom_prompts
+            if cp.get('output_column', '').strip() and cp.get('system', '').strip()
+        ],
+    }
+
+# ── Run button ────────────────────────────────────────────────────────────────
+
+can_run = bool(selected_sources) and bool(selected_agencies)
+
+if st.button('▶ Run Matching', type='primary', disabled=not can_run):
+    # Serialize active filters (only if topics have been loaded)
+    active_filters = []
+    if st.session_state.bm_topics_df is not None:
+        for f in st.session_state.bm_filters:
+            if not _filter_is_active(f):
+                continue
+            if f.get('type') == 'date_range':
+                active_filters.append({
+                    'column':    f['column'],
+                    'type':      'date_range',
+                    'date_from': f['date_from'].isoformat(),
+                    'date_to':   f['date_to'].isoformat(),
+                    'operator':  f['operator'],
+                })
+            else:
+                active_filters.append({
+                    'column':   f['column'],
+                    'type':     'keyword',
+                    'keyword':  f['keyword'],
+                    'operator': f['operator'],
+                })
+
+    ag_tag  = '-'.join(selected_agencies) if selected_agencies else 'none'
+    src_tag = '-'.join(selected_sources)  if selected_sources  else 'none'
+    run_id  = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_ag-{ag_tag}_src-{src_tag}"
+    config = {
+        'run_id':         run_id,
+        'threshold':      float(threshold),
+        'top_k':          int(top_k),
+        'sources':        selected_sources,
+        'agencies':       selected_agencies,
+        'topic_filters':  active_filters,
+        'ai_validation':  ai_validation,
+        'prewrite_email': prewrite_email,
+        'email_config':   email_config,
+    }
+    try:
+        with st.spinner('Uploading job config to GCS…'):
+            config_blob = _write_job_config(gcs_client, config)
+
+        with st.spinner('Triggering Cloud Run job…'):
+            _trigger_job(_get_credentials(), config_blob)
+
+        st.session_state.bm_active_run  = {
+            'run_id':       run_id,
+            'config_blob':  config_blob,
+            'notify_email': notify_email.strip() or None,
+        }
+        st.session_state.bm_run_summary = None
+        st.rerun()
+
+    except Exception as e:
+        st.error(f'Failed to trigger job: {e}')
+        st.code(traceback.format_exc())
+
+# ── Section 4 · Last run results ─────────────────────────────────────────────
+
+if st.session_state.bm_run_summary:
+    summary = st.session_state.bm_run_summary
+    st.divider()
+    st.subheader('4 · Last run results')
+    st.caption(
+        f'Run ID: `{summary["run_id"]}` · '
+        f'GCS prefix: `{_RESULTS_PREFIX}{summary["run_id"]}/`'
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric('Rows saved',       f'{summary["total_saved"]:,}')
+    c2.metric('Total candidates', f'{summary["total_candidates"]:,}')
+    c3.metric('Segments',         summary['segments'])
