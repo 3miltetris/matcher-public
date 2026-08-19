@@ -5,9 +5,15 @@ Edit the company summary for records in data/all-contacts/clients/ and
 re-embed the new text. Multiple contact rows share one company summary,
 so an edit is applied to every row of the selected company and the
 source parquet file(s) are rewritten in place in GCS.
+
+Admins (see src/modules/access_control.py) additionally get a delete
+section for companies that are no longer clients: it removes every contact
+row of the company, its multi-aspect profile, and its Drive Sync folder
+assignment, archiving the removed rows to data/deleted-clients/ first.
 """
 
 import io
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -15,6 +21,8 @@ import streamlit as st
 from google.cloud import storage
 from google.oauth2 import service_account
 
+import src.modules.access_control as ac
+import src.modules.client_delete as cd
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 
@@ -65,6 +73,21 @@ def _group_mask(df: pd.DataFrame, key: str) -> pd.Series:
     return (names == name) & (websites == website)
 
 
+def _render_delete_report() -> None:
+    """Outcome of the last deletion. Also rendered on the 'no client files'
+    path — deleting the last client company lands there."""
+    report = st.session_state.get('ce_delete_report')
+    if not report:
+        return
+    st.success('Deletion complete.')
+    st.markdown(cd.format_report(report))
+    for err in report['errors']:
+        st.warning(err)
+    if st.button('Dismiss', key='ce_del_dismiss'):
+        st.session_state.ce_delete_report = None
+        st.rerun()
+
+
 # ── Page ───────────────────────────────────────────────────────────────────
 
 st.title('✏️ Client Editor')
@@ -93,6 +116,7 @@ frames: dict[str, pd.DataFrame] = st.session_state.ce_frames
 
 if not frames:
     st.warning(f'No parquet files found under {_CLIENTS_PREFIX} in GCS.')
+    _render_delete_report()
     st.stop()
 
 combined = pd.concat(
@@ -180,43 +204,137 @@ save_btn = st.button(
     help='Edit the summary to enable saving.' if not changed else None,
 )
 
-if not save_btn:
-    st.stop()
-
 # ── Re-embed & write back ──────────────────────────────────────────────────
 
-with st.spinner('Embedding new summary…'):
-    try:
-        tp        = TextProcessor(api_key=st.secrets['openai_api_key'])
-        # float64 to match the dtype of existing rows — pyarrow cannot mix
-        # float32 and float64 ndarrays in one parquet column
-        embedding = np.array(tp.get_embedding(new_summary.strip()), dtype=np.float64)
-    except Exception as e:
-        st.error(f'Embedding failed: {e}')
-        st.stop()
+if save_btn:
+    with st.spinner('Embedding new summary…'):
+        try:
+            tp        = TextProcessor(api_key=st.secrets['openai_api_key'])
+            # float64 to match the dtype of existing rows — pyarrow cannot mix
+            # float32 and float64 ndarrays in one parquet column
+            embedding = np.array(tp.get_embedding(new_summary.strip()), dtype=np.float64)
+        except Exception as e:
+            st.error(f'Embedding failed: {e}')
+            st.stop()
 
-bm = BucketManager(_BUCKET, client=_get_storage_client())
+    bm = BucketManager(_BUCKET, client=_get_storage_client())
 
-rows_updated  = 0
-files_written = []
-for blob_name in group_rows['_blob'].unique():
-    df   = frames[blob_name]
-    mask = _group_mask(df, selected_key)
-    if not mask.any():
-        continue
-    df.loc[mask, 'summary'] = new_summary.strip()
-    for idx in df.index[mask]:
-        df.at[idx, 'embeddings'] = embedding
-    try:
-        bm.upload_file(blob_name, df)
-    except Exception as e:
-        st.error(f'Failed to write {blob_name}: {e}')
-        st.stop()
-    rows_updated += int(mask.sum())
-    files_written.append(blob_name)
+    rows_updated  = 0
+    files_written = []
+    for blob_name in group_rows['_blob'].unique():
+        df   = frames[blob_name]
+        mask = _group_mask(df, selected_key)
+        if not mask.any():
+            continue
+        df.loc[mask, 'summary'] = new_summary.strip()
+        for idx in df.index[mask]:
+            df.at[idx, 'embeddings'] = embedding
+        try:
+            bm.upload_file(blob_name, df)
+        except Exception as e:
+            st.error(f'Failed to write {blob_name}: {e}')
+            st.stop()
+        rows_updated += int(mask.sum())
+        files_written.append(blob_name)
 
-st.success(
-    f'Updated **{rows_updated}** contact row{"s" if rows_updated != 1 else ""} '
-    f'for **{first_row.get("company_name") or website}** and saved to '
-    f'{len(files_written)} file{"s" if len(files_written) != 1 else ""} in GCS.'
+    st.success(
+        f'Updated **{rows_updated}** contact row{"s" if rows_updated != 1 else ""} '
+        f'for **{first_row.get("company_name") or website}** and saved to '
+        f'{len(files_written)} file{"s" if len(files_written) != 1 else ""} in GCS.'
+    )
+
+# ── Delete clients (admin only) ────────────────────────────────────────────
+
+st.divider()
+st.subheader('🗑 Delete clients')
+
+_render_delete_report()
+
+if not ac.is_admin():
+    ac.admin_only_notice('Deleting clients')
+    st.stop()
+
+st.caption(
+    'Removes the company from `data/all-contacts/clients/` entirely — every '
+    'contact row, in every file it appears in. Removed rows are backed up to '
+    f'`{cd.ARCHIVE_PREFIX}` first, so a mistake can be undone by hand.'
 )
+
+# Widget keys are tied to the selected client so switching clients above resets
+# the selection and the confirmation — a stale "[Acme] + DELETE" carried over
+# onto a different company is exactly the mistake this section must not make.
+_del_key   = f'ce_del_keys_{selected_key}'
+_conf_key  = f'ce_del_confirm_{selected_key}'
+
+# Drop selections whose client no longer exists (deleted in an earlier pass)
+# before the widget sees them.
+if _del_key in st.session_state:
+    st.session_state[_del_key] = [
+        k for k in st.session_state[_del_key] if k in labels
+    ]
+
+del_keys = st.multiselect(
+    'Clients to delete',
+    options=list(labels.keys()),
+    default=[selected_key],
+    format_func=lambda k: labels[k],
+    key=_del_key,
+)
+
+opt_l, opt_r = st.columns(2)
+with opt_l:
+    also_profile = st.checkbox(
+        'Also delete their multi-aspect profile', value=True,
+        help='Removes the row from data/client-profiles/profiles.parquet so the '
+             'client disappears from Bulk Aspect Match.',
+    )
+with opt_r:
+    also_drive = st.checkbox(
+        'Also clear their Drive Sync folder assignment', value=True,
+        help='Marks the folder skipped so Drive Sync neither syncs it nor '
+             'proposes it as a new client on the next scan.',
+    )
+
+if del_keys:
+    counts = cd.count_rows(frames, del_keys)
+    st.dataframe(
+        pd.DataFrame([
+            {'client': labels[k].split('  (')[0], 'contact rows': counts.get(k, 0)}
+            for k in del_keys
+        ]),
+        hide_index=True, use_container_width=True,
+    )
+    st.warning(
+        f'This permanently deletes **{sum(counts.values())}** contact row(s) '
+        f'across **{len(del_keys)}** company/companies.'
+    )
+
+confirm = st.text_input(
+    'Type DELETE to confirm', key=_conf_key, placeholder='DELETE',
+)
+
+if st.button(
+    f'🗑 Delete {len(del_keys)} client{"s" if len(del_keys) != 1 else ""} permanently',
+    type='primary',
+    disabled=not del_keys or confirm.strip().upper() != 'DELETE',
+    help='Select at least one client and type DELETE to enable.',
+):
+    with st.spinner('Deleting…'):
+        try:
+            report = cd.delete_clients(
+                _get_storage_client(),
+                del_keys,
+                delete_profiles         = also_profile,
+                clear_drive_assignments = also_drive,
+                actor                   = ac.current_user_email() or 'local-dev',
+            )
+        except Exception as e:
+            st.error(f'Delete failed: {e}')
+            st.code(traceback.format_exc())
+            st.stop()
+
+    st.session_state.ce_delete_report = report
+    st.session_state.pop('ce_frames', None)      # reload clients from GCS
+    st.session_state.pop(_del_key, None)         # deleted keys are no longer options
+    st.session_state.pop(_conf_key, None)
+    st.rerun()

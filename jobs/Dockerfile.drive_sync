@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.drive_sync_job.txt .
+RUN pip install --no-cache-dir -r requirements.drive_sync_job.txt
+
+COPY jobs/drive_sync_job.py jobs/drive_sync_job.py
+
+# Shared streamlit-free modules (also imported by views/drive_sync.py)
+COPY src/__init__.py src/__init__.py
+COPY src/modules/__init__.py src/modules/__init__.py
+COPY src/modules/doc_extract.py src/modules/doc_extract.py
+COPY src/modules/drive_client.py src/modules/drive_client.py
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "jobs/drive_sync_job.py"]

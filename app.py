@@ -3,6 +3,8 @@ import sys
 
 import streamlit as st
 
+import src.modules.access_control as ac
+
 
 @st.cache_resource(show_spinner=False)
 def _install_playwright_browser():
@@ -64,6 +66,9 @@ pages = [
     st.Page("views/contact_importer.py", title="Contact Importer", icon="👤"),
     st.Page("views/client_editor.py",    title="Client Editor",    icon="✏️"),
     st.Page("views/finance_researcher.py", title="Client Research", icon="🧪"),
+    st.Page("views/client_profiler.py",  title="Client Profiles",  icon="🧩"),
+    st.Page("views/aspect_match.py",     title="Bulk Aspect Match", icon="🎯"),
+    st.Page("views/drive_sync.py",       title="Drive Sync",       icon="🗂️"),
     st.Page("views/resume_importer.py", title="Resume Importer",  icon="📄"),
     st.Page("views/resume_search.py",   title="Resume Search",    icon="🔎"),
     # Uncomment as pages are built:
@@ -71,8 +76,15 @@ pages = [
     # st.Page("views/match_history.py",    title="Match History",    icon="📊"),
 ]
 
+# Admin-only page — hidden from the navigation for everyone else. The page
+# guards itself too, so hiding it here is convenience, not the control.
+if ac.is_admin():
+    pages.append(st.Page("views/admin_portal.py", title="Admin Portal", icon="🛡️"))
+
 if st.session_state.get("user_email"):
-    st.sidebar.caption(f"Signed in as {st.session_state.user_email}")
+    st.sidebar.caption(
+        f"Signed in as {st.session_state.user_email} · {ac.role_label()}"
+    )
 
 pg = st.navigation(pages)
 pg.run()

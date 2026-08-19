@@ -16,6 +16,7 @@ Both modes dedupe by companyWebsite → domain and poll the import until done.
 
 import io
 import json
+import re
 import time
 import traceback
 
@@ -113,21 +114,38 @@ def _hs_headers() -> dict:
 
 # ── GCS helpers ───────────────────────────────────────────────────────────────
 
-def _list_completed_runs(client: storage.Client) -> list[str]:
-    blobs = client.list_blobs(_BUCKET, prefix=_RESULTS_PREFIX, delimiter='/')
-    list(blobs)
-    run_ids = sorted(
-        (p.replace(_RESULTS_PREFIX, '').strip('/') for p in blobs.prefixes),
-        reverse=True,
-    )
-    completed = []
-    for run_id in run_ids:
-        blob = client.bucket(_BUCKET).blob(f'{_RESULTS_PREFIX}{run_id}/status.json')
-        if blob.exists():
+def _list_completed_runs(client: storage.Client) -> list[tuple[str, str]]:
+    """
+    Every run with at least one segment CSV, newest first, as (run_id, label).
+    Runs whose status.json is missing (job killed/timed out) or carries an
+    error are still listed — their saved segments are importable — but get a
+    partial-run label so the user knows the results are incomplete.
+    """
+    has_csv, status_blobs = set(), {}
+    for blob in client.list_blobs(_BUCKET, prefix=_RESULTS_PREFIX):
+        rel = blob.name[len(_RESULTS_PREFIX):]
+        if '/' not in rel:
+            continue
+        run_id, filename = rel.split('/', 1)
+        if filename.endswith('.csv'):
+            has_csv.add(run_id)
+        elif filename == 'status.json':
+            status_blobs[run_id] = blob
+    runs = []
+    for run_id in sorted(has_csv, reverse=True):
+        blob = status_blobs.get(run_id)
+        if blob is None:
+            runs.append((run_id, f'{run_id} — ⚠️ partial (no status file — job died or still running)'))
+            continue
+        try:
             status = json.loads(blob.download_as_text())
-            if not status.get('error'):
-                completed.append(run_id)
-    return completed
+        except Exception:
+            status = {}
+        if status.get('error'):
+            runs.append((run_id, f'{run_id} — ⚠️ partial (job errored)'))
+        else:
+            runs.append((run_id, run_id))
+    return runs
 
 
 def _load_run(client: storage.Client, run_id: str) -> pd.DataFrame:
@@ -412,11 +430,22 @@ if st.session_state.hs_mode_last != mode:
 gcs = _gcs_client()
 
 if mode == 'Matching run':
-    with st.spinner('Fetching completed runs from GCS…'):
-        runs = _list_completed_runs(gcs)
-    if not runs:
-        st.warning('No completed matching runs found in GCS.')
+    with st.spinner('Fetching matching runs from GCS…'):
+        matching_runs = _list_completed_runs(gcs)
+    if not matching_runs:
+        st.warning('No matching runs with saved results found in GCS.')
         st.stop()
+    run_labels = dict(matching_runs)
+    run_id = st.selectbox(
+        'Select a run',
+        [r for r, _ in matching_runs],
+        format_func=lambda r: run_labels[r],
+    )
+    if run_labels[run_id] != run_id:
+        st.warning(
+            'This run did not finish cleanly — only the segments saved before it '
+            'stopped will be imported.'
+        )
 else:
     with st.spinner('Fetching financial research runs from GCS…'):
         runs = _list_fin_runs(gcs)
@@ -424,8 +453,7 @@ else:
         st.warning('No completed financial research runs found in GCS. '
                    'Run one from the Client Financials view first.')
         st.stop()
-
-run_id = st.selectbox('Select a completed run', runs)
+    run_id = st.selectbox('Select a completed run', runs)
 
 if st.session_state.hs_run_id != run_id:
     st.session_state.hs_df     = None
@@ -626,8 +654,14 @@ if extra_df_cols:
         'These columns were added during topic import and are not part of the standard HubSpot property set. '
         'Check the ones you want to include — HubSpot properties will be created automatically.'
     )
+    seen_hs_names = set()
     for col in extra_df_cols:
-        hs_name = f'matcher_{col}'
+        # HubSpot property internal names must be lowercase (letters/digits/_)
+        hs_name = 'matcher_' + re.sub(r'[^a-z0-9_]', '_', col.lower())
+        if hs_name in seen_hs_names:
+            st.warning(f'Skipping `{col}` — it maps to `{hs_name}`, already used by another column.')
+            continue
+        seen_hs_names.add(hs_name)
         if st.checkbox(
             f'`{col}` → `{hs_name}`',
             value=True,

@@ -15,7 +15,7 @@ app.py                        # Streamlit entry point — auth gate, playwright 
 packages.txt                  # Streamlit Cloud apt packages (Chromium system libs for Playwright)
 views/
   contact_importer.py         # Upload a lead spreadsheet OR pull a HubSpot company list → map columns → dedup (per-source or all-sources) → pick profiling method (scrape or Deep Research tech focus) → trigger contact-import-job → poll status
-  client_editor.py            # Edit a client company summary → re-embed → rewrite source parquet in data/all-contacts/clients/
+  client_editor.py            # Edit a client company summary → re-embed → rewrite source parquet in data/all-contacts/clients/; admin-only delete of clients (rows + profile + Drive assignment)
   finance_researcher.py       # Client Research — OpenAI Deep Research on client companies, two focuses: financials or technology/R&D, written back onto client rows
   topic_importer.py           # Upload PDF/text solicitations → extract topics → embed → save
   grant_search.py             # Cosine-similarity search across processed grant topics
@@ -25,7 +25,11 @@ views/
   hubspot_import.py           # Import companies to HubSpot via Imports API — from a matching run or a financial research run (per-field mapping)
   resume_importer.py          # Upload HubSpot contacts CSV → fetch resumes by URL → extract text → GPT expertise summary → embed → save
   resume_search.py            # Natural-language search across resume embeddings → ranked candidate list
+  drive_sync.py               # Scan the client Google shared drive → auto-assign folders to clients (fuzzy match, saved assignments) → trigger drive-sync-job → results + new-client review queue
+  client_profiler.py          # Build multi-aspect capability profiles for clients from existing material (website summary, Drive docs, Deep Research) → one embedding per aspect → data/client-profiles/profiles.parquet
+  aspect_match.py             # Bulk multi-aspect match: every client aspect × every selected grant topic → threshold/coverage filter → Claude LLM re-rank → CSV
   suggestions.py              # Team feature-request board with upvoting
+  admin_portal.py             # Admin-only: view/add/remove admins (admin-config/admins.json); super admins are a code constant
 
 src/
   modules/
@@ -39,20 +43,28 @@ src/
     grant_utils.py            # normalize_grant_columns() — coalesces description → grant_summary at load time
     finance_research.py       # Deep Research prompt/schema, JSON parse+repair, digest, cost accounting (Client Research view — financial focus + shared plumbing)
     tech_research.py          # Technology & R&D research schema/prompt/digest (Client Research view — tech focus; reuses finance_research parse/pricing)
+    aspect_profile.py         # Multi-aspect client profile schema/prompt/parse + flat-packed aspect embeddings + profiles.parquet store I/O — shared by Client Profiles + Bulk Aspect Match views
+    access_control.py         # Admin gating for destructive actions — SUPER_ADMINS code constant + admin-config/admins.json; is_admin()/require_admin() (Streamlit-only)
+    client_delete.py          # Streamlit-free client deletion — archive removed rows → rewrite/delete clients parquets → drop profile → park Drive assignment; shared by Client Editor + Client Profiles
+    doc_extract.py            # Streamlit-free document text extraction (PDF/DOCX/XLSX/TXT/CSV) — shared by Drive Sync view + drive-sync-job
+    drive_client.py           # Streamlit-free Google Drive v3 helpers (shared-drive listing, export/download, backoff) — shared by Drive Sync view + drive-sync-job
     lead_importer.py          # Shared scraping/summarization/embedding helpers (reference; not imported by jobs)
 
 jobs/
   matching_job.py             # Cloud Run Job — scoring, AI validation, email pre-write
   sam_gov_job.py              # Cloud Run Job — SAM.gov fetch metadata → screen (title+NAICS) → dedup → fetch descriptions for survivors → summarize → embed → save
   contact_import_job.py       # Cloud Run Job — download staged file → map cols → dedup → profile (scrape+GPT or Deep Research tech focus) → embed → save contacts
+  drive_sync_job.py           # Cloud Run Job — Drive scan per assigned client → diff vs sync_state → extract changed docs → Claude profile merge → write docs columns + re-embed summary
   Dockerfile                  # Image for matching-job (uses requirements.job.txt)
   Dockerfile.sam_gov          # Image for sam-gov-job (uses requirements.sam_gov_job.txt)
   Dockerfile.contact_import   # Image for contact-import-job — python:3.11-slim + Chromium system libs + playwright install chromium; also COPYs src/modules/{finance,tech}_research.py (shared Deep Research schema)
+  Dockerfile.drive_sync       # Image for drive-sync-job — python:3.11-slim, no Chromium; COPYs src/modules/{doc_extract,drive_client}.py
 
-requirements.txt                    # Streamlit app dependencies (includes aiohttp, tldextract, playwright)
+requirements.txt                    # Streamlit app dependencies (includes aiohttp, tldextract, playwright, google-api-python-client, openpyxl)
 requirements.job.txt                # matching-job dependencies (lean — no Streamlit)
 requirements.sam_gov_job.txt        # sam-gov-job dependencies (adds requests, beautifulsoup4, tiktoken, pymupdf)
 requirements.contact_import_job.txt # contact-import-job dependencies (aiohttp, playwright, tldextract, openpyxl, tiktoken, openai, pandas/numpy/pyarrow, GCS)
+requirements.drive_sync_job.txt     # drive-sync-job dependencies (anthropic, openai, google-api-python-client, pymupdf, python-docx, openpyxl, tiktoken)
 ```
 
 ### Pipeline Stages
@@ -104,6 +116,22 @@ requirements.contact_import_job.txt # contact-import-job dependencies (aiohttp, 
 - **Apply** writes three focus-specific columns onto every contact row of each researched company in the clients parquets (rewritten in place): financial focus → `financial_data` (full JSON string), `financial_summary` (digest, no AI call), `financials_updated_at` (ISO date); technology focus → `technology_data`, `technology_summary`, `technology_updated_at`. **Financial runs never modify `summary` or `embeddings`.** Technology runs show a checkbox at apply time (on by default): rewrite each company's matching `summary` from `tech_research.build_matching_summary()` (core tech + approach + capabilities + products/services + use cases + R&D focus + keywords, confidence labels stripped, no AI call) and re-embed it (`text-embedding-ada-002`, float64 to match stored dtype) — this intentionally changes grant matching; uncheck to save research columns only.
 - HubSpot Import's "Financial research run" mode only lists `finance-research-runs/` — technology runs are not currently importable to HubSpot.
 
+**Stage 7 — Drive Sync** (client Google Drive documents → profile updates)
+- **Via Drive Sync view** (`views/drive_sync.py`): the client shared drive is structured root → section folders (`a-h`, `i-p`, …, `nonprofit & nonR&D business`, `internal projects`) → `{Client Name}_INTERNAL` folders (one per client, docs inside recursively). The `internal projects` section is excluded by default.
+- **Setup (one-time):** save the shared drive ID; the drive must have both `matcher-app@` and `matching-job@` service accounts added as **Viewer members** (no domain-wide delegation). Drive access uses `google-api-python-client` with scope `drive.readonly` — the only place in the codebase where credentials are built **with explicit scopes**.
+- **Scan & auto-assign:** list sections → scan chosen sections → each client folder is fuzzy-matched against `company_name` in `data/all-contacts/clients/` (normalize: strip trailing `_INTERNAL`, lowercase, drop punctuation + legal suffixes; tiers: exact → containment (≥5 chars) → `difflib` ratio ≥ 0.87 with ≥ 0.05 margin). Matches are saved to `drive-sync-configs/assignments.json` (`folder_id → {client_key, match_type: auto|manual}`); unmatched folders go to a review table (`st.data_editor` — assign to any client, mark "new client", or skip). Rescans never overwrite existing assignments.
+- **Sync (one click):** select assigned clients (default all) → `drive-sync-job` Cloud Run Job lists each client's folder recursively, diffs file `modifiedTime` against `drive-sync-configs/sync_state.json` (unchanged clients cost zero downloads/LLM calls; "Full re-scan" checkbox bypasses), extracts changed docs (Google Docs/Sheets/Slides exported; PDF/DOCX/XLSX/TXT/CSV binaries ≤15 MB via `src/modules/doc_extract.py`; caps: 40 docs / 150k chars per client, overflow deferred to next run), then one Claude (`claude-sonnet-4-6`) merge call per changed client: current `summary` + prior `client_docs_data` + new doc texts → `{no_meaningful_change, updated_summary, docs_digest, extracted}`. Writes `client_docs_data` (JSON) / `client_docs_summary` (digest) / `docs_updated_at` (ISO date) onto every contact row of the client; rewrites `summary` + re-embeds (`text-embedding-ada-002`, float64) **only when the change is meaningful**. Touched parquets + sync_state + interim status checkpoint every 10 clients (re-trigger resumes after timeout). Dry-run mode reports without writing.
+- **New clients:** unassigned folders produce proposals (name/summary/digest) in the status payload. **Website extraction:** business email/URL domains are harvested around each proposal folder — Drive share permissions (`permissions.list` on the folder, weight ×3), file `lastModifyingUser` emails (×2), and emails/URLs in doc text (×1) — with freemail/our-own/gov domains filtered out. The top candidates are passed to Claude as `candidate_domains` (it may pick one that clearly belongs to the company); if Claude leaves the website empty, a deterministic fallback fills it when a domain stem matches the company/folder name (exact → containment → acronym → difflib ≥ 0.8, frequency tie-break) — `website_source` records `claude` vs `domain_match`, and `candidate_domains` ships in the proposal for UI hints. Websites are never invented beyond these signals. The view's review queue requires a website per approval (**proposals with a pre-filled website are pre-checked for approval**), embeds in Streamlit, writes rows (clients convention: `company_name`/`summary`) to a new `data/all-contacts/clients/drive_sync_{date}_{hex6}.parquet`, and converts the folder into a normal assignment.
+
+**Stage 8 — Multi-aspect profiling & matching** (clients → per-aspect embeddings → re-ranked client×topic matches)
+
+A client's single blended `summary` embedding averages away everything except its dominant theme, so a company with three unrelated capability areas matches poorly on all three. Stage 8 splits each client into a handful of independently embedded aspects and matches per aspect.
+
+- **Via Client Profiles view** (`views/client_profiler.py`): reads only material that already exists on the client rows — website summary/scrape (`summary`, `full_text`/`page_text`), Drive extractions (`client_docs_summary` + `client_docs_data.extracted`), and Deep Research output (`technology_data`, `financial_data`) — per-source include checkboxes (financials off by default, since it describes money not capability). Material is read per company as the **first non-empty value across its contact rows** (a partially-updated file can leave some rows blank) and capped per source (~8k–14k chars). One Claude call per client (`claude-sonnet-4-6` default, Haiku optional, one strict-JSON retry) returns `{profile_summary, aspects:[{label, kind, text, keywords, evidence}]}` — 2–8 aspects, each an independently searchable capability/technology/product/domain/market, grounded only in the supplied material. Each aspect's `label + text + keywords` is embedded (`text-embedding-ada-002`) and the profile is saved as **one row per company** to `data/client-profiles/profiles.parquet`. Aspects are editable in the view (`st.data_editor`) with a re-embed-and-save button, plus delete.
+- **Staleness:** each profile stores a `source_fingerprint` (sha256 over *all* available source texts, not just the ones used). The view recomputes it live and flags profiles ⚠️ stale when the client's website/Drive/research material has changed since the build; the picker pre-selects stale + unprofiled clients. Clients with no material at all are listed separately, not offered.
+- **Nothing is written to the client parquets** — profiles live in their own store, so Client Editor / Client Research / Drive Sync keep rewriting client rows freely.
+- **Via Bulk Aspect Match view** (`views/aspect_match.py`): select profiled clients + grant agencies (same keyword/date filter UI as Grant Search), then one numpy matmul per client scores its `(n_aspects, 1536)` matrix against the topic matrix. A topic qualifies for a client when its **best** aspect score clears the threshold and at least `min_hits` aspects clear it (default 1 — a client's aspects are alternative capabilities, not conjunctive requirements of one query, unlike Grant Search's multi-aspect mode; raise it to demand topics spanning several capabilities). Top-K topics per client are kept with the winning aspect attributed (`aspect_label`, `aspect_score`, `aspects_hit`, and a per-aspect `aspect_scores` JSON). Survivors are re-ranked 1–5 by Claude (async `AsyncAnthropic`, 15 concurrent, exponential backoff on 429/529) with the matched aspect text + profile summary + topic as context; unparseable/failed pairs get score 0 and are reported, never silently promoted. Rows ≥ the minimum LLM score are shown, downloadable as CSV, and saved to `aspect-match-results/{run_id}/results.csv`. Scoring and re-ranking run **in the Streamlit process** — the page must stay open; above 2,500 re-rank calls a confirmation checkbox is required.
+
 ---
 
 ## Streamlit Views
@@ -111,7 +139,7 @@ requirements.contact_import_job.txt # contact-import-job dependencies (aiohttp, 
 | File | Title | Purpose |
 |------|-------|---------|
 | `views/contact_importer.py` | Contact Importer | Upload any lead spreadsheet **or** pull a HubSpot company list (lists search → memberships → batch company read) → map columns → dedup preview vs GCS (per-source or all-sources scope) → choose profiling method (🌐 scrape+GPT summary or 🔬 Deep Research technology focus, with model picker + cost estimate + >$50 confirmation) → stage file + trigger `contact-import-job` Cloud Run Job → poll `contact-import-jobs/{run_id}/status.json` |
-| `views/client_editor.py` | Client Editor | Select a company from `data/all-contacts/clients/` → edit its `summary` → re-embed (float64, matching stored dtype) → apply to all contact rows of that company → rewrite the source parquet in place |
+| `views/client_editor.py` | Client Editor | Select a company from `data/all-contacts/clients/` → edit its `summary` → re-embed (float64, matching stored dtype) → apply to all contact rows of that company → rewrite the source parquet in place. **Admins only:** a "🗑 Delete clients" section (multiselect + type-DELETE confirmation) removes companies that are no longer clients — every contact row, their aspect profile, and their Drive Sync assignment |
 | `views/finance_researcher.py` | Client Research | Select clients from `data/all-contacts/clients/` → pick research focus (💰 Financials / 🔬 Technology & R&D) → launch background Deep Research tasks (one per company) → poll `finance-research-runs/` or `tech-research-runs/` `{run_id}/state.json` → review parsed results → apply `financial_data`/`financial_summary`/`financials_updated_at` or `technology_data`/`technology_summary`/`technology_updated_at` back onto client rows |
 | `views/topic_importer.py` | Topic Importer | Upload PDF or paste text → Claude extracts topics → editable table → embed + save to `processed/` |
 | `views/grant_search.py` | Grant Search | Select agencies, apply keyword filters, embed a tech description, find matching topics by cosine similarity |
@@ -121,7 +149,11 @@ requirements.contact_import_job.txt # contact-import-job dependencies (aiohttp, 
 | `views/hubspot_import.py` | HubSpot Import | Two source modes: **Matching run** (concatenate segment CSVs → standard `matcher_*` properties) or **Financial research run** (load `finance-research-runs/{run_id}/state.json` → per-field mapping table: each financial field → existing HubSpot property or auto-created `matcher_fin_*`). Both submit as company imports via `/crm/v3/imports` (dedup by `domain`) and poll for completion |
 | `views/resume_importer.py` | Resume Importer | Upload HubSpot contacts CSV with resume URL column → dedup by email → fetch files (PDF/DOCX) via HubSpot Bearer auth → extract text → GPT expertise summary → embed → save to `data/resumes/` |
 | `views/resume_search.py` | Resume Search | Natural-language query → embed → cosine similarity against resume parquets → ranked candidate cards + CSV export. Supports an optional include keyword (single term) and comma-separated exclude keywords to pre-filter the resume pool before scoring. |
+| `views/drive_sync.py` | Drive Sync | Scan the client Google shared drive (sections → `{Client}_INTERNAL` folders) → fuzzy auto-assign folders to clients with persistent assignments (`drive-sync-configs/assignments.json`) + review table → one-click trigger of `drive-sync-job` (incremental via `sync_state.json`) → poll `drive-sync-jobs/{run_id}/status.json` → results + new-client review queue (approve with website → rows created in `data/all-contacts/clients/`) |
+| `views/client_profiler.py` | Client Profiles | Directory of client companies with the source material available per client (website / Drive / technology / financials) and profile status (none / current / ⚠️ stale by `source_fingerprint`) → pick clients + sources + target aspect count + model → one Claude call per client → embed each aspect → save to `data/client-profiles/profiles.parquet`. Second section reviews/edits a profile's aspects (`st.data_editor`) and re-embeds, or deletes it (delete is admin-only). **Admins only:** a third section bulk-deletes profiles, with an opt-in checkbox to delete the clients' contact rows too |
+| `views/aspect_match.py` | Bulk Aspect Match | Select profiled clients + grant agencies + filters → per-client matmul of aspect vectors against topic vectors → keep topics clearing the threshold on ≥ `min_hits` aspects, top-K per client → async Claude re-rank 1–5 with the matched aspect as context → results table + CSV download + `aspect-match-results/{run_id}/results.csv`. Runs in-process (keep the page open) |
 | `views/suggestions.py` | Suggestions | Team feature-request board — submit by name, upvote once per session; stored as JSON blobs in `suggestions/` |
+| `views/admin_portal.py` | Admin Portal | **Admins only** (and hidden from the navigation for everyone else) — lists the code-constant super admins, then lets a **super admin** add/remove admins in `admin-config/admins.json` with an append-only change history. Non-super admins see the list read-only |
 
 ---
 
@@ -137,7 +169,10 @@ requirements.contact_import_job.txt # contact-import-job dependencies (aiohttp, 
 | `email_generator.py` | `async_generate_subject_line`, `async_josiah_copy` | Async email copy generation. Subject line tries GPT-4o-mini first, falls back to Claude Haiku on 429. Both functions accept async client objects passed in from the caller. |
 | `grant_utils.py` | `normalize_grant_columns` | Call this whenever a topics DataFrame is loaded. Ensures `grant_summary` is always present: renames `description` → `grant_summary` if the column is absent, or fills empty `grant_summary` values from `description` if both exist. |
 | `finance_research.py` | `FIELD_SECTIONS`, `build_research_prompt`, `parse_research_output`, `build_financial_digest`, `response_cost_usd` | Deep Research helpers for the Client Research view (financial focus + shared plumbing) — 54-field output schema, prompt builder, JSON extract + `gpt-4o-mini` repair (`parse_research_output` takes an optional `fields=` list so it can normalize either focus's schema), headline digest (no AI call), and per-response cost from `usage`. Model IDs (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`) drift — verify against developers.openai.com/api/docs/models on API errors. |
+| `aspect_profile.py` | `SOURCES`, `assemble_source_texts`, `source_fingerprint`, `build_aspect_system`, `build_aspect_user_message`, `parse_aspect_response`, `aspect_embed_text`, `pack_embeddings`/`unpack_embeddings`, `build_profile_record`, `load_profiles`/`save_profiles`/`upsert_profiles`/`delete_profile`, `company_key` | Multi-aspect client profiles (Stage 8). Streamlit-free: pulls source material off client rows per source, fingerprints it for staleness, builds the aspect-generation prompt, parses/normalizes Claude's JSON (unknown `kind` → `capability`, duplicate labels dropped, ≤ `MAX_ASPECTS`), and owns the `data/client-profiles/profiles.parquet` store. **Aspect vectors are stored flat** (`aspect_embeddings` = `n_aspects × embedding_dim` float64 in one list column) — a flat double list round-trips through parquet without nested-list dtype ambiguity; always read them back via `unpack_embeddings()`. |
 | `tech_research.py` | `FIELD_SECTIONS`, `ALL_FIELDS`, `build_research_prompt`, `build_tech_digest`, `build_matching_summary` | Technology & R&D research schema/prompt/digest for the Client Research view's tech focus — ~40-field output (core technology, products, R&D activity, patents, TRL/maturity, differentiation, grant-alignment keywords). `build_matching_summary()` assembles embedding-ready text (confidence labels stripped) for the optional summary-rewrite at apply time. Reuses finance_research's models, pricing, and JSON parse/repair. |
+| `access_control.py` | `SUPER_ADMINS`, `current_user_email`, `is_admin`, `is_super_admin`, `role_label`, `require_admin`, `admin_only_notice`, `load_admins`/`save_admins`/`admin_emails` | Admin gating for the delete actions and the Admin Portal. Identity is the IAP email `app.py` puts in `st.session_state.user_email`; the admin list lives in `admin-config/admins.json` (cached per session — a newly added admin must reload the page). `SUPER_ADMINS` is a code constant: not editable from the UI, never stored in the JSON, and the only role allowed to change the list. A GCS read failure grants nothing beyond the super admins. Streamlit-only. |
+| `client_delete.py` | `delete_clients`, `count_rows`, `key_mask`, `format_report`, `ARCHIVE_PREFIX` | Streamlit-free client deletion shared by Client Editor and Client Profiles. Re-reads the clients parquets from GCS (never the view's session copy), **archives every removed row to `data/deleted-clients/` before writing anything** — a failed archive aborts the whole delete — then rewrites each touched parquet (deleting the blob outright when no rows remain), drops the company's `profiles.parquet` row, and moves its Drive Sync folder assignment to `skipped` so the next scan neither syncs nor re-proposes it. Per-target failures land in `report['errors']`, not exceptions. |
 
 ### Resume Importer — 5-step UI flow
 
@@ -197,7 +232,24 @@ URL normalization (adds `https://` if missing) happens at mapping time. The job 
 | `scraped_at` | str | ISO date of processing |
 | `uuid` | str | Unique record ID |
 
-Rows may additionally carry Deep Research columns — financial focus (Client Research view, `data/all-contacts/clients/` only): `financial_data` (JSON string of the full 54-field Deep Research output), `financial_summary` (human-readable digest), `financials_updated_at` (ISO date); technology focus (Client Research view on clients, or any source imported via the Contact Importer's `deep_research` profiling method): `technology_data` (JSON string of the ~40-field tech research output), `technology_summary` (digest), `technology_updated_at` (ISO date). For deep-research imports, `company_summary` holds `tech_research.build_matching_summary()` output (not a scraped-page GPT summary) and `embeddings` is its vector.
+Rows may additionally carry Deep Research columns — financial focus (Client Research view, `data/all-contacts/clients/` only): `financial_data` (JSON string of the full 54-field Deep Research output), `financial_summary` (human-readable digest), `financials_updated_at` (ISO date); technology focus (Client Research view on clients, or any source imported via the Contact Importer's `deep_research` profiling method): `technology_data` (JSON string of the ~40-field tech research output), `technology_summary` (digest), `technology_updated_at` (ISO date). For deep-research imports, `company_summary` holds `tech_research.build_matching_summary()` output (not a scraped-page GPT summary) and `embeddings` is its vector. Client rows updated by Drive Sync additionally carry `client_docs_data` (JSON: extracted fields + source_files + last_run), `client_docs_summary` (plain-text digest), and `docs_updated_at` (ISO date).
+
+### Multi-aspect client profile (parquet, `data/client-profiles/profiles.parquet`)
+One row per client company — written by the Client Profiles view, read by Bulk Aspect Match. Never written to the client contact parquets.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `company_key` | str | **Join key** — `{company_name}\|\|{companyWebsite}`, the same identity used by Client Editor / Client Research / Drive Sync (`aspect_profile.company_key()`) |
+| `company_name` / `companyWebsite` | str | Copied from the client rows at build time |
+| `profile_summary` | str | 2–4 sentence company summary. Context for the LLM re-ranker — **not embedded** |
+| `aspects` | str | JSON array of `{label, kind, text, keywords, evidence}`; `kind` ∈ technology/capability/product/domain/market. Read with `profile_aspects()` |
+| `aspect_labels` | str | `' \| '`-joined labels, for display without parsing the JSON |
+| `n_aspects` / `embedding_dim` | int | Shape of the packed vectors (dim is 1536 for `text-embedding-ada-002`) |
+| `aspect_embeddings` | list[float] | **Flat** `n_aspects × embedding_dim` float64 vectors of each aspect's `label + text + keywords`. Read with `unpack_embeddings()` — never index this directly |
+| `sources_used` | str | Comma-separated source keys actually included in the build (`website`, `drive`, `technology`, `financials`) |
+| `source_fingerprint` | str | sha256[:16] over **all** available source texts at build time — mismatch against a live recompute means the profile is stale |
+| `model` | str | Aspect-generation model; manually edited profiles get ` + manual edit` appended once |
+| `built_at` | str | ISO date of the build or last edit |
 
 ### Grant topic record (parquet, `data/all-topics/processed/`)
 | Field | Type | Notes |
@@ -290,6 +342,15 @@ cc-matcher-bucket-jeg-v1/
         free_alert_2026-03-01_c1d8a2.parquet
     resumes/
       resumes_2026-06-24_a3f9c1.parquet   # individual resume records, deduped by email
+    client-profiles/
+      profiles.parquet                  # multi-aspect client profiles, one row per company (overwritten in place on every build/edit/delete — not versioned)
+    deleted-clients/                    # backups written before any client deletion — restore source if a delete was a mistake
+      deleted_2026-08-19_a3f9c1.parquet # the removed rows + _deleted_from / _deleted_at / _deleted_by columns
+  admin-config/
+    admins.json                         # {admins: [email], updated_at, updated_by, history: [{at, by, note}]} — super admins are NOT in here (code constant)
+  aspect-match-results/                 # Bulk Aspect Match runs (written from Streamlit, no job)
+    aspect_match_2026-08-18_15-30-00/
+      results.csv
   job-configs/                          # matching-job configs
     2026-04-16_10-30-00_ag-DOD-HHS_src-apollo.json
   matching-results/
@@ -312,6 +373,13 @@ cc-matcher-bucket-jeg-v1/
     contact_import_2026-06-25_10-30-00_apollo.json
   contact-import-jobs/                  # contact-import-job completion status
     contact_import_2026-06-25_10-30-00_apollo/
+      status.json
+  drive-sync-configs/                   # Drive Sync state + job configs
+    assignments.json                  # drive_id + folder_id → client_key assignments (+ unassigned/skipped) — overwritten on save
+    sync_state.json                   # files: file_id → modifiedTime last synced (incremental diffing) + proposed: folder_id → last-proposed date (proposal rotation cursor); advanced only by non-dry runs
+    drive_sync_2026-08-11_15-30-00.json  # per-run job config
+  drive-sync-jobs/                      # drive-sync-job completion status
+    drive_sync_2026-08-11_15-30-00/
       status.json
   finance-research-runs/                # Client Research run checkpoints — financial focus
     finres_2026-07-29_10-30-00/
@@ -474,6 +542,27 @@ openai_key = os.environ['OPENAI_API_KEY']
 
 ---
 
+## Access Control (admins & destructive actions)
+
+Everything in the app is open to the whole team except the **destructive** actions, which are admin-gated by `src/modules/access_control.py`:
+
+| Action | Where | Required role |
+|--------|-------|---------------|
+| Delete clients (contact rows + profile + Drive assignment) | Client Editor → "🗑 Delete clients" | admin |
+| Delete a single aspect profile | Client Profiles → section 2 | admin |
+| Bulk-delete profiles (± their contact rows) | Client Profiles → section 3 | admin |
+| Add / remove admins | Admin Portal | **super admin** |
+| Everything else (imports, matching, research, Drive Sync, edits) | — | any signed-in user |
+
+- **Identity** is the IAP-verified email that `app.py` writes to `st.session_state.user_email`. No email (the local-dev `app_password` fallback) counts as super admin — that path is unreachable behind IAP.
+- **Super admins** are the `SUPER_ADMINS` tuple in `access_control.py` (currently `john@bwcoconsulting.com`). To change them, edit the constant and redeploy — they are deliberately not editable from the UI and are never written to `admins.json`.
+- **Admins** live in `admin-config/admins.json`, managed in the Admin Portal (append-only `history` records who changed what). The list is cached in session state (the navigation checks it on every rerun), so a newly added admin sees their new rights after a page reload.
+- A failed read of `admins.json` grants nothing beyond the super admins.
+- Every deletion archives the removed rows to `data/deleted-clients/deleted_{date}_{hex6}.parquet` **before** anything is rewritten, and a failed archive write aborts the delete — that file is the only way back, since parquets are rewritten in place.
+- Both delete paths call `client_delete.delete_clients()`, which re-reads the clients parquets from GCS rather than trusting the view's session copy.
+
+---
+
 ## Naming Conventions
 
 - **Files:** `snake_case.py`
@@ -554,6 +643,7 @@ Two Cloud Run Jobs run the heavy pipeline work so Streamlit never hits memory or
 | `matching-job` | `jobs/matching_job.py` | `jobs/Dockerfile` | `requirements.job.txt` | Bulk Matching view |
 | `sam-gov-job` | `jobs/sam_gov_job.py` | `jobs/Dockerfile.sam_gov` | `requirements.sam_gov_job.txt` | SAM.gov Upload view (manual) + Cloud Scheduler (daily) |
 | `contact-import-job` | `jobs/contact_import_job.py` | `jobs/Dockerfile.contact_import` | `requirements.contact_import_job.txt` | Contact Importer view |
+| `drive-sync-job` | `jobs/drive_sync_job.py` | `jobs/Dockerfile.drive_sync` | `requirements.drive_sync_job.txt` | Drive Sync view |
 
 ### `matching-job` config schema (`job-configs/{run_id}.json`)
 
@@ -954,6 +1044,95 @@ Note: Playwright + Chromium installation adds ~5–8 minutes to the build vs. ot
 
 ```bash
 gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=contact-import-job" \
+  --limit 50 --format "value(textPayload)"
+```
+
+---
+
+### `drive-sync-job` — build, deploy, and manage
+
+#### `drive-sync-job` config schema (`drive-sync-configs/{run_id}.json`)
+
+```json
+{
+  "run_id":                "drive_sync_2026-08-11_15-30-00",
+  "drive_id":              "0ABc...",
+  "folder_ids":            ["<assigned client folder ids to sync>"],
+  "new_client_folder_ids": ["<unassigned folder ids to propose>"],
+  "full_resync":           false,
+  "dry_run":               false,
+  "max_docs_per_client":   40,
+  "per_client_char_cap":   150000,
+  "max_proposals":         40,
+  "model":                 "claude-sonnet-4-6"
+}
+```
+
+The job resolves `folder_ids → client_key` through `drive-sync-configs/assignments.json` and groups multi-folder clients into one unit of work. `full_resync` bypasses the `sync_state.json` modifiedTime diff; `dry_run` reports outcomes without touching parquets or sync_state. **Time budget:** the job stops gracefully ~10 min before the 7200s task timeout (`stopped_early: "timeout"`), deferring remaining clients/proposals to the next run — a hard timeout kill would lose un-checkpointed work and leave no status file. When proposal candidates exist, the client phase gets a tighter deadline (90s reserved per planned proposal, capped at half the budget) so a heavy client sweep can't starve the proposals phase. **Proposal cap + rotation:** at most `max_proposals` new-client proposals per run (each ≈1 min: folder download + Claude call); candidates are ordered never-proposed-first then least-recently-proposed via the `proposed` cursor in `sync_state.json` (advanced on non-dry runs only), so a large unassigned backlog drains across successive runs instead of re-proposing the same chunk.
+
+#### Status schema (`drive-sync-jobs/{run_id}/status.json`)
+
+```json
+{
+  "run_id": "...", "state": "complete", "dry_run": false, "stopped_early": null,
+  "clients_total": 42, "clients_updated": 17, "clients_unchanged": 22, "clients_errored": 3,
+  "files_scanned": 812, "files_changed": 63,
+  "files_skipped": [{"name": "big.pdf", "reason": ">15MB"}],
+  "results": [{"client_key": "...", "folder_ids": ["..."], "outcome": "updated|unchanged|error|deferred",
+               "files_processed": 4, "summary_changed": true, "note": ""}],
+  "new_client_proposals": [{"folder_id": "...", "folder_name": "...", "proposed_name": "...",
+                             "proposed_website": "", "website_source": "claude|domain_match|",
+                             "candidate_domains": ["acme.com"], "proposed_summary": "...",
+                             "docs_summary": "...", "docs_data": "{...}", "error": null}],
+  "proposals_deferred": 0,
+  "error": null
+}
+```
+
+`state: "running"` payloads are written at every 10-client checkpoint (`clients_done`/`clients_total`) and after **every** proposal (`proposals_done`/`proposals_total` + accumulated `new_client_proposals`) so the UI shows progress and a mid-run kill never loses completed proposal work; `files_skipped` is capped at 200 entries. `stopped_early: "timeout"` + `outcome: "deferred"` rows / `proposals_deferred` mean the time budget or proposal cap hit — re-running the same selection continues where it left off (already-synced files are skipped via `sync_state.json`). **Permanently unextractable files** (image-only PDFs, oversized exports, 404 shortcut targets — reasons matching `_PERMANENT_SKIP_MARKERS`) are marked synced with a `skip_reason` so they stop burning budget on every run; a Full re-scan retries them.
+
+#### One-time setup (run once — skip if job already exists)
+
+```bash
+# Drive API must be enabled on the project (done 2026-08-11)
+gcloud services enable drive.googleapis.com --project cc-matcher-v1
+
+gcloud run jobs create drive-sync-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/drive-sync-job:latest \
+  --region us-central1 \
+  --memory 2Gi \
+  --cpu 2 \
+  --task-timeout 7200 \
+  --max-retries 0 \
+  --service-account matching-job@cc-matcher-v1.iam.gserviceaccount.com \
+  --set-secrets=ANTHROPIC_API_KEY=anthropic-api-key:latest \
+  --set-secrets=OPENAI_API_KEY=openai-api-key:latest \
+  --project cc-matcher-v1
+
+# Streamlit's service account needs run.admin for runWithOverrides (same as contact-import-job)
+gcloud run jobs add-iam-policy-binding drive-sync-job \
+  --region us-central1 \
+  --member="serviceAccount:matcher-app@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/run.admin" \
+  --project cc-matcher-v1
+```
+
+**Manual Drive step (Google Drive UI, not gcloud):** add both `matcher-app@cc-matcher-v1.iam.gserviceaccount.com` and `matching-job@cc-matcher-v1.iam.gserviceaccount.com` as **Viewer members of the client shared drive**. Without this the view's "List sections" returns nothing and the job 404s on every folder.
+
+#### Build and deploy (run every time `drive_sync_job.py`, `doc_extract.py`, or `drive_client.py` changes)
+
+```bash
+gcloud builds submit --config cloudbuild.drive_sync.yaml --project cc-matcher-v1 .
+
+gcloud run jobs update drive-sync-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/drive-sync-job:latest \
+  --region us-central1 --project cc-matcher-v1
+```
+
+#### View logs
+
+```bash
+gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=drive-sync-job" \
   --limit 50 --format "value(textPayload)"
 ```
 
