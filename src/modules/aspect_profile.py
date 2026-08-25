@@ -123,6 +123,38 @@ def company_key(row) -> str:
     return f'{name}||{website}'
 
 
+# ── Per-company material row ────────────────────────────────────────────────
+
+# Columns that can carry profile source material. Shared by the Client
+# Profiles view (directory + staleness) and client-profile-job (build).
+MATERIAL_COLS = [
+    'company_name', 'companyWebsite', 'state',
+    'summary', 'company_summary', 'full_text', 'page_text',
+    'client_docs_summary', 'client_docs_data',
+    'technology_data', 'technology_summary',
+    'financial_data', 'financial_summary',
+]
+
+
+def first_nonempty(values):
+    """First value that isn't null-ish, or None."""
+    for v in values:
+        if _s(v):
+            return v
+    return None
+
+
+def merge_company_row(group) -> dict:
+    """One representative dict per company. Research/docs columns are written
+    to every contact row of a company, but a partially-updated file can leave
+    some rows blank — take the first non-empty value per column."""
+    out: dict = {}
+    for col in MATERIAL_COLS:
+        if col in group.columns:
+            out[col] = first_nonempty(group[col].tolist())
+    return out
+
+
 # ── Source material extraction ──────────────────────────────────────────────
 
 def _website_text(row) -> str:

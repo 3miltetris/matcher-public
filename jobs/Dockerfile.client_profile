@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.client_profile_job.txt .
+RUN pip install --no-cache-dir -r requirements.client_profile_job.txt
+
+COPY jobs/client_profile_job.py jobs/client_profile_job.py
+
+# Shared streamlit-free modules (also imported by views/client_profiler.py).
+# aspect_profile pulls the research field lists from {finance,tech}_research
+# and the profile store I/O from BucketManager — keep all four COPY lines.
+COPY src/__init__.py src/__init__.py
+COPY src/modules/__init__.py src/modules/__init__.py
+COPY src/modules/aspect_profile.py src/modules/aspect_profile.py
+COPY src/modules/finance_research.py src/modules/finance_research.py
+COPY src/modules/tech_research.py src/modules/tech_research.py
+COPY src/modules/GoogleBucketManager/bucket_manager.py src/modules/GoogleBucketManager/bucket_manager.py
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "jobs/client_profile_job.py"]

@@ -15,6 +15,12 @@ client rows without touching profiles. When a client's source material
 changes, its profile is flagged ⚠️ stale (source fingerprint mismatch) and
 can be rebuilt.
 
+Building runs in the `client-profile-job` Cloud Run Job (this view writes a
+config to client-profile-configs/ and polls client-profile-jobs/{run_id}/
+status.json) so a large batch neither ties up the Streamlit process nor dies
+with the browser tab. Editing a single profile still re-embeds in-process —
+that's one company and a handful of embeddings.
+
 The Bulk Aspect Match view consumes these profiles.
 
 Deleting is admin-gated (src/modules/access_control.py): section 3 bulk-deletes
@@ -24,13 +30,14 @@ data/deleted-clients/ first — see src/modules/client_delete.py).
 """
 
 import io
+import json
+import time
 import traceback
-from datetime import date
+from datetime import date, datetime
 
-import anthropic
 import pandas as pd
 import streamlit as st
-from google.cloud import storage
+from google.cloud import run_v2, storage
 from google.oauth2 import service_account
 
 import src.modules.access_control as ac
@@ -42,29 +49,57 @@ from src.modules.Embedding.text_embedder import TextProcessor
 
 _BUCKET         = ap.BUCKET
 _CLIENTS_PREFIX = ap.CLIENTS_PREFIX
-
-# Columns that can carry profile source material — read per company as the
-# first non-empty value across its contact rows.
-_MATERIAL_COLS = [
-    'company_name', 'companyWebsite', 'state',
-    'summary', 'company_summary', 'full_text', 'page_text',
-    'client_docs_summary', 'client_docs_data',
-    'technology_data', 'technology_summary',
-    'financial_data', 'financial_summary',
-]
+_CFG_PREFIX     = 'client-profile-configs/'
+_STATUS_PREFIX  = 'client-profile-jobs/'
+_JOB_NAME       = 'projects/cc-matcher-v1/locations/us-central1/jobs/client-profile-job'
+_POLL_INTERVAL  = 10
+_JOB_WORKERS    = 4
 
 _STATUS_NONE    = '— none'
 _STATUS_CURRENT = '✅ current'
 _STATUS_STALE   = '⚠️ stale'
 
 
-# ── GCS ────────────────────────────────────────────────────────────────────
+# ── GCS / Cloud Run ────────────────────────────────────────────────────────
 
-def _get_storage_client() -> storage.Client:
-    creds = service_account.Credentials.from_service_account_info(
+def _get_credentials():
+    return service_account.Credentials.from_service_account_info(
         st.secrets['gcp_service_account']
     )
-    return storage.Client(credentials=creds)
+
+
+def _get_storage_client() -> storage.Client:
+    return storage.Client(credentials=_get_credentials())
+
+
+def _write_config(client: storage.Client, config: dict) -> str:
+    blob_path = f"{_CFG_PREFIX}{config['run_id']}.json"
+    client.bucket(_BUCKET).blob(blob_path).upload_from_string(
+        json.dumps(config), content_type='application/json'
+    )
+    return blob_path
+
+
+def _trigger_job(credentials, config_blob_path: str) -> None:
+    run_v2.JobsClient(credentials=credentials).run_job(
+        request=run_v2.RunJobRequest(
+            name=_JOB_NAME,
+            overrides=run_v2.RunJobRequest.Overrides(
+                container_overrides=[
+                    run_v2.RunJobRequest.Overrides.ContainerOverride(
+                        args=[config_blob_path]
+                    )
+                ]
+            ),
+        )
+    )
+
+
+def _poll_status(client: storage.Client, run_id: str) -> dict | None:
+    blob = client.bucket(_BUCKET).blob(f'{_STATUS_PREFIX}{run_id}/status.json')
+    if not blob.exists():
+        return None
+    return json.loads(blob.download_as_text())
 
 
 def _load_client_frames() -> tuple[dict[str, pd.DataFrame], list[str]]:
@@ -83,27 +118,6 @@ def _load_client_frames() -> tuple[dict[str, pd.DataFrame], list[str]]:
 
 # ── Directory assembly ─────────────────────────────────────────────────────
 
-def _first_nonempty(values):
-    for v in values:
-        if v is None:
-            continue
-        s = str(v).strip()
-        if s and s.lower() not in ('nan', 'none', 'not found', '-'):
-            return v
-    return None
-
-
-def _merged_row(group: pd.DataFrame) -> dict:
-    """One representative dict per company. Research/docs columns are written
-    to every contact row of a company, but a partially-updated file can leave
-    some rows blank — take the first non-empty value per column."""
-    out: dict = {}
-    for col in _MATERIAL_COLS:
-        if col in group.columns:
-            out[col] = _first_nonempty(group[col].tolist())
-    return out
-
-
 def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataFrame:
     stored = {}
     if not profiles.empty:
@@ -112,7 +126,7 @@ def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataF
 
     rows = []
     for key, group in combined.groupby('_key', sort=False):
-        merged    = _merged_row(group)
+        merged    = ap.merge_company_row(group)
         available = ap.assemble_source_texts(merged)
         fp        = ap.source_fingerprint(available)
         prof      = stored.get(key)
@@ -144,7 +158,7 @@ def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataF
     ).reset_index(drop=True)
 
 
-# ── Claude ─────────────────────────────────────────────────────────────────
+# ── Delete report ──────────────────────────────────────────────────────────
 
 def _render_delete_report() -> None:
     """Outcome of the last bulk delete. Rendered in section 3, and also on the
@@ -161,34 +175,9 @@ def _render_delete_report() -> None:
         st.rerun()
 
 
-def _claude_aspects(
-    anth: anthropic.Anthropic, model: str, system: str, user_msg: str
-) -> tuple[str, list[dict]]:
-    """Aspect generation with one strict-JSON retry."""
-    last_err = None
-    for attempt in range(2):
-        content = user_msg if attempt == 0 else (
-            user_msg + '\n\nYour previous response was not valid JSON. '
-                       'Return ONLY the valid JSON object.'
-        )
-        resp = anth.messages.create(
-            model=model,
-            max_tokens=4000,
-            system=system,
-            messages=[{'role': 'user', 'content': content}],
-        )
-        if resp.stop_reason == 'max_tokens':
-            raise ValueError('Claude hit the output token limit')
-        try:
-            return ap.parse_aspect_response(resp.content[0].text)
-        except ValueError as e:
-            last_err = e
-    raise ValueError(f'invalid response twice: {last_err}')
-
-
 # ── Session state ──────────────────────────────────────────────────────────
 
-for _k in ['cp_frames', 'cp_profiles', 'cp_build_summary']:
+for _k in ['cp_frames', 'cp_profiles', 'cp_build_summary', 'cp_active_run']:
     if _k not in st.session_state:
         st.session_state[_k] = None
 # Bumped after every build so the picker's checkbox state resets instead of
@@ -205,6 +194,63 @@ st.caption(
     'website summary, Drive documents, and Deep Research already on their rows — '
     'and embed each aspect separately for multi-aspect grant matching.'
 )
+
+# ── Active run polling ─────────────────────────────────────────────────────
+# Placed before the GCS loads below so a poll cycle costs one small status
+# read rather than re-downloading every client parquet every 10 seconds.
+
+if st.session_state.cp_active_run:
+    run_id = st.session_state.cp_active_run
+    st.subheader('🔄 Profile build in progress')
+    st.caption(f'Run ID: `{run_id}`')
+    try:
+        status = _poll_status(_get_storage_client(), run_id)
+        if status is None or status.get('state') == 'running':
+            done  = (status or {}).get('clients_done', 0)
+            total = (status or {}).get('clients_total', 0)
+            if total:
+                st.progress(done / total, text=f'{done}/{total} clients profiled')
+            else:
+                st.info(f'Job is starting… checking again in {_POLL_INTERVAL}s.')
+            if st.button('Cancel monitoring (job keeps running)'):
+                st.session_state.cp_active_run = None
+                st.rerun()
+            time.sleep(_POLL_INTERVAL)
+            st.rerun()
+        elif status.get('state') == 'error' or status.get('error'):
+            st.error('Profile build job failed.')
+            st.code(status.get('error') or 'unknown error', language='text')
+            if st.button('Dismiss'):
+                st.session_state.cp_active_run = None
+                st.rerun()
+        else:
+            st.session_state.cp_build_summary = {
+                'built':    [b.get('company_name') or '—' for b in status.get('built') or []],
+                'errors':   list(status.get('errors') or []),
+                'deferred': list(status.get('deferred') or []),
+                'run_id':   run_id,
+                'dry_run':  bool(status.get('dry_run')),
+            }
+            st.session_state.cp_active_run   = None
+            st.session_state.cp_profiles     = None   # rebuilt store — reload
+            st.session_state.cp_build_nonce += 1
+            st.rerun()
+    except Exception as e:
+        st.error(f'Error polling status: {e}')
+        st.code(traceback.format_exc())
+        if st.button('Stop monitoring'):
+            st.session_state.cp_active_run = None
+            st.rerun()
+    st.stop()
+
+with st.expander('Resume monitoring a previous build job'):
+    resume_id = st.text_input(
+        'Run ID', key='cp_resume_run_id',
+        placeholder='client_profile_2026-08-19_10-30-00',
+    )
+    if st.button('Check status', key='cp_resume_btn') and resume_id.strip():
+        st.session_state.cp_active_run = resume_id.strip()
+        st.rerun()
 
 col_reload, col_info = st.columns([1, 5])
 with col_reload:
@@ -341,8 +387,10 @@ if not view.empty:
     ].tolist()
 
     st.caption(
-        f'**{len(selected_keys)}** selected · one Claude call and '
-        f'{target_aspects} embeddings per client.'
+        f'**{len(selected_keys)}** selected · one Claude call and up to '
+        f'{target_aspects} embeddings per client, run in the '
+        '`client-profile-job` Cloud Run Job — you can leave this page once it '
+        'starts and resume monitoring by run ID.'
     )
 
     if st.button(
@@ -350,75 +398,26 @@ if not view.empty:
         type='primary',
         disabled=not selected_keys or not include_keys,
     ):
-        by_key = {r['_key']: r for _, r in directory.iterrows()}
+        run_id = f"client_profile_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         try:
-            anth = anthropic.Anthropic(api_key=st.secrets['anthropic_api_key'])
-            tp   = TextProcessor(api_key=st.secrets['openai_api_key'])
+            config = {
+                'run_id':         run_id,
+                'company_keys':   selected_keys,
+                'sources':        include_keys,
+                'target_aspects': int(target_aspects),
+                'model':          model,
+                'concurrency':    _JOB_WORKERS,
+                'dry_run':        False,
+            }
+            with st.spinner('Writing job config…'):
+                config_blob_path = _write_config(_get_storage_client(), config)
+            with st.spinner('Triggering Cloud Run job…'):
+                _trigger_job(_get_credentials(), config_blob_path)
+            st.session_state.cp_active_run = run_id
+            st.rerun()
         except Exception as e:
-            st.error(f'Could not initialise API clients: {e}')
-            st.stop()
-
-        records: list[dict] = []
-        errors:  list[str]  = []
-        total = len(selected_keys)
-        prog  = st.progress(0.0, text='Starting…')
-
-        for i, key in enumerate(selected_keys, 1):
-            entry = by_key[key]
-            name  = entry['company']
-            prog.progress((i - 1) / total, text=f'{name} ({i}/{total})')
-
-            texts = ap.assemble_source_texts(entry['_row'], include_keys)
-            if not texts:
-                errors.append(f'{name}: none of the selected sources have material')
-                continue
-            try:
-                summary, aspects = _claude_aspects(
-                    anth, model,
-                    ap.build_aspect_system(target_aspects),
-                    ap.build_aspect_user_message({
-                        'company_name': entry['company'],
-                        'website':      entry['website'],
-                        'state':        entry['_row'].get('state'),
-                    }, texts),
-                )
-                vectors = [tp.get_embedding(ap.aspect_embed_text(a)) for a in aspects]
-                records.append(ap.build_profile_record(
-                    company_key     = key,
-                    company_name    = entry['company'],
-                    website         = entry['website'],
-                    profile_summary = summary,
-                    aspects         = aspects,
-                    vectors         = vectors,
-                    sources_used    = list(texts.keys()),
-                    # Fingerprint over ALL available material, not just the
-                    # sources used — any later change should read as stale.
-                    fingerprint     = entry['_fingerprint'],
-                    model           = model,
-                ))
-            except Exception as e:
-                errors.append(f'{name}: {e}')
-
-            prog.progress(i / total, text=f'{name} ({i}/{total})')
-
-        prog.empty()
-
-        if records:
-            try:
-                merged = ap.upsert_profiles(profiles, records)
-                ap.save_profiles(_get_storage_client(), merged)
-                st.session_state.cp_profiles = merged
-            except Exception as e:
-                st.error(f'Profiles built but saving to GCS failed: {e}')
-                st.code(traceback.format_exc())
-                st.stop()
-
-        st.session_state.cp_build_summary = {
-            'built':  [r['company_name'] for r in records],
-            'errors': errors,
-        }
-        st.session_state.cp_build_nonce += 1
-        st.rerun()
+            st.error(f'Failed to start the profile build job: {e}')
+            st.code(traceback.format_exc())
 
 if not no_material.empty:
     with st.expander(f'{len(no_material)} client(s) with no profilable material'):
@@ -437,6 +436,16 @@ if st.session_state.cp_build_summary:
         st.success(
             f'Built **{len(summary["built"])}** profile'
             f'{"s" if len(summary["built"]) != 1 else ""} → `{ap.PROFILES_BLOB}`'
+            + (f'  ·  run `{summary["run_id"]}`' if summary.get('run_id') else '')
+        )
+    elif not summary['errors']:
+        st.info('The job finished without building any profiles.')
+    if summary.get('deferred'):
+        st.warning(
+            f'{len(summary["deferred"])} client(s) hit the job time budget and were '
+            'not profiled — build them again to finish: '
+            + ', '.join(summary['deferred'][:20])
+            + ('…' if len(summary['deferred']) > 20 else '')
         )
     for err in summary['errors']:
         st.warning(err)

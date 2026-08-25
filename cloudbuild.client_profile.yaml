@@ -1,0 +1,11 @@
+steps:
+- name: "gcr.io/cloud-builders/docker"
+  args:
+  - "build"
+  - "-t"
+  - "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/client-profile-job:latest"
+  - "-f"
+  - "jobs/Dockerfile.client_profile"
+  - "."
+images:
+- "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/client-profile-job:latest"

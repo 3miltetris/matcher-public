@@ -35,6 +35,8 @@ Config schema:
   "dry_run":               false,
   "max_docs_per_client":   40,
   "per_client_char_cap":   150000,
+  "max_proposals":         40,
+  "task_timeout_s":        14400,
   "model":                 "claude-sonnet-4-6"
 }
 """
@@ -81,7 +83,11 @@ _DEFAULT_MODEL      = 'claude-sonnet-4-6'
 # Graceful time budget: stop before Cloud Run's hard task timeout kills the
 # container (which would lose all un-checkpointed work AND the status file,
 # leaving the UI polling forever). Deferred work is picked up by the next run.
-_TASK_TIMEOUT_S     = 7_200
+# The window comes from the config (`task_timeout_s`, chosen in the view) and
+# must never exceed the deployed --task-timeout, which is Cloud Run's 24 h max.
+_DEFAULT_TASK_TIMEOUT_S = 7_200
+_MIN_TASK_TIMEOUT_S     = 900
+_MAX_TASK_TIMEOUT_S     = 86_400
 _DEADLINE_MARGIN_S  = 600
 _DEFAULT_MAX_PROPOSALS = 40
 # When proposal candidates exist, the client phase may not eat the whole
@@ -458,9 +464,15 @@ def main(config_blob_path: str) -> None:
     max_props    = int(config.get('max_proposals', _DEFAULT_MAX_PROPOSALS))
     model        = config.get('model', _DEFAULT_MODEL)
 
-    work_budget_s = _TASK_TIMEOUT_S - _DEADLINE_MARGIN_S
+    task_timeout_s = max(_MIN_TASK_TIMEOUT_S,
+                         min(int(config.get('task_timeout_s',
+                                            _DEFAULT_TASK_TIMEOUT_S)),
+                             _MAX_TASK_TIMEOUT_S))
+    work_budget_s = task_timeout_s - _DEADLINE_MARGIN_S
     deadline      = time.monotonic() + work_budget_s
     stopped_early = None
+    print(f'Time budget: {work_budget_s}s of a {task_timeout_s}s task timeout.',
+          flush=True)
 
     # Client phase gets a tighter deadline when proposals are planned
     n_props_planned = min(len(new_folders), max_props)
@@ -828,6 +840,8 @@ def main(config_blob_path: str) -> None:
         'state':             'complete',
         'dry_run':           dry_run,
         'stopped_early':     stopped_early,
+        'task_timeout_s':    task_timeout_s,
+        'max_proposals':     max_props,
         'clients_total':     total_groups,
         'clients_updated':   clients_updated,
         'clients_unchanged': clients_unchanged,

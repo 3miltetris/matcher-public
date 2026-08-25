@@ -24,7 +24,7 @@ import string
 import time
 import traceback
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
 import numpy as np
@@ -44,9 +44,23 @@ _CLIENTS_PREFIX  = 'data/all-contacts/clients/'
 _CFG_PREFIX      = 'drive-sync-configs/'
 _STATUS_PREFIX   = 'drive-sync-jobs/'
 _ASSIGN_BLOB     = 'drive-sync-configs/assignments.json'
+_SYNC_STATE_BLOB = 'drive-sync-configs/sync_state.json'
 _JOB_NAME        = 'projects/cc-matcher-v1/locations/us-central1/jobs/drive-sync-job'
 _POLL_INTERVAL   = 10
 _SYNC_MODEL      = 'claude-sonnet-4-6'
+
+# Cloud Run task timeout options (the job is deployed with the 24 h maximum and
+# stops itself ~10 min before whichever budget is chosen here).
+_TIME_BUDGETS = {
+    '1 hour':   3_600,
+    '2 hours':  7_200,
+    '4 hours':  14_400,
+    '8 hours':  28_800,
+    '12 hours': 43_200,
+    '24 hours': 86_400,
+}
+_DEFAULT_BUDGET_LABEL = '4 hours'
+_STALE_DAYS = 30
 
 _DEFAULT_EXCLUDED_SECTIONS = ['internal projects']
 
@@ -125,6 +139,37 @@ def _save_assignments(client: storage.Client, doc: dict) -> None:
     client.bucket(_BUCKET).blob(_ASSIGN_BLOB).upload_from_string(
         json.dumps(doc), content_type='application/json'
     )
+
+
+def _load_sync_state(client: storage.Client) -> dict:
+    """File-history state written by the job: {'files': {file_id: {...}},
+    'proposed': {folder_id: last-proposed date}}. Read-only here — used to show
+    what has actually been synced so the selection can be made deliberately."""
+    blob = client.bucket(_BUCKET).blob(_SYNC_STATE_BLOB)
+    if not blob.exists():
+        return {'files': {}, 'proposed': {}}
+    try:
+        doc = json.loads(blob.download_as_text())
+    except Exception:
+        return {'files': {}, 'proposed': {}}
+    doc.setdefault('files', {})
+    doc.setdefault('proposed', {})
+    return doc
+
+
+def _folder_sync_index(sync_state: dict) -> tuple[dict[str, str], dict[str, int]]:
+    """(folder_id → latest synced_at, folder_id → files tracked)."""
+    last: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for meta in (sync_state.get('files') or {}).values():
+        fid = meta.get('folder_id')
+        if not fid:
+            continue
+        counts[fid] = counts.get(fid, 0) + 1
+        synced = str(meta.get('synced_at') or '')
+        if synced > last.get(fid, ''):
+            last[fid] = synced
+    return last, counts
 
 
 def _write_config(client: storage.Client, config: dict) -> str:
@@ -536,22 +581,137 @@ if not assign_doc['assignments'] and not assign_doc['unassigned']:
     st.info('No folders assigned yet — scan sections above first.')
     st.stop()
 
-assigned_keys = sorted(
-    {a['client_key'] for a in assign_doc['assignments'].values() if a.get('client_key')},
-    key=lambda k: client_labels.get(k, k).lower(),
-)
+sync_state = _load_sync_state(gcs)
+folder_last_sync, folder_file_counts = _folder_sync_index(sync_state)
+proposed_state: dict = sync_state.get('proposed') or {}
+
+client_folders: dict[str, list[str]] = {}
+for _fid, _a in assign_doc['assignments'].items():
+    if _a.get('client_key'):
+        client_folders.setdefault(_a['client_key'], []).append(_fid)
+
+assigned_keys = sorted(client_folders,
+                       key=lambda k: client_labels.get(k, k).lower())
+
+client_last_sync = {
+    k: max((folder_last_sync.get(f, '') for f in fids), default='')
+    for k, fids in client_folders.items()
+}
+client_tracked = {
+    k: sum(folder_file_counts.get(f, 0) for f in fids)
+    for k, fids in client_folders.items()
+}
+_stale_before = (date.today() - timedelta(days=_STALE_DAYS)).isoformat()
+
+# ── Client selection ───────────────────────────────────────────────────────
+
+st.markdown('**Clients to sync**')
+
+# Quick-select buttons run before the multiselect is created, so writing its
+# session-state key here is what sets the widget's value for this run.
+qs1, qs2, qs3, qs4, _qs5 = st.columns([1, 1, 1.4, 1.8, 4])
+_quick = None
+if qs1.button('All', key='ds_pick_all'):
+    _quick = assigned_keys
+if qs2.button('None', key='ds_pick_none'):
+    _quick = []
+if qs3.button('Never synced', key='ds_pick_never',
+              help='Clients with no synced documents on record.'):
+    _quick = [k for k in assigned_keys if not client_last_sync.get(k)]
+if qs4.button(f'Stale (> {_STALE_DAYS} days)', key='ds_pick_stale',
+              help=f'Never synced, or last synced more than {_STALE_DAYS} days ago.'):
+    _quick = [k for k in assigned_keys
+              if client_last_sync.get(k, '') < _stale_before]
+if _quick is not None:
+    st.session_state.ds_sync_pick = _quick
+    st.rerun()
+
+# Keep the stored selection valid if assignments changed since it was made
+st.session_state.ds_sync_pick = [
+    k for k in st.session_state.get('ds_sync_pick', assigned_keys)
+    if k in client_folders
+]
+
+
+def _client_option_label(key: str) -> str:
+    last = client_last_sync.get(key) or 'never synced'
+    n_f  = len(client_folders.get(key, []))
+    return (f"{client_labels.get(key, key)}  ·  {last}"
+            f"  ·  {n_f} folder{'s' if n_f != 1 else ''}")
+
 
 sync_selection = st.multiselect(
     'Clients to sync',
     options=assigned_keys,
-    default=assigned_keys,
-    format_func=lambda k: client_labels.get(k, k),
+    format_func=_client_option_label,
     key='ds_sync_pick',
-    help='Default: all assigned clients. Only clients with new or changed Drive '
-         'documents cost anything — unchanged clients are skipped for free.',
+    label_visibility='collapsed',
+    help='Pick exactly the clients to process. Only clients with new or changed '
+         'Drive documents cost anything — unchanged clients are skipped for free.',
 )
 
-opt1, opt2, opt3 = st.columns(3)
+with st.expander(f'📊 Sync status of all {len(assigned_keys)} assigned clients'):
+    st.dataframe(
+        pd.DataFrame([{
+            'client':       client_labels.get(k, k),
+            'folders':      len(client_folders[k]),
+            'files tracked': client_tracked.get(k, 0),
+            'last synced':  client_last_sync.get(k) or '—',
+            'selected':     k in set(sync_selection),
+        } for k in assigned_keys]),
+        hide_index=True, use_container_width=True,
+    )
+
+# ── New-client proposal selection ──────────────────────────────────────────
+
+unassigned_ids = sorted(
+    assign_doc['unassigned'].keys(),
+    key=lambda f: str(assign_doc['unassigned'][f].get('folder_name', '')).lower(),
+)
+
+new_folder_ids: list[str] = []
+if unassigned_ids:
+    st.markdown('**New clients to profile** '
+                f'({len(unassigned_ids)} unassigned folders)')
+
+    ps1, ps2, ps3, _ps4 = st.columns([1, 1, 1.6, 6.4])
+    _pquick = None
+    if ps1.button('All', key='ds_prop_all'):
+        _pquick = unassigned_ids
+    if ps2.button('None', key='ds_prop_none'):
+        _pquick = []
+    if ps3.button('Never proposed', key='ds_prop_never',
+                  help='Folders that have never produced a proposal.'):
+        _pquick = [f for f in unassigned_ids if not proposed_state.get(f)]
+    if _pquick is not None:
+        st.session_state.ds_prop_pick = _pquick
+        st.rerun()
+
+    if 'ds_prop_pick' not in st.session_state:
+        st.session_state.ds_prop_pick = [
+            f for f in unassigned_ids if not proposed_state.get(f)]
+    st.session_state.ds_prop_pick = [
+        f for f in st.session_state.ds_prop_pick if f in assign_doc['unassigned']]
+
+    def _prop_option_label(fid: str) -> str:
+        meta = assign_doc['unassigned'].get(fid, {})
+        last = proposed_state.get(fid)
+        return (f"{meta.get('folder_name', fid)}  ·  {meta.get('section', '')}"
+                f"  ·  {'last proposed ' + last if last else 'never proposed'}")
+
+    new_folder_ids = st.multiselect(
+        'Unassigned folders to build a proposed profile from',
+        options=unassigned_ids,
+        format_func=_prop_option_label,
+        key='ds_prop_pick',
+        label_visibility='collapsed',
+        help='Each selected folder costs a folder download + one Claude call '
+             '(~1 min). Defaults to folders never proposed before.',
+    )
+
+# ── Run options ────────────────────────────────────────────────────────────
+
+opt1, opt2, opt3 = st.columns([1, 1, 2])
 with opt1:
     full_resync = st.checkbox(
         'Full re-scan', key='ds_full_resync',
@@ -561,20 +721,38 @@ with opt2:
         'Dry run', key='ds_dry_run',
         help='Report what would change — no profile writes, no file-history updates.')
 with opt3:
-    include_new = st.checkbox(
-        'Propose new clients', value=True, key='ds_include_new',
-        help='Also process unassigned folders and return new-client proposals for review.')
+    budget_label = st.selectbox(
+        'Time budget', options=list(_TIME_BUDGETS.keys()),
+        index=list(_TIME_BUDGETS).index(_DEFAULT_BUDGET_LABEL),
+        key='ds_time_budget',
+        help='How long the job may run before it stops gracefully and defers the '
+             'rest. The Cloud Run task timeout is 24 h — anything up to that is '
+             'safe; longer budgets just let one run finish more clients.')
+budget_s = _TIME_BUDGETS[budget_label]
+
+with st.expander('⚙️ Advanced — per-client document caps'):
+    a1, a2 = st.columns(2)
+    with a1:
+        max_docs = st.number_input(
+            'Max documents per client', min_value=1, max_value=200, value=40,
+            step=5, key='ds_max_docs',
+            help='Newest-first. Documents past the cap are deferred to the next run.')
+    with a2:
+        char_cap = st.number_input(
+            'Max characters per client', min_value=20_000, max_value=600_000,
+            value=150_000, step=10_000, key='ds_char_cap',
+            help='Total extracted text sent to Claude for one client.')
 
 sel_folder_ids = [fid for fid, a in assign_doc['assignments'].items()
                   if a.get('client_key') in set(sync_selection)]
-new_folder_ids = list(assign_doc['unassigned'].keys()) if include_new else []
 
 st.caption(
     f'**{len(sync_selection)}** clients ({len(sel_folder_ids)} folders) will be '
     f'checked for changed documents'
     + (f'; **{len(new_folder_ids)}** unassigned folders will produce new-client '
        f'proposals' if new_folder_ids else '')
-    + '. Changed documents are merged into profiles by Claude and re-embedded.'
+    + f'. Time budget: **{budget_label}**. '
+      'Changed documents are merged into profiles by Claude and re-embedded.'
 )
 
 if st.button('🚀 Sync', type='primary', key='ds_sync_btn',
@@ -588,9 +766,12 @@ if st.button('🚀 Sync', type='primary', key='ds_sync_btn',
             'new_client_folder_ids': new_folder_ids,
             'full_resync':           bool(full_resync),
             'dry_run':               bool(dry_run),
-            'max_docs_per_client':   40,
-            'per_client_char_cap':   150_000,
-            'max_proposals':         40,
+            'max_docs_per_client':   int(max_docs),
+            'per_client_char_cap':   int(char_cap),
+            # Explicitly selected folders are all honoured — the time budget is
+            # the only thing that can defer them.
+            'max_proposals':         max(len(new_folder_ids), 1),
+            'task_timeout_s':        budget_s,
             'model':                 _SYNC_MODEL,
         }
         with st.spinner('Writing job config…'):
@@ -624,10 +805,13 @@ n_deferred_props = status.get('proposals_deferred', 0)
 if status.get('stopped_early') or n_deferred_props:
     parts = []
     if status.get('stopped_early'):
-        parts.append('the run hit its time budget and stopped early')
+        budget_h = (status.get('task_timeout_s') or 0) / 3600
+        parts.append('the run hit its time budget'
+                     + (f' ({budget_h:g} h)' if budget_h else '')
+                     + ' and stopped early')
     if n_deferred_props:
         parts.append(f'{n_deferred_props} new-client folders were deferred '
-                     f'(max 40 proposals per run)')
+                     f"(cap {status.get('max_proposals', '?')} proposals per run)")
     st.warning('⏳ ' + ' — '.join(parts).capitalize()
                + '. Run **Sync** again to continue where it left off; '
                  'already-synced clients are skipped for free.')
