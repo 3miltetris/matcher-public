@@ -33,7 +33,9 @@ from google.cloud import storage
 from openai import AsyncOpenAI
 
 # ── src modules are on the path because the Dockerfile sets PYTHONPATH ────────
-from src.modules.email_generator import async_generate_subject_line, async_josiah_copy, async_custom_prompt
+from src.modules.email_generator import (
+    async_generate_subject_line, async_josiah_copy, async_custom_prompt, clean_agency,
+)
 from src.modules.grant_utils import normalize_grant_columns
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -182,7 +184,6 @@ async def _validate_rows(
                     msg = await client.messages.create(
                         model='claude-haiku-4-5-20251001',
                         max_tokens=15,
-                        temperature=0,
                         system=_VALIDATION_SYSTEM,
                         messages=[{
                             'role': 'user',
@@ -204,6 +205,21 @@ async def _validate_rows(
         return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
 
 
+def _row_agency(row: dict) -> str:
+    """Agency label for the subject line.
+
+    A topic row can carry a blank / NaN `agency` (Topic Importer allows an empty
+    sub-agency), and handing that to the model makes it invent one — the DoW
+    Release 6 run came out with "- NIH" / "- NASA" subject lines. Fall back to the
+    folder-level `broad_agency`, which is never blank.
+    """
+    for key in ('agency', 'broad_agency'):
+        value = clean_agency(row.get(key))
+        if value:
+            return value
+    return ''
+
+
 async def _generate_email_batch(
     rows: list[tuple[int, dict]],
     openai_key: str,
@@ -220,7 +236,7 @@ async def _generate_email_batch(
             subject, body = await asyncio.gather(
                 async_generate_subject_line(
                     company_summary=str(row.get('company_summary', '') or ''),
-                    agency=str(row.get('agency', row.get('broad_agency', '')) or ''),
+                    agency=_row_agency(row),
                     openai_client=oai,
                     anth_client=anth,
                     word_limit=subject_cfg.get('word_limit', 15),

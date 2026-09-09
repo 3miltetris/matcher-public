@@ -4,11 +4,17 @@ Bulk Aspect Match
 Matches the whole client directory against grant topics using the
 multi-aspect profiles built in the Client Profiles view.
 
-Each client carries several independently embedded aspects. Every aspect is
-scored against every selected grant topic (one numpy matmul per client), a
-topic becomes a candidate for that client when enough aspects clear the
-similarity threshold, and the top candidates per client are then re-ranked
-1-5 by Claude with the matched aspect as context.
+Each client carries several independently embedded aspects, grouped into the
+markets those aspects serve. A run scores one *unit* at a time — either the
+whole company (every aspect at once, the original behaviour) or one market
+(only the aspects earmarked to it, plus the market's own narrative vector).
+Every vector in the unit is scored against every selected grant topic (one
+numpy matmul per unit), a topic becomes a candidate when enough of them clear
+the similarity threshold, and the top candidates per unit are re-ranked 1-5 by
+Claude with the matched aspect as context.
+
+Running by market treats each market as its own company, so a client's defense
+story is ranked on its own instead of being averaged in with the rest.
 
 Scoring and re-ranking run in this process — keep the page open while a run
 is in flight. Results are held in session state, downloadable as CSV, and
@@ -44,6 +50,18 @@ _RERANK_MODELS = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6']
 _CONCURRENCY   = 15
 _MAX_RETRIES   = 5
 _CONFIRM_PAIRS = 2500   # above this many re-rank calls, require a confirmation
+
+# Match modes
+_MODE_ALL    = 'All aspects (whole company)'
+_MODE_MARKET = 'By market'
+
+# Market scope (tier), and the category filter alongside it
+_SCOPE_ALL       = 'All markets'
+_SCOPE_PRIMARY   = 'Primary markets only'
+_SCOPE_SECONDARY = 'Secondary markets only'
+_SCOPE_DEFENSE   = 'Defense only'
+_SCOPES          = [_SCOPE_ALL, _SCOPE_PRIMARY, _SCOPE_SECONDARY, _SCOPE_DEFENSE]
+_CATEGORY_ALL    = 'All categories'
 
 # Topic columns carried into the results, when present.
 _TOPIC_COLS = [
@@ -167,8 +185,59 @@ def _stack_topic_embeddings(df: pd.DataFrame) -> tuple[np.ndarray, pd.DataFrame]
     return np.vstack(vecs), meta
 
 
-def _match_clients(
-    selected: pd.DataFrame,
+def _market_counts(selected: pd.DataFrame) -> dict[str, int]:
+    """Canonical market name → how many of the selected clients have it."""
+    counts: dict[str, int] = {}
+    for _, prof in selected.iterrows():
+        for name in {str(m.get('market') or '') for m in ap.profile_markets(prof)}:
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _plan_units(
+    selected: pd.DataFrame, by_market: bool, scope: str, category: str
+) -> tuple[list[tuple], list[str]]:
+    """One (profile, market, market_index) per scoring subject.
+
+    Whole-company mode gives one unit per client (market is None). Market mode
+    gives one unit per (client, market) surviving the tier and category
+    filters — each is scored, capped and re-ranked as if it were its own
+    company. Cheap enough to call on every rerun for the run-size estimate."""
+    plan: list[tuple] = []
+    skipped: list[str] = []
+
+    for _, prof in selected.iterrows():
+        if not by_market:
+            plan.append((prof, None, -1))
+            continue
+
+        markets = ap.profile_markets(prof)
+        if not markets:
+            skipped.append(
+                f'{prof["company_name"]}: profile has no markets — rebuild it in '
+                'Client Profiles to match it by market'
+            )
+            continue
+
+        for i, market in enumerate(markets):
+            name = str(market.get('market') or '')
+            tier = str(market.get('tier') or '')
+            if scope == _SCOPE_PRIMARY and tier != 'primary':
+                continue
+            if scope == _SCOPE_SECONDARY and tier != 'secondary':
+                continue
+            if scope == _SCOPE_DEFENSE and name != ap.DEFENSE_MARKET:
+                continue
+            if scope != _SCOPE_DEFENSE and category != _CATEGORY_ALL and name != category:
+                continue
+            plan.append((prof, market, i))
+
+    return plan, skipped
+
+
+def _match_units(
+    plan: list[tuple],
     topic_matrix: np.ndarray,
     topic_meta: pd.DataFrame,
     threshold: float,
@@ -176,33 +245,73 @@ def _match_clients(
     top_k: int,
     progress=None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Candidate (client, topic) rows: a topic qualifies for a client when at
-    least `min_hits` of the client's aspects clear `threshold`; the top `top_k`
-    per client by best aspect score are kept."""
+    """Candidate (unit, topic) rows: a topic qualifies for a unit when at least
+    `min_hits` of the unit's *aspect* vectors clear `threshold`; the top `top_k`
+    per unit by best score are kept. A market unit carries its earmarked aspect
+    vectors plus the market narrative vector, which for Defense is the only
+    place the DoD framing exists."""
     meta_cols = [c for c in _TOPIC_COLS if c in topic_meta.columns]
     # Materialised once — .iloc[ti] per candidate builds a Series per row and
     # dominates the loop on large runs.
     meta_records = topic_meta[meta_cols].to_dict('records')
     rows: list[dict] = []
     skipped: list[str] = []
-    total = len(selected)
+    total = len(plan)
 
-    for n, (_, prof) in enumerate(selected.iterrows(), 1):
+    # A client appears once per market, so unpack its stored vectors once.
+    aspect_cache: dict[str, tuple] = {}
+    market_cache: dict[str, np.ndarray] = {}
+
+    for n, (prof, market, mi) in enumerate(plan, 1):
+        client = str(prof['company_name'])
+        label  = f'{client} · {market["market"]}' if market else client
         if progress is not None:
-            progress.progress(n / total, text=f'Scoring {prof["company_name"]} ({n}/{total})')
+            progress.progress(n / total, text=f'Scoring {label} ({n}/{total})')
 
-        aspects = ap.profile_aspects(prof)
-        matrix  = ap.unpack_embeddings(prof)
+        key = str(prof['company_key'])
+        if key not in aspect_cache:
+            aspect_cache[key] = (ap.profile_aspects(prof), ap.unpack_embeddings(prof))
+        aspects, matrix = aspect_cache[key]
+
         if matrix.shape[0] == 0 or len(aspects) != matrix.shape[0]:
-            skipped.append(
-                f'{prof["company_name"]}: profile has no usable aspect vectors — rebuild it'
-            )
+            skipped.append(f'{client}: profile has no usable aspect vectors — rebuild it')
             continue
 
-        scores = matrix @ topic_matrix.T          # (n_aspects, T)
-        best_i = scores.argmax(axis=0)
-        best   = scores.max(axis=0)
-        hits   = (scores >= threshold).sum(axis=0)
+        if market is None:
+            unit_aspects, unit_matrix = aspects, matrix
+            n_aspect_vecs = unit_matrix.shape[0]
+        else:
+            idx          = ap.market_aspect_indices(aspects, str(market.get('market')))
+            unit_aspects = [aspects[i] for i in idx]
+            unit_matrix  = matrix[idx] if idx else matrix[:0]
+
+            if key not in market_cache:
+                market_cache[key] = ap.unpack_market_embeddings(prof)
+            market_vectors = market_cache[key]
+            n_aspect_vecs = unit_matrix.shape[0]
+            if 0 <= mi < market_vectors.shape[0]:
+                unit_aspects = unit_aspects + [{
+                    'label': f'Market: {market.get("market")}',
+                    'kind':  'market',
+                    'text':  str(market.get('narrative') or ''),
+                }]
+                unit_matrix = np.vstack([unit_matrix, market_vectors[mi][None, :]])
+
+            if unit_matrix.shape[0] == 0:
+                skipped.append(
+                    f'{label}: market has no aspect or narrative vectors — rebuild the profile'
+                )
+                continue
+
+        scores  = unit_matrix @ topic_matrix.T     # (n_vectors, T)
+        best_i  = scores.argmax(axis=0)
+        best    = scores.max(axis=0)
+        cleared = scores >= threshold
+        # min_hits counts capabilities. The market narrative is one more way of
+        # describing the same market, not an extra capability, so it stays out
+        # of the count - unless it is all the unit has, which is the case for a
+        # market no aspect was earmarked to.
+        hits    = (cleared[:n_aspect_vecs] if n_aspect_vecs else cleared).sum(axis=0)
 
         qualified = np.where((best >= threshold) & (hits >= min_hits))[0]
         if qualified.size == 0:
@@ -211,18 +320,21 @@ def _match_clients(
 
         for ti in order:
             ai     = int(best_i[ti])
-            aspect = aspects[ai]
+            aspect = unit_aspects[ai]
             row = {
-                'client':           prof['company_name'],
+                'client':           client,
                 'client_website':   prof['companyWebsite'],
+                'market':           str(market.get('market')) if market else '',
+                'market_tier':      str(market.get('tier') or '') if market else '',
+                'market_subtitle':  str(market.get('subtitle') or '') if market else '',
                 'aspect_label':     aspect.get('label', ''),
                 'aspect_kind':      aspect.get('kind', ''),
                 'aspect_score':     round(float(best[ti]), 4),
                 'aspects_hit':      int(hits[ti]),
-                'aspects_total':    len(aspects),
+                'aspects_total':    n_aspect_vecs or len(unit_aspects),
                 'aspect_scores':    json.dumps({
-                    aspects[j].get('label', f'aspect_{j + 1}'): round(float(scores[j, ti]), 4)
-                    for j in range(len(aspects))
+                    unit_aspects[j].get('label', f'aspect_{j + 1}'): round(float(scores[j, ti]), 4)
+                    for j in range(len(unit_aspects))
                 }),
                 '_company_key':     prof['company_key'],
                 '_aspect_text':     aspect.get('text', ''),
@@ -293,7 +405,10 @@ async def _rerank_async(
                         resp = await client.messages.create(
                             model=model,
                             max_tokens=250,
-                            temperature=0,
+                            # No temperature: the anthropic 1.x SDK removed the
+                            # parameter, and it is rejected outright by the newer
+                            # models. Determinism comes from the strict JSON
+                            # contract in _RERANK_SYSTEM instead.
                             system=_RERANK_SYSTEM,
                             messages=[{'role': 'user', 'content': _rerank_user_message(row)}],
                         )
@@ -319,10 +434,34 @@ async def _rerank_async(
         return results
 
 
+def _rerank_groups(candidates: pd.DataFrame) -> list[list[int]]:
+    """Row indices grouped by (client, topic, matched aspect).
+
+    In market mode the same aspect can win the same topic under two markets.
+    The re-rank prompt carries no market context, so those rows would get
+    identical answers — score the pair once and share it."""
+    groups: dict[tuple, list[int]] = {}
+    for idx, row in candidates.iterrows():
+        key = (
+            str(row.get('_company_key') or ''),
+            # Agency included: one topic_number can belong to two agencies, and
+            # blank-numbered rows fall back to titles that repeat across them.
+            # Without it two different topics would share one score, written
+            # from only the first row's grant_summary.
+            str(row.get('broad_agency') or ''),
+            str(row.get('agency') or ''),
+            str(row.get('topic_number') or row.get('title') or ''),
+            str(row.get('aspect_label') or ''),
+        )
+        groups.setdefault(key, []).append(int(idx))
+    return list(groups.values())
+
+
 def _run_rerank(candidates: pd.DataFrame, api_key: str, model: str) -> pd.DataFrame:
-    rows  = [(int(i), r.to_dict()) for i, r in candidates.iterrows()]
-    total = len(rows)
-    prog  = st.progress(0.0, text=f'LLM re-ranking 0/{total}…')
+    groups = _rerank_groups(candidates)
+    rows   = [(n, candidates.loc[g[0]].to_dict()) for n, g in enumerate(groups)]
+    total  = len(rows)
+    prog   = st.progress(0.0, text=f'LLM re-ranking 0/{total}…')
 
     def on_done(done: int) -> None:
         prog.progress(done / total, text=f'LLM re-ranking {done}/{total}…')
@@ -333,17 +472,19 @@ def _run_rerank(candidates: pd.DataFrame, api_key: str, model: str) -> pd.DataFr
     out = candidates.copy()
     out['llm_score']     = 0
     out['llm_rationale'] = ''
-    for idx, score, rationale in results:
-        # 0 keeps unscored pairs visible but below any usable minimum
-        out.at[idx, 'llm_score']     = int(score) if score is not None else 0
-        out.at[idx, 'llm_rationale'] = rationale
+    for n, score, rationale in results:
+        for idx in groups[n]:
+            # 0 keeps unscored pairs visible but below any usable minimum
+            out.at[idx, 'llm_score']     = int(score) if score is not None else 0
+            out.at[idx, 'llm_rationale'] = rationale
     return out
 
 
 # ── Results output ─────────────────────────────────────────────────────────
 
 _DISPLAY_FIRST = [
-    'client', 'aspect_label', 'aspect_score', 'aspects_hit', 'aspects_total',
+    'client', 'market', 'market_tier', 'aspect_label', 'aspect_score',
+    'aspects_hit', 'aspects_total',
     'llm_score', 'llm_rationale', 'topic_number', 'title', 'agency', 'broad_agency',
 ]
 
@@ -370,6 +511,12 @@ for _k in ['am_profiles', 'am_topics_df', 'am_results', 'am_run_meta']:
         st.session_state[_k] = None
 if 'am_filters' not in st.session_state:
     st.session_state.am_filters = [{'column': None, 'type': 'keyword', 'keyword': '', 'operator': 'AND'}]
+# Client picker: a data_editor keeps its own edit state, so All/None flip the
+# default and bump the nonce in the widget key to force a fresh table.
+if 'am_pick_all' not in st.session_state:
+    st.session_state.am_pick_all = True
+if 'am_pick_nonce' not in st.session_state:
+    st.session_state.am_pick_nonce = 0
 
 
 # ── Page ───────────────────────────────────────────────────────────────────
@@ -414,8 +561,18 @@ with head_r:
         f'{int(pd.to_numeric(profiles["n_aspects"], errors="coerce").fillna(0).sum()):,} aspects total'
     )
 
+qs1, qs2, _qs3 = st.columns([1, 1, 6])
+if qs1.button('Select all', key='am_pick_all_btn'):
+    st.session_state.am_pick_all    = True
+    st.session_state.am_pick_nonce += 1
+    st.rerun()
+if qs2.button('Deselect all', key='am_pick_none_btn'):
+    st.session_state.am_pick_all    = False
+    st.session_state.am_pick_nonce += 1
+    st.rerun()
+
 picker = pd.DataFrame({
-    'use':      True,
+    'use':      st.session_state.am_pick_all,
     'client':   profiles['company_name'].fillna('—').astype(str),
     'aspects':  pd.to_numeric(profiles['n_aspects'], errors='coerce').fillna(0).astype(int),
     'labels':   profiles['aspect_labels'].fillna('').astype(str),
@@ -435,7 +592,7 @@ edited = st.data_editor(
         'labels':   st.column_config.TextColumn('Aspect labels', width='large'),
         'built_at': st.column_config.TextColumn('Built'),
     },
-    key='am_client_picker',
+    key=f'am_client_picker_{st.session_state.am_pick_nonce}',
 )
 
 selected = profiles.loc[edited.index[edited['use'].fillna(False).to_numpy(dtype=bool)]]
@@ -453,6 +610,18 @@ agencies = _list_agencies(gcs)
 if not agencies:
     st.warning('No grant agencies found in GCS.')
     st.stop()
+
+# Quick-select buttons run before the checkboxes are created, so writing their
+# session-state keys here is what sets the widget values for this run.
+ags1, ags2, _ags3 = st.columns([1, 1, 6])
+if ags1.button('Select all', key='am_agency_all'):
+    for ag in agencies:
+        st.session_state[f'am_agency_{ag}'] = True
+    st.rerun()
+if ags2.button('Deselect all', key='am_agency_none'):
+    for ag in agencies:
+        st.session_state[f'am_agency_{ag}'] = False
+    st.rerun()
 
 ag_cols = st.columns(min(len(agencies), 6))
 selected_agencies = [
@@ -542,6 +711,36 @@ st.dataframe(filtered[filterable_cols].head(25), use_container_width=True, hide_
 st.divider()
 st.subheader('3 · Match options')
 
+mode = st.radio(
+    'Match mode', [_MODE_ALL, _MODE_MARKET], horizontal=True, key='am_mode',
+    help='Whole company scores every aspect at once. By market scores each '
+         'market separately — its earmarked aspects plus the market narrative '
+         '— so a client\'s markets compete for topics on their own.',
+)
+by_market = mode == _MODE_MARKET
+
+scope, category = _SCOPE_ALL, _CATEGORY_ALL
+if by_market:
+    counts = _market_counts(selected)
+    if not counts:
+        st.warning(
+            'None of the selected clients have markets yet. Rebuild their '
+            'profiles in **Client Profiles** to match by market.'
+        )
+    m1, m2 = st.columns(2)
+    with m1:
+        scope = st.selectbox('Market scope', _SCOPES, index=0, key='am_scope')
+    with m2:
+        options = [_CATEGORY_ALL] + list(counts.keys())
+        category = st.selectbox(
+            'Market category', options, index=0, key='am_category',
+            format_func=lambda c: c if c == _CATEGORY_ALL else f'{c} ({counts[c]} clients)',
+            disabled=scope == _SCOPE_DEFENSE,
+            help='Scoped to the markets the selected clients actually have.',
+        )
+
+plan, plan_skipped = _plan_units(selected, by_market, scope, category)
+
 o1, o2, o3 = st.columns(3)
 with o1:
     threshold = st.slider('Aspect similarity threshold', 0.60, 0.95, 0.78, 0.01)
@@ -550,10 +749,21 @@ with o2:
         'Aspects that must clear it', min_value=1, max_value=max(1, max_aspects), value=1, step=1,
         help='1 = any single capability matching is enough (recommended — a client\'s '
              'aspects are different capabilities, not requirements of one query). '
-             'Raise it to demand topics that touch several of the client\'s capabilities.',
+             'Raise it to demand topics that touch several of the client\'s capabilities. '
+             'The market narrative does not count towards it.',
     )
 with o3:
-    top_k = st.number_input('Top topics per client', min_value=1, max_value=100, value=10, step=1)
+    top_k = st.number_input(
+        'Top topics per market' if by_market else 'Top topics per client',
+        min_value=1, max_value=100, value=10, step=1,
+    )
+
+if by_market:
+    st.caption(
+        f'**{len(plan)}** market unit{"s" if len(plan) != 1 else ""} across '
+        f'**{len({str(p[0]["company_key"]) for p in plan})}** client(s) — each is '
+        'scored, capped and ranked as if it were its own company.'
+    )
 
 r1, r2, r3 = st.columns(3)
 with r1:
@@ -565,11 +775,15 @@ with r3:
         'Keep LLM score ≥', min_value=1, max_value=5, value=3, step=1, disabled=not do_rerank,
     )
 
-max_pairs = len(selected) * int(top_k)
+max_pairs = len(plan) * int(top_k)
 if do_rerank:
     st.caption(
         f'Up to **{max_pairs:,}** re-rank calls '
-        f'({len(selected)} clients × top {int(top_k)}), {_CONCURRENCY} at a time.'
+        f'({len(plan)} {"market unit" if by_market else "client"}'
+        f'{"s" if len(plan) != 1 else ""} × top {int(top_k)}), '
+        f'{_CONCURRENCY} at a time.'
+        + (' Identical (client, topic, aspect) pairs are scored once and shared '
+           'across markets, so the real count is usually lower.' if by_market else '')
     )
 confirm = True
 if do_rerank and max_pairs > _CONFIRM_PAIRS:
@@ -579,9 +793,12 @@ if do_rerank and max_pairs > _CONFIRM_PAIRS:
         value=False,
     )
 
+for _msg in plan_skipped:
+    st.warning(_msg)
+
 run = st.button(
     '▶ Run match', type='primary',
-    disabled=selected.empty or filtered.empty or not confirm,
+    disabled=selected.empty or filtered.empty or not plan or not confirm,
 )
 
 # ── Run ────────────────────────────────────────────────────────────────────
@@ -604,8 +821,8 @@ if run:
     # failure path below reports and falls through to the results section.
     try:
         prog = st.progress(0.0, text='Scoring…')
-        candidates, skipped = _match_clients(
-            selected, topic_matrix, topic_meta,
+        candidates, skipped = _match_units(
+            plan, topic_matrix, topic_meta,
             float(threshold), int(min_hits), int(top_k), prog,
         )
         prog.empty()
@@ -620,14 +837,23 @@ if run:
                 'run_id': None, 'threshold': float(threshold), 'min_hits': int(min_hits),
                 'top_k': int(top_k), 'clients': len(selected), 'topics': len(topic_meta),
                 'candidates': 0, 'reranked': False, 'kept': 0, 'unscored': 0, 'gcs_path': None,
+                'mode': mode, 'scope': scope, 'category': category, 'units': len(plan),
             }
         else:
             reranked = False
             unscored = 0
+            failures: dict[str, int] = {}
             results  = candidates
             if do_rerank:
                 results  = _run_rerank(candidates, st.secrets['anthropic_api_key'], rerank_model)
                 unscored = int((results['llm_score'] == 0).sum())
+                # A pair scores 0 only when the call failed or the answer was
+                # unparseable — the reason is the one thing worth surfacing when
+                # a run ends with nothing to show.
+                failures = (
+                    results.loc[results['llm_score'] == 0, 'llm_rationale']
+                    .astype(str).value_counts().head(5).to_dict()
+                )
                 reranked = True
                 results  = results[results['llm_score'] >= int(min_llm)]
                 results  = results.sort_values(
@@ -651,7 +877,10 @@ if run:
                 'run_id': run_id, 'threshold': float(threshold), 'min_hits': int(min_hits),
                 'top_k': int(top_k), 'clients': len(selected), 'topics': len(topic_meta),
                 'candidates': len(candidates), 'reranked': reranked,
-                'kept': len(results), 'unscored': unscored, 'gcs_path': gcs_path,
+                'kept': len(results), 'unscored': unscored, 'failures': failures,
+                'gcs_path': gcs_path,
+                'mode': mode, 'scope': scope, 'category': category, 'units': len(plan),
+                'rerank_calls': len(_rerank_groups(candidates)) if reranked else 0,
             }
 
     except Exception as e:
@@ -674,17 +903,52 @@ if st.session_state.am_results is not None:
             + (' and survived re-ranking.' if meta.get('reranked') else '.')
             + ' Try lowering the threshold or widening the topic selection.'
         )
+        # Similarity and re-ranking fail very differently, and lowering the
+        # threshold cannot rescue a run the re-ranker dropped.
+        if meta.get('candidates'):
+            st.info(
+                f'Similarity scoring found **{meta["candidates"]:,}** candidate row(s) '
+                f'across {meta.get("units", meta.get("clients", 0))} unit(s) — they were '
+                'dropped during re-ranking, not by the similarity threshold.'
+            )
+        if meta.get('unscored'):
+            st.error(
+                f'**{meta["unscored"]:,}** of them could not be scored by Claude at all. '
+                'An unscored pair is stored as 0, which is below every selectable '
+                'minimum, so the whole run is filtered away. Reported reasons:'
+            )
+            for reason, n in (meta.get('failures') or {}).items():
+                st.markdown(f'- `{reason}` × {n:,}')
+            st.caption(
+                'Re-run with **LLM re-rank** unchecked to see the similarity results '
+                'with no Claude calls at all.'
+            )
     else:
-        m = st.columns(4)
+        m = st.columns(5 if meta.get('mode') == _MODE_MARKET else 4)
         m[0].metric('Rows', f'{len(results):,}')
         m[1].metric('Clients matched', f'{results["client"].nunique():,}')
-        m[2].metric('Candidates scored', f'{meta.get("candidates", 0):,}')
-        m[3].metric('Topics searched', f'{meta.get("topics", 0):,}')
+        if meta.get('mode') == _MODE_MARKET:
+            m[2].metric(
+                'Markets matched',
+                f'{results.groupby(["client", "market"]).ngroups:,}',
+            )
+        m[-2].metric('Candidates scored', f'{meta.get("candidates", 0):,}')
+        m[-1].metric('Topics searched', f'{meta.get("topics", 0):,}')
+
+        if meta.get('mode') == _MODE_MARKET:
+            st.caption(
+                f'Ran **{meta.get("units", 0)}** market unit(s) · scope '
+                f'*{meta.get("scope")}* · category *{meta.get("category")}*'
+                + (f' · {meta["rerank_calls"]:,} re-rank call(s) for {meta.get("candidates", 0):,} '
+                   'candidate row(s)' if meta.get('rerank_calls') else '')
+            )
 
         if meta.get('unscored'):
             st.warning(
                 f'{meta["unscored"]} pair(s) could not be scored by the re-ranker '
-                '(shown as score 0 and dropped by the minimum score).'
+                '(shown as score 0 and dropped by the minimum score)'
+                + (': ' + '; '.join(f'{r} × {n}' for r, n in (meta.get('failures') or {}).items())
+                   if meta.get('failures') else '.')
             )
         if meta.get('gcs_path'):
             st.caption(f'Saved to `{meta["gcs_path"]}`')
@@ -692,6 +956,8 @@ if st.session_state.am_results is not None:
         display = _display_frame(results)
         col_cfg = {
             'client':        st.column_config.TextColumn('Client'),
+            'market':        st.column_config.TextColumn('Market'),
+            'market_tier':   st.column_config.TextColumn('Tier', width='small'),
             'aspect_label':  st.column_config.TextColumn('Matched aspect'),
             'aspect_score':  st.column_config.NumberColumn('Aspect score', format='%.4f'),
             'aspects_hit':   st.column_config.NumberColumn('Aspects hit', format='%d'),
@@ -710,7 +976,9 @@ if st.session_state.am_results is not None:
             mime='text/csv',
         )
 
-        with st.expander('Per-client summary'):
+        by = (['client', 'market'] if meta.get('mode') == _MODE_MARKET
+              and 'market' in results.columns else ['client'])
+        with st.expander('Per-market summary' if len(by) == 2 else 'Per-client summary'):
             agg = {
                 'topics':            ('client', 'size'),
                 'best_aspect_score': ('aspect_score', 'max'),
@@ -718,7 +986,7 @@ if st.session_state.am_results is not None:
             if 'llm_score' in results.columns:
                 agg['best_llm_score'] = ('llm_score', 'max')
             summary = (
-                results.groupby('client')
+                results.groupby(by)
                 .agg(**agg)
                 .reset_index()
                 .sort_values('topics', ascending=False)

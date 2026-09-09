@@ -9,15 +9,26 @@ from any of three sources:
 - **Financial research run** — loads a completed Client Financials run from
   finance-research-runs/{run_id}/state.json and imports the Deep Research
   fields. Users map each financial field to an existing HubSpot company
-  property or a new auto-created matcher_fin_* property.
+  property or a new auto-created matcher_fin_* property; the mapping table
+  is pre-filled by _auto_assign_properties (properties a previous import
+  created, name/label matches, and — opt-in — standard properties such as
+  annualrevenue), so a repeat import needs no manual mapping. Money/count/score
+  fields additionally carry a `<field>_num` integer companion (see
+  finance_research.NUMERIC_FIELDS) created as a HubSpot *number* property,
+  so prose values like "0-250,000 (estimated)" are also importable as 125000
+  for lead scoring.
 - **Client profiles** — loads the multi-aspect capability profiles from
   data/client-profiles/profiles.parquet (Stage 8), flattens each company's
-  aspects into importable columns (summary, labels, keywords, a readable
-  aspects block, and optional per-aspect columns), and maps them the same way.
+  aspects and markets into importable columns (summary, labels, keywords, a
+  readable aspects block, the markets each aspect serves, the market
+  narratives, the Defense use case, and optional per-aspect columns), and maps
+  them the same way.
 
 All modes dedupe by companyWebsite → domain and poll the import until done.
 """
 
+import difflib
+import hashlib
 import io
 import json
 import re
@@ -72,8 +83,20 @@ _IMPORT_EXCLUDE = frozenset({'embeddings', 'uuid'})
 
 # ── Financial-mode constants ──────────────────────────────────────────────────
 
-# All mappable financial fields: the digest first, then the 54 research fields
-_FIN_FIELDS = ['financial_summary'] + fr.ALL_FIELDS
+# All mappable financial fields: the digest first, then the 54 research fields.
+# Fields with a numeric companion are followed immediately by their
+# "{field}_num" column, so the pair sits together in the mapping table.
+_FIN_FIELDS = ['financial_summary'] + [
+    col
+    for f in fr.ALL_FIELDS
+    for col in ([f, f'{f}{fr.NUMERIC_SUFFIX}'] if f in fr.NUMERIC_FIELDS else [f])
+]
+
+# The "{field}_num" columns — integers parsed out of the prose values, for
+# HubSpot lead scoring. Created as `number` properties, never textarea.
+_FIN_NUMERIC_COLS = frozenset(
+    f'{f}{fr.NUMERIC_SUFFIX}' for f in fr.NUMERIC_FIELDS
+)
 
 # Sentinel dropdown option — resolves per-row to the field's auto-created name
 _CREATE_OPT = '➕ create new property'
@@ -95,6 +118,30 @@ _FIN_DEFAULT_ON = frozenset({
     'score_total', 'recommendation', 'confidence_score',
 })
 
+# A headline field's numeric companion is on by default too — that pairing is
+# the point of the _num columns (readable value + scoreable number).
+_FIN_DEFAULT_ON = _FIN_DEFAULT_ON | frozenset(
+    f'{f}{fr.NUMERIC_SUFFIX}' for f in fr.NUMERIC_FIELDS if f in _FIN_DEFAULT_ON
+)
+
+# Standard (HubSpot-defined) company properties a financial field can
+# reasonably fill. Auto-assignment only reaches these when the user opts in —
+# `annualrevenue` and friends usually hold CRM-owned data the import would
+# overwrite. Targets that don't exist in the portal, or whose type doesn't fit
+# the field, are skipped automatically.
+_FIN_STANDARD_ALIASES: dict[str, str] = {
+    f'revenue_estimate{fr.NUMERIC_SUFFIX}':       'annualrevenue',
+    f'employee_count_current{fr.NUMERIC_SUFFIX}': 'numberofemployees',
+    'total_venture_funding':                      'total_money_raised',
+    'website_resolved':                           'website',
+    'naics_codes':                                'naics_code',
+    'entity_type':                                'type',
+}
+
+# Auto-match confidence floor for the fuzzy tier. Deliberately strict — a
+# wrong guess writes research data into an unrelated CRM property.
+_AUTO_FUZZY_CUTOFF = 0.90
+
 
 # ── Client-profile-mode constants ─────────────────────────────────────────────
 
@@ -107,6 +154,12 @@ _PROFILE_BASE_FIELDS: list[tuple[str, str, bool, bool]] = [
     ('aspect_keywords',  'matcher_aspect_keywords',   True,  True),
     ('aspect_kinds',     'matcher_aspect_kinds',      False, False),
     ('n_aspects',        'matcher_aspect_count',      True,  False),
+    ('market_labels',    'matcher_market_labels',     True,  True),
+    ('markets_full',     'matcher_markets_full',      True,  True),
+    ('market_categories', 'matcher_market_categories', False, True),
+    ('n_markets',        'matcher_market_count',      True,  False),
+    ('defense_market',   'matcher_defense_market',    True,  False),
+    ('defense_use_case', 'matcher_defense_use_case',  True,  True),
     ('sources_used',     'matcher_profile_sources',   False, False),
     ('profile_model',    'matcher_profile_model',     False, False),
     ('profile_built_at', 'matcher_profile_built_at',  True,  False),
@@ -123,7 +176,19 @@ def _profile_aspect_fields(max_aspects: int) -> list[tuple[str, str, bool, bool]
     return fields
 
 
+# HubSpot (type, fieldType) per property kind used by the mapping table.
+# `number` matters for the _num companions — a string property can't be
+# sorted, filtered by range, or fed into a HubSpot scoring property.
+_PROP_KINDS: dict[str, tuple[str, str]] = {
+    'text':     ('string', 'text'),
+    'textarea': ('string', 'textarea'),
+    'number':   ('number', 'number'),
+}
+
+
 def _col_to_label(col: str) -> str:
+    if col.endswith(fr.NUMERIC_SUFFIX):
+        return col[:-len(fr.NUMERIC_SUFFIX)].replace('_', ' ').title() + ' (Number)'
     return col.replace('_', ' ').title()
 
 
@@ -229,6 +294,9 @@ def _load_fin_run(client: storage.Client, run_id: str) -> pd.DataFrame:
             'companyWebsite':    c.get('website') or '',
             'financial_summary': fr.build_financial_digest(output),
             **{f: output.get(f, '') for f in fr.ALL_FIELDS},
+            # "{field}_num" integer companions for scoring — '' when the
+            # research value carries no parseable figure
+            **fr.numeric_columns(output),
         })
     return pd.DataFrame(rows)
 
@@ -236,9 +304,10 @@ def _load_fin_run(client: storage.Client, run_id: str) -> pd.DataFrame:
 def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
     """data/client-profiles/profiles.parquet → one flat import row per company.
 
-    The aspects live in the profile row as a JSON array; HubSpot needs flat
-    columns, so each company gets rolled-up fields (labels, keywords, a
-    readable aspects block) plus one label/text pair per aspect.
+    The aspects and markets live in the profile row as JSON arrays; HubSpot
+    needs flat columns, so each company gets rolled-up fields (labels,
+    keywords, readable aspect and market blocks, the Defense use case) plus one
+    label/text pair per aspect.
     """
     profiles = ap.load_profiles(client)
     if profiles.empty:
@@ -247,6 +316,7 @@ def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
     rows = []
     for _, p in profiles.iterrows():
         aspects = ap.profile_aspects(p)
+        markets = ap.profile_markets(p)
         labels, kinds, keywords, blocks = [], [], [], []
         row = {
             'company_key':      str(p.get('company_key') or ''),
@@ -265,12 +335,15 @@ def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
             labels.append(label)
             if kind:
                 kinds.append(kind)
+            in_markets = ', '.join(a.get('markets') or [])
             block = f'{i}. {label}' + (f' ({kind})' if kind else '')
             if text:
                 block += f'\n{text}'
             if kw:
                 block += f'\nKeywords: {kw}'
                 keywords.extend(k.strip() for k in kw.split(',') if k.strip())
+            if in_markets:
+                block += f'\nMarkets: {in_markets}'
             blocks.append(block)
             row[f'aspect_{i}_label'] = label
             row[f'aspect_{i}_text']  = text + (f'\nKeywords: {kw}' if kw else '')
@@ -287,6 +360,40 @@ def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
         row['aspect_keywords'] = ', '.join(uniq_kw)
         row['aspect_kinds']    = ', '.join(dict.fromkeys(kinds))
         row['n_aspects']       = str(len(aspects))
+
+        market_blocks, defense_use_case = [], ''
+        has_defense = False
+        for m in markets:
+            name  = str(m.get('market') or '')
+            tier  = str(m.get('tier') or '')
+            head  = f'{tier.upper()} · {name}' if tier else name
+            if m.get('subtitle'):
+                head += f' — {m["subtitle"]}'
+            block = head
+            if m.get('narrative'):
+                block += f'\n{m["narrative"]}'
+            if m.get('keywords'):
+                block += f'\nKeywords: {m["keywords"]}'
+            if m.get('aspect_labels'):
+                block += '\nAspects: ' + ', '.join(m['aspect_labels'])
+            market_blocks.append(block)
+            if name == ap.DEFENSE_MARKET:
+                has_defense      = True
+                defense_use_case = str(m.get('narrative') or '')
+
+        row['market_labels']     = str(p.get('market_labels') or '')
+        row['markets_full']      = '\n\n'.join(market_blocks)
+        row['market_categories'] = ', '.join(
+            dict.fromkeys(str(m.get('market') or '') for m in markets if m.get('market'))
+        )
+        row['n_markets']         = str(len(markets))
+        # Keyed off the market existing, not off its narrative: a Defense market
+        # with an empty narrative would otherwise import as 'no' with no reason,
+        # since dod_assessment is only written when there is no Defense market.
+        row['defense_market']    = 'yes' if has_defense else 'no'
+        # The reason there is none is worth carrying over too — it stops the
+        # team re-asking whether a client was ever assessed for defense.
+        row['defense_use_case']  = defense_use_case or str(p.get('dod_assessment') or '')
         rows.append(row)
 
     # Companies differ in aspect count — missing per-aspect columns become ''
@@ -308,7 +415,15 @@ def _fetch_company_properties() -> list[dict]:
     for p in resp.json().get('results', []):
         if p.get('modificationMetadata', {}).get('readOnlyValue'):
             continue
-        props.append({'name': p['name'], 'label': p.get('label', p['name'])})
+        props.append({
+            'name':            p['name'],
+            'label':           p.get('label', p['name']),
+            # `type` gates auto-assignment: prose can't go into a number
+            # property, and a _num column can't go into a string one
+            'type':            p.get('type', ''),
+            'field_type':      p.get('fieldType', ''),
+            'hubspot_defined': bool(p.get('hubspotDefined')),
+        })
     return sorted(props, key=lambda p: p['name'])
 
 
@@ -437,45 +552,152 @@ def _ensure_properties(
     return created
 
 
+def _normalize_prop_key(s: str) -> str:
+    """Comparable form of a field/property name — `Matcher Fin Revenue
+    Estimate`, `matcher_fin_revenue_estimate` and `MatcherFinRevenueEstimate`
+    all collapse to the same key."""
+    return re.sub(r'[^a-z0-9]', '', str(s).lower())
+
+
+def _kind_fits(kind: str, prop: dict) -> bool:
+    """Whether a field of this kind can be written into an existing property.
+    A prose value into a `number` property fails the import row-by-row, and a
+    _num integer into an enumeration/date property is meaningless — so
+    auto-assignment only ever targets a matching primitive type.
+    """
+    prop_type = prop.get('type', '')
+    return prop_type == 'number' if kind == 'number' else prop_type == 'string'
+
+
+def _auto_assign_properties(
+    specs: list[tuple[str, str, bool, bool | str]],
+    hs_props: list[dict],
+    *,
+    aliases: dict[str, str] | None = None,
+    include_standard: bool = False,
+    reserved: frozenset[str] = frozenset({'domain', 'name'}),
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Guess an existing HubSpot property for each field in `specs`.
+
+    Tiers, most confident first:
+      1. the field's own auto-created property (`matcher_fin_<field>`) already
+         exists — a previous import made it, so reuse instead of re-creating;
+      2. a custom property whose name or label normalizes to the field name;
+      3. a curated standard-property alias (opt-in — those overwrite CRM data);
+      4. a custom property matching the field name closely (difflib ≥ cutoff).
+
+    Every tier requires a compatible property type, and each property is
+    claimed by at most one field. Returns (field → property name,
+    field → short reason for the UI).
+    """
+    aliases   = aliases or {}
+    by_name   = {p['name']: p for p in hs_props}
+    custom    = [p for p in hs_props if not p.get('hubspot_defined')]
+
+    # Normalized name/label → custom properties (name wins over label)
+    by_norm: dict[str, dict] = {}
+    for p in custom:
+        by_norm.setdefault(_normalize_prop_key(p['label']), p)
+    for p in custom:
+        by_norm[_normalize_prop_key(p['name'])] = p
+
+    fuzzy_keys = sorted(by_norm)
+
+    assignment: dict[str, str] = {}
+    reasons:    dict[str, str] = {}
+    taken = set(reserved)
+
+    for field, create_name, _default, kind in specs:
+        if isinstance(kind, bool):
+            kind = 'textarea' if kind else 'text'
+        norm_field = _normalize_prop_key(field)
+
+        candidates: list[tuple[dict | None, str]] = [
+            (by_name.get(create_name), 'existing matcher property'),
+            (by_norm.get(norm_field),  'name match'),
+        ]
+        if include_standard and field in aliases:
+            candidates.append((by_name.get(aliases[field]), 'standard property'))
+        close = difflib.get_close_matches(
+            norm_field, fuzzy_keys, n=3, cutoff=_AUTO_FUZZY_CUTOFF)
+        candidates += [(by_norm[k], 'close name match') for k in close]
+
+        for prop, reason in candidates:
+            if not prop or prop['name'] in taken or not _kind_fits(kind, prop):
+                continue
+            if prop.get('hubspot_defined') and reason != 'standard property':
+                continue  # standard properties are opt-in only
+            assignment[field] = prop['name']
+            reasons[field]    = reason
+            taken.add(prop['name'])
+            break
+
+    return assignment, reasons
+
+
 def _mapping_editor(
-    specs: list[tuple[str, str, bool, bool]],
+    specs: list[tuple[str, str, bool, bool | str]],
     prop_options: list[str],
     key: str,
     *,
     label_col: str = 'Field',
     height: int = 560,
     reserved: frozenset[str] = frozenset({'domain', 'name'}),
+    preassigned: dict[str, str] | None = None,
+    notes: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, tuple]]:
     """Field → HubSpot property mapping table, shared by the financial and
     client-profile modes.
 
     specs items are (df column, auto-created property name, on by default,
-    long-form). Returns (df_col → hs_property, create_props for
-    _ensure_properties). Stops the page when the selection is unusable.
+    kind) where kind is a _PROP_KINDS key — or a bool for the common
+    long-form/short-text choice. `preassigned` (field → existing property)
+    seeds the dropdown from _auto_assign_properties and pre-checks those rows;
+    `notes` adds a read-only column explaining each auto-match. Returns
+    (df_col → hs_property, create_props for _ensure_properties). Stops the
+    page when the selection is unusable.
     """
+    pre       = preassigned or {}
+    valid_opt = set(prop_options)
+    # An auto-assignment whose property vanished between fetch and render
+    # falls back to creating the matcher_* property
+    seeded = {f: p for f, p in pre.items() if p in valid_opt}
+
     table = pd.DataFrame({
-        'Import':           [d for _f, _n, d, _t in specs],
+        'Import':           [d or f in seeded for f, _n, d, _t in specs],
         label_col:          [f for f, _n, _d, _t in specs],
-        'HubSpot property': [_CREATE_OPT] * len(specs),
+        'HubSpot property': [seeded.get(f, _CREATE_OPT) for f, _n, _d, _t in specs],
     })
+    disabled_cols = [label_col]
+    column_config = {
+        'Import': st.column_config.CheckboxColumn(
+            'Import', help='Include this field in the HubSpot import'),
+        label_col: st.column_config.TextColumn(label_col),
+        'HubSpot property': st.column_config.SelectboxColumn(
+            'HubSpot property',
+            options=prop_options,
+            required=True,
+            help='Target company property. The create option makes the '
+                 'matcher_* property automatically.',
+        ),
+    }
+    if notes:
+        table['Auto-match'] = [notes.get(f, '') if f in seeded else ''
+                               for f, _n, _d, _t in specs]
+        disabled_cols.append('Auto-match')
+        column_config['Auto-match'] = st.column_config.TextColumn(
+            'Auto-match',
+            help='Why this existing property was picked. Blank means the '
+                 'field defaults to creating a new one.',
+        )
+
     edited = st.data_editor(
         table,
         hide_index=True,
         use_container_width=True,
         height=height,
-        disabled=[label_col],
-        column_config={
-            'Import': st.column_config.CheckboxColumn(
-                'Import', help='Include this field in the HubSpot import'),
-            label_col: st.column_config.TextColumn(label_col),
-            'HubSpot property': st.column_config.SelectboxColumn(
-                'HubSpot property',
-                options=prop_options,
-                required=True,
-                help='Target company property. The create option makes the '
-                     'matcher_* property automatically.',
-            ),
-        },
+        disabled=disabled_cols,
+        column_config=column_config,
         key=key,
     )
 
@@ -486,14 +708,17 @@ def _mapping_editor(
         if not row['Import'] or row['HubSpot property'] == _SKIP_OPT:
             continue
         field = row[label_col]
-        create_name, textarea = meta[field]
+        create_name, kind = meta[field]
+        if isinstance(kind, bool):
+            kind = 'textarea' if kind else 'text'
         if row['HubSpot property'] == _CREATE_OPT:
             hs_name = create_name
+            prop_type, field_type = _PROP_KINDS.get(kind, _PROP_KINDS['text'])
             create_props[field] = (
                 hs_name,
                 _col_to_label(create_name),
-                'string',
-                'textarea' if textarea else 'text',
+                prop_type,
+                field_type,
             )
         else:
             hs_name = row['HubSpot property']
@@ -757,13 +982,48 @@ if unique_sites < len(df):
 if mode == 'Financial research run':
 
     preview_cols = ['companyName', 'companyWebsite', 'financial_summary',
-                    'revenue_estimate', 'score_total', 'recommendation']
+                    'revenue_estimate', 'revenue_estimate_num',
+                    'score_total', 'score_total_num', 'recommendation']
     st.dataframe(
         df[[c for c in preview_cols if c in df.columns]].head(50),
         use_container_width=True, hide_index=True,
     )
 
-    # ── Field mapping ─────────────────────────────────────────────────────────
+    # ── Numeric companions ────────────────────────────────────────────────────
+
+    with st.expander('🔢 Numeric companion columns (for lead scoring)'):
+        st.caption(
+            'Research values are prose — `"0-250,000 (estimated)"`, '
+            '`"21 (estimated)"`, `"~$4.2M"`. Each field below also carries a '
+            f'`<field>{fr.NUMERIC_SUFFIX}` column holding one integer (the '
+            'midpoint of a range, or the lone figure), created in HubSpot as a '
+            '**number** property so it can be sorted, filtered by range, and '
+            'used in scoring. A value with no parseable figure imports as '
+            'blank rather than 0, so it reads as "no data" instead of dragging '
+            'a score down.'
+        )
+        num_rows = []
+        for f in fr.NUMERIC_FIELDS:
+            num_col = f'{f}{fr.NUMERIC_SUFFIX}'
+            if f not in df.columns or num_col not in df.columns:
+                continue
+            parsed = (df[num_col].astype(str).str.strip() != '')
+            num_rows.append({
+                'Field':          f,
+                'Parsed':         f'{parsed.sum()} / {len(df)}',
+                'Example value':  next(
+                    (v for v in df.loc[parsed, f].astype(str) if v.strip()), '—'),
+                '→ Number':       next(
+                    (v for v in df.loc[parsed, num_col].astype(str) if v.strip()), '—'),
+            })
+        if num_rows:
+            st.dataframe(pd.DataFrame(num_rows), use_container_width=True,
+                         hide_index=True)
+            st.caption(
+                'Spot-check the conversions above before importing — a field '
+                'whose Parsed count is far below the row count is probably '
+                'prose the parser cannot read, and is better left unchecked.'
+            )
 
     st.divider()
     st.subheader('Map financial fields to HubSpot properties')
@@ -771,24 +1031,91 @@ if mode == 'Financial research run':
         'Company name → `name` and website → `domain` are always mapped. '
         'For each financial field, choose an existing HubSpot company property '
         f'or keep "{_CREATE_OPT}" to auto-create `matcher_fin_<field>`. '
+        f'The `{fr.NUMERIC_SUFFIX}` rows are the integer companions — they '
+        'auto-create as HubSpot **number** properties. '
         'Uncheck **Import** to leave a field out.'
     )
 
     prop_options = _hs_property_options()
+    hs_props: list[dict] = st.session_state.hs_company_props
 
-    fin_col_map, create_props = _mapping_editor(
-        [(f, f'matcher_fin_{f}', f in _FIN_DEFAULT_ON, f in _FIN_TEXTAREA)
-         for f in _FIN_FIELDS],
-        prop_options,
-        key=f'hs_fin_map_{run_id}',
-        label_col='Financial field',
+    def _fin_kind(field: str) -> str:
+        if field in _FIN_NUMERIC_COLS:
+            return 'number'
+        return 'textarea' if field in _FIN_TEXTAREA else 'text'
+
+    fin_specs = [(f, f'matcher_fin_{f}', f in _FIN_DEFAULT_ON, _fin_kind(f))
+                 for f in _FIN_FIELDS]
+
+    # ── Auto-assignment ───────────────────────────────────────────────────────
+
+    col_auto, col_std = st.columns([1, 2])
+    auto_on = col_auto.checkbox(
+        '🪄 Auto-assign properties', value=True, key='hs_fin_auto',
+        help='Point each field at an existing HubSpot company property when '
+             'one clearly matches — properties a previous import created, or '
+             'custom properties whose name matches the field. Auto-assigned '
+             'fields are checked for import; every guess is editable below.',
+    )
+    use_standard = col_std.checkbox(
+        'Include standard HubSpot properties '
+        '(`annualrevenue`, `numberofemployees`, `total_money_raised`…)',
+        value=False, key='hs_fin_auto_std', disabled=not auto_on,
+        help='Off by default: these hold CRM-owned data that the import would '
+             'overwrite for every company in the run.',
     )
 
-    n_create = len(create_props)
+    preassigned, match_notes = {}, {}
+    if auto_on:
+        preassigned, match_notes = _auto_assign_properties(
+            fin_specs, hs_props,
+            aliases=_FIN_STANDARD_ALIASES,
+            include_standard=use_standard,
+        )
+        if preassigned:
+            st.success(
+                f'Auto-assigned **{len(preassigned)}** field'
+                f'{"s" if len(preassigned) != 1 else ""} to existing HubSpot '
+                'properties (and checked them for import) — review the '
+                '**HubSpot property** column below and change anything that '
+                'looks wrong.'
+            )
+            with st.expander(f'🪄 {len(preassigned)} auto-assigned fields'):
+                st.dataframe(
+                    pd.DataFrame([
+                        {'Financial field': f,
+                         'HubSpot property': p,
+                         'Matched by': match_notes.get(f, '')}
+                        for f, p in preassigned.items()
+                    ]),
+                    use_container_width=True, hide_index=True,
+                )
+        else:
+            st.caption(
+                'No existing HubSpot property matched any financial field — '
+                'every field falls back to creating `matcher_fin_<field>`.'
+            )
+
+    # The editor keeps its edits per widget key, so a changed auto-assignment
+    # needs a new key or the table would keep showing the previous seed
+    seed_sig = hashlib.md5(
+        json.dumps(preassigned, sort_keys=True).encode()).hexdigest()[:8]
+
+    fin_col_map, create_props = _mapping_editor(
+        fin_specs,
+        prop_options,
+        key=f'hs_fin_map_{run_id}_{seed_sig}',
+        label_col='Financial field',
+        preassigned=preassigned,
+        notes=match_notes,
+    )
+
+    n_create   = len(create_props)
+    n_existing = len(fin_col_map) - n_create
     st.caption(
-        f'**{len(fin_col_map)}** field{"s" if len(fin_col_map) != 1 else ""} will be imported'
-        + (f' — {n_create} new `matcher_fin_*` propert{"ies" if n_create != 1 else "y"} will be created.'
-           if n_create else '.')
+        f'**{len(fin_col_map)}** field{"s" if len(fin_col_map) != 1 else ""} will be imported — '
+        f'{n_existing} into existing propert{"ies" if n_existing != 1 else "y"}, '
+        f'{n_create} into new `matcher_fin_*` propert{"ies" if n_create != 1 else "y"}.'
     )
 
     # ── Import ────────────────────────────────────────────────────────────────
@@ -826,7 +1153,8 @@ if mode == 'Financial research run':
 if mode == 'Client profiles':
 
     preview_cols = ['companyName', 'companyWebsite', 'n_aspects',
-                    'aspect_labels', 'profile_built_at', 'sources_used']
+                    'aspect_labels', 'market_labels', 'profile_built_at',
+                    'sources_used']
     st.dataframe(
         df[[c for c in preview_cols if c in df.columns]].head(50),
         use_container_width=True, hide_index=True,
@@ -838,6 +1166,8 @@ if mode == 'Client profiles':
         st.text(str(row.get('profile_summary') or '')[:2000])
         st.caption('Aspects block (`aspects_full`):')
         st.text(str(row.get('aspects_full') or '')[:4000])
+        st.caption('Markets block (`markets_full`):')
+        st.text(str(row.get('markets_full') or '') or '— no markets on this profile')
 
     # ── Field mapping ─────────────────────────────────────────────────────────
 

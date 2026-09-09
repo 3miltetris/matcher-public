@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import random
+import re
 import time
 
 from anthropic import Anthropic, AsyncAnthropic, InternalServerError
@@ -14,6 +15,8 @@ DEFAULT_SUBJECT_SYSTEM = (
     "that summarizes what this company's area of research, products, etc. is. "
     "Just focus on the technologies and research areas. Ignore investing, finance, etc. "
     'The format should be like this: "Grant for {summary} - {agency}"'
+    " Use the agency name exactly as it is given to you — never invent, guess or "
+    "substitute a different agency, and never emit a placeholder in its place."
 )
 
 DEFAULT_JOSIAH_SYSTEM = (
@@ -35,6 +38,57 @@ DEFAULT_JOSIAH_SYSTEM = (
     "and from what I can tell, you're doing custom UAS builds - particularly the ruggedized variants for "
     'defense applications"'
 )
+
+
+# ── Agency handling ──────────────────────────────────────────────────────────
+# The subject line ends in the grant's agency, and the model will happily invent
+# one ("- NIH", "- NASA", "- {agency}") when the value handed to it is blank or a
+# stringified NaN. Normalize the value, tell the model explicitly what to do when
+# it is missing, and scrub any placeholder that still comes back.
+
+_NULLISH_AGENCIES = {'', 'nan', 'none', 'null', 'n/a', 'na', '<na>', 'nat'}
+
+_TRAILING_JUNK_RE = re.compile(
+    r"""[\s\-\u2013\u2014:]+(?:\{agency\}|\{summary\}|\[[^\]]*\]|nan|none|null|n/?a)"""
+    r"""[\s"\u201d\u2019']*$""",
+    re.IGNORECASE,
+)
+
+_QUOTE_OPEN = '"\u201c\u2018\''
+_QUOTE_CLOSE = '"\u201d\u2019\''
+
+
+def clean_agency(agency) -> str:
+    """Return a usable agency label, or '' for blank / NaN / 'nan' / 'None'."""
+    a = '' if agency is None else str(agency).strip().strip('"\'')
+    return '' if a.lower() in _NULLISH_AGENCIES else a
+
+
+def _subject_user_text(company_summary: str, agency: str) -> str:
+    """User message for the subject-line call. The agency rule lives here (not only
+    in the system prompt) so it still applies when the caller passes a custom one."""
+    if agency:
+        return (
+            f"company summary:{company_summary}, agency: {agency}\n\n"
+            f'The agency is exactly "{agency}" — use that name verbatim in the subject '
+            f"line. Do not substitute, expand or guess a different agency."
+        )
+    return (
+        f"company summary:{company_summary}, agency: (not provided)\n\n"
+        "The agency is unknown. Omit it entirely: end the subject line after the "
+        "research summary, with no trailing ' - agency', no placeholder and no guess."
+    )
+
+
+def _sanitize_subject(text: str, agency: str) -> str:
+    """Strip wrapping quotes and repair/remove leaked agency placeholders."""
+    s = str(text or '').strip()
+    while len(s) >= 2 and s[0] in _QUOTE_OPEN and s[-1] in _QUOTE_CLOSE:
+        s = s[1:-1].strip()
+    if agency:
+        s = re.sub(r'\{agency\}|\[agency[^\]]*\]', agency, s, flags=re.IGNORECASE)
+    s = _TRAILING_JUNK_RE.sub('', s).strip()
+    return s.strip(' -\u2013\u2014:')
 
 
 # ── In-memory subject line cache (persists for the duration of the session) ──
@@ -60,17 +114,13 @@ def generate_subject_line(
     """
 
     # ── cache lookup ──────────────────────────────────────────────────────
+    agency    = clean_agency(agency)
     cache_key = hashlib.md5(f"{company_summary}||{agency}".encode()).hexdigest()
     if cache_key in _subject_line_cache:
         return _subject_line_cache[cache_key]
 
-    system = (
-        f"Generate a subject line for a cold email that is no more than {word_limit} words "
-        f"that summarizes what this company's area of research, products, etc. is. "
-        f"Just focus on the technologies and research areas. Ignore investing, finance, etc. "
-        f'The format should be like this: "Grant for {{summary}} - {{agency}}"'
-    )
-    text = f"company summary:{company_summary}, agency: {agency}"
+    system = DEFAULT_SUBJECT_SYSTEM.replace('{word_limit}', str(word_limit))
+    text   = _subject_user_text(company_summary, agency)
 
     # ── try OpenAI first ──────────────────────────────────────────────────
     use_fallback = False
@@ -83,7 +133,7 @@ def generate_subject_line(
                     {"role": "user",   "content": text},
                 ],
             )
-            result = completion.choices[0].message.content
+            result = _sanitize_subject(completion.choices[0].message.content, agency)
             _subject_line_cache[cache_key] = result
             return result
 
@@ -110,7 +160,7 @@ def generate_subject_line(
                 system=system,
                 messages=[{"role": "user", "content": text}],
             )
-            result = message.content[0].text
+            result = _sanitize_subject(message.content[0].text, agency)
             _subject_line_cache[cache_key] = result
             print(f"  [generate_subject_line] Anthropic fallback succeeded.")
             return result
@@ -146,7 +196,6 @@ def generate_body(
     message = anth_client.messages.create(
         model=model,
         max_tokens=max_tokens,
-        temperature=0,
         system=system,
         messages=[{"role": "user", "content": [{"type": "text", "text": text}]}],
     )
@@ -186,13 +235,14 @@ async def async_generate_subject_line(
     system_override: str | None = None,
 ) -> str:
     """Async version of generate_subject_line — OpenAI first, Anthropic fallback."""
+    agency    = clean_agency(agency)
     cache_key = hashlib.md5(f"{company_summary}||{agency}".encode()).hexdigest()
     if cache_key in _subject_line_cache:
         return _subject_line_cache[cache_key]
 
     template = system_override if system_override else DEFAULT_SUBJECT_SYSTEM
     system = template.replace('{word_limit}', str(word_limit))
-    text = f"company summary:{company_summary}, agency: {agency}"
+    text = _subject_user_text(company_summary, agency)
 
     for attempt in range(max_retries):
         try:
@@ -203,7 +253,7 @@ async def async_generate_subject_line(
                     {"role": "user",   "content": text},
                 ],
             )
-            result = completion.choices[0].message.content
+            result = _sanitize_subject(completion.choices[0].message.content, agency)
             _subject_line_cache[cache_key] = result
             return result
         except Exception as e:
@@ -220,7 +270,7 @@ async def async_generate_subject_line(
                 system=system,
                 messages=[{"role": "user", "content": text}],
             )
-            result = message.content[0].text
+            result = _sanitize_subject(message.content[0].text, agency)
             _subject_line_cache[cache_key] = result
             return result
         except Exception as e:
@@ -245,7 +295,6 @@ async def async_josiah_copy(
             message = await anth_client.messages.create(
                 model=model,
                 max_tokens=500,
-                temperature=0.7,
                 system=system,
                 messages=[{"role": "user", "content": [{"type": "text", "text": f"Company: {company_summary}\nGrant: {grant_summary}"}]}],
             )
@@ -272,7 +321,6 @@ async def async_custom_prompt(
             message = await anth_client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
-                temperature=0.7,
                 system=system,
                 messages=[{'role': 'user', 'content': [{'type': 'text', 'text': text}]}],
             )
@@ -317,7 +365,6 @@ def josiah_copy(
     message = anth_client.messages.create(
         model=model,
         max_tokens=500,
-        temperature=0.7,
         system=system,
         messages=[{"role": "user", "content": [{"type": "text", "text": text}]}],
     )

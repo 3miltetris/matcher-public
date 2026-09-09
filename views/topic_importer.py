@@ -405,7 +405,21 @@ if st.session_state.topics_df is not None:
         f'— one parquet per unique sub-agency, named `{{sub_agency}}_{{date}}_{{hex}}.parquet`'
     )
 
-    save_disabled = not broad_agency
+    # A blank sub-agency lands in the store as agency='' (and a parquet named
+    # `_{date}_{hex}.parquet`). Matching then has no agency for the subject line,
+    # so block the save rather than shipping rows the email pre-write can't label.
+    blank_agency = int(
+        edited_df['agency'].fillna('').astype(str).str.strip()
+        .str.lower().isin(['', 'nan', 'none']).sum()
+    )
+    if blank_agency:
+        st.warning(
+            f'**{blank_agency}** of **{n_topics}** topic(s) have no agency. '
+            'Fill the Agency column (or use "Apply to all rows" above) before saving '
+            '— topics without an agency produce mislabelled email subject lines.'
+        )
+
+    save_disabled = (not broad_agency) or bool(blank_agency)
     if st.button('💾 Save & Embed', type='primary', disabled=save_disabled):
         descriptions = edited_df['grant_summary'].astype(str).str.strip()
         if descriptions.eq('').all() or descriptions.eq('None').all():

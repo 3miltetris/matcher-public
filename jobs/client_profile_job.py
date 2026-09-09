@@ -8,8 +8,11 @@ selected company:
 
   1. Merge its contact rows into one material row (first non-empty per column)
   2. Assemble the selected source texts + fingerprint ALL available material
-  3. One Claude call → profile summary + 2-8 independently searchable aspects
-  4. Embed each aspect separately (text-embedding-ada-002, float64)
+  3. One Claude call → profile summary, 2-8 independently searchable aspects,
+     and the markets those aspects serve (up to 4, plus Defense when a DoD use
+     case is plausible), with every aspect earmarked to at least one market
+  4. Embed each aspect AND each market narrative (text-embedding-ada-002,
+     float64), then merge markets whose narratives are near-identical
   5. Upsert the profile row into data/client-profiles/profiles.parquet
 
 Clients are processed concurrently (one Claude call each), and the profile
@@ -30,6 +33,9 @@ Config schema:
   "company_keys":   ["Acme Robotics||https://acme.com", ...],
   "sources":        ["website", "drive", "technology"],
   "target_aspects": 4,
+  "max_markets":    4,
+  "assess_defense": true,
+  "market_merge_threshold": 0.93,
   "model":          "claude-sonnet-4-6",
   "concurrency":    4,
   "dry_run":        false
@@ -121,9 +127,8 @@ def _get_embedding(text: str, oai: OpenAI, encoding: tiktoken.Encoding) -> list[
 
 # ── Claude ─────────────────────────────────────────────────────────────────────
 
-def _claude_aspects(anth: Anthropic, model: str, system: str, user_msg: str
-                    ) -> tuple[str, list[dict]]:
-    """Aspect generation with one strict-JSON retry."""
+def _claude_aspects(anth: Anthropic, model: str, system: str, user_msg: str) -> dict:
+    """Aspect + market generation with one strict-JSON retry."""
     last_err = None
     for attempt in range(2):
         content = user_msg if attempt == 0 else (
@@ -132,7 +137,9 @@ def _claude_aspects(anth: Anthropic, model: str, system: str, user_msg: str
         )
         resp = anth.messages.create(
             model=model,
-            max_tokens=4000,
+            # Aspects plus the markets block; a truncated response is a hard
+            # error below, so leave headroom rather than lose the run.
+            max_tokens=6000,
             system=system,
             messages=[{'role': 'user', 'content': content}],
         )
@@ -157,6 +164,9 @@ def main(config_blob_path: str) -> None:
     wanted_keys  = list(config.get('company_keys') or [])
     sources      = list(config.get('sources') or ap.SOURCE_KEYS)
     target       = int(config.get('target_aspects', 4))
+    max_markets  = int(config.get('max_markets', ap.MAX_MARKETS))
+    assess_def   = bool(config.get('assess_defense', True))
+    merge_thresh = float(config.get('market_merge_threshold', ap.MARKET_MERGE_THRESHOLD))
     model        = config.get('model', ap.DEFAULT_MODEL)
     dry_run      = bool(config.get('dry_run', False))
     workers      = max(1, min(_MAX_WORKERS, int(config.get('concurrency', _DEFAULT_WORKERS))))
@@ -174,7 +184,7 @@ def main(config_blob_path: str) -> None:
     oai      = OpenAI(api_key=_get_secret('openai-api-key'))
     encoding = tiktoken.get_encoding('cl100k_base')
 
-    system = ap.build_aspect_system(target)
+    system = ap.build_aspect_system(target, max_markets, assess_def)
 
     print('Loading client frames…', flush=True)
     frames = _load_client_frames(gcs)
@@ -211,6 +221,8 @@ def main(config_blob_path: str) -> None:
             'model':          model,
             'sources':        sources,
             'target_aspects': target,
+            'max_markets':    max_markets,
+            'assess_defense': assess_def,
             'clients_total':  total,
             'clients_done':   done,
             'built':          built,
@@ -244,7 +256,7 @@ def main(config_blob_path: str) -> None:
             if not texts:
                 return {'key': key, 'name': name, 'outcome': 'error',
                         'note': 'none of the selected sources have material'}
-            summary, aspects = _claude_aspects(
+            parsed = _claude_aspects(
                 anth, model, system,
                 ap.build_aspect_user_message({
                     'company_name': name,
@@ -252,8 +264,24 @@ def main(config_blob_path: str) -> None:
                     'state':        row.get('state'),
                 }, texts),
             )
+            summary = parsed['profile_summary']
+            aspects = parsed['aspects']
+            markets = parsed['markets']
+
             vectors = [_get_embedding(ap.aspect_embed_text(a), oai, encoding)
                        for a in aspects]
+            market_vectors = [_get_embedding(ap.market_embed_text(m), oai, encoding)
+                              for m in markets]
+            if markets:
+                # Two markets whose narratives read alike are one market
+                # described twice; fold them together before storing.
+                aspects, markets, market_vectors = ap.merge_similar_markets(
+                    aspects, markets, market_vectors, merge_thresh
+                )
+                by_name = {m['market']: v for m, v in zip(markets, market_vectors)}
+                aspects, markets = ap.normalize_markets(aspects, markets, max_markets)
+                market_vectors = [by_name[m['market']] for m in markets]
+
             record = ap.build_profile_record(
                 company_key     = key,
                 company_name    = name,
@@ -266,6 +294,9 @@ def main(config_blob_path: str) -> None:
                 # used — any later change to any of it should read as stale.
                 fingerprint     = ap.source_fingerprint(ap.assemble_source_texts(row)),
                 model           = model,
+                markets         = markets,
+                market_vectors  = market_vectors,
+                dod_assessment  = parsed['dod_assessment'],
             )
             return {'key': key, 'name': name, 'outcome': 'built', 'record': record}
         except Exception as e:
@@ -273,7 +304,8 @@ def main(config_blob_path: str) -> None:
             return {'key': key, 'name': name, 'outcome': 'error', 'note': str(e)[:300]}
 
     print(f'Building {total} profile(s) with {workers} worker(s), model={model}, '
-          f'sources={",".join(sources)}', flush=True)
+          f'sources={",".join(sources)}, max_markets={max_markets}, '
+          f'assess_defense={assess_def}', flush=True)
     _write_status(gcs, run_id, _status('running'))
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -287,13 +319,19 @@ def main(config_blob_path: str) -> None:
                 rec = res['record']
                 records.append(rec)
                 built.append({
-                    'company_key':  rec['company_key'],
-                    'company_name': rec['company_name'],
-                    'n_aspects':    rec['n_aspects'],
-                    'sources_used': rec['sources_used'],
+                    'company_key':   rec['company_key'],
+                    'company_name':  rec['company_name'],
+                    'n_aspects':     rec['n_aspects'],
+                    'sources_used':  rec['sources_used'],
                     'aspect_labels': rec['aspect_labels'],
+                    'n_markets':     rec['n_markets'],
+                    'market_labels': rec['market_labels'],
+                    'has_defense':   ap.DEFENSE_MARKET in [
+                        m.get('market') for m in ap.profile_markets(rec)
+                    ],
                 })
-                print(f'[{done}/{total}] {name} → {rec["n_aspects"]} aspects', flush=True)
+                print(f'[{done}/{total}] {name} → {rec["n_aspects"]} aspects, '
+                      f'{rec["n_markets"]} markets [{rec["market_labels"]}]', flush=True)
             elif res['outcome'] == 'deferred':
                 stopped_early = 'timeout'
                 deferred.append(name)

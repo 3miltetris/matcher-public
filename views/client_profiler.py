@@ -6,8 +6,10 @@ data/all-contacts/clients/ out of material that already exists on their
 rows — the website summary/scrape, Drive document extractions written by
 drive-sync-job, and Deep Research output written by the Client Research
 view. Claude splits that material into a handful of distinct, independently
-searchable aspects; each aspect is embedded separately and the profile is
-stored as one row per company in data/client-profiles/profiles.parquet.
+searchable aspects, then groups those aspects into the markets they serve
+(up to 4, plus Defense whenever a DoD use case is plausible). Every aspect and
+every market narrative is embedded separately and the profile is stored as one
+row per company in data/client-profiles/profiles.parquet.
 
 Nothing here writes to the client parquets — profiles live in their own
 store, so Client Editor / Client Research / Drive Sync can keep rewriting
@@ -58,6 +60,9 @@ _JOB_WORKERS    = 4
 _STATUS_NONE    = '— none'
 _STATUS_CURRENT = '✅ current'
 _STATUS_STALE   = '⚠️ stale'
+# Built before markets existed: the material is unchanged, but the profile
+# can't take part in a market-scoped match run until it is rebuilt.
+_STATUS_NOMARKET = '⚠️ no markets'
 
 
 # ── GCS / Cloud Run ────────────────────────────────────────────────────────
@@ -131,12 +136,18 @@ def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataF
         fp        = ap.source_fingerprint(available)
         prof      = stored.get(key)
 
+        n_markets = 0
+        if prof is not None and pd.notna(prof.get('n_markets')):
+            n_markets = int(prof['n_markets'])
+
         if prof is None:
             status = _STATUS_NONE
-        elif str(prof.get('source_fingerprint') or '') == fp:
-            status = _STATUS_CURRENT
-        else:
+        elif str(prof.get('source_fingerprint') or '') != fp:
             status = _STATUS_STALE
+        elif n_markets < 1:
+            status = _STATUS_NOMARKET
+        else:
+            status = _STATUS_CURRENT
 
         rows.append({
             '_key':        key,
@@ -147,6 +158,7 @@ def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataF
             'material':    sum(len(t) for t in available.values()),
             'status':      status,
             'aspects':     int(prof['n_aspects']) if prof is not None and pd.notna(prof.get('n_aspects')) else 0,
+            'markets':     str(prof.get('market_labels') or '') if prof is not None else '',
             'built_at':    str(prof.get('built_at') or '') if prof is not None else '',
             '_fingerprint': fp,
             '_available':  list(available.keys()),
@@ -226,6 +238,7 @@ if st.session_state.cp_active_run:
         else:
             st.session_state.cp_build_summary = {
                 'built':    [b.get('company_name') or '—' for b in status.get('built') or []],
+                'defense':  sum(1 for b in status.get('built') or [] if b.get('has_defense')),
                 'errors':   list(status.get('errors') or []),
                 'deferred': list(status.get('deferred') or []),
                 'run_id':   run_id,
@@ -297,6 +310,7 @@ with col_info:
         f'{len(directory):,} client companies · '
         f'{int((directory["status"] == _STATUS_CURRENT).sum()):,} current profiles · '
         f'{int((directory["status"] == _STATUS_STALE).sum()):,} stale · '
+        f'{int((directory["status"] == _STATUS_NOMARKET).sum()):,} without markets · '
         f'{int((directory["status"] == _STATUS_NONE).sum()):,} unprofiled'
     )
 
@@ -314,6 +328,19 @@ with opt_l:
              'depending on how much distinct material a client has.',
     )
     model = st.selectbox('Model', ap.ASPECT_MODELS, index=0)
+    max_markets = st.number_input(
+        'Max markets (excluding Defense)', min_value=1, max_value=ap.MAX_MARKETS,
+        value=ap.MAX_MARKETS, step=1,
+        help='Markets are named from a fixed list so one market means the same '
+             'thing for every client. Each aspect is earmarked to the markets '
+             'it serves, and Bulk Aspect Match can run one market at a time.',
+    )
+    assess_defense = st.checkbox(
+        'Assess a Defense / DoD use case', value=True,
+        help='Adds a Defense market whenever there is a plausible defense '
+             'application, even a loose one. When there is none, the reason is '
+             'stored on the profile instead.',
+    )
 
 with opt_r:
     st.markdown('**Source material to use**')
@@ -323,6 +350,16 @@ with opt_r:
     ]
     if not include_keys:
         st.warning('Select at least one source of material.')
+
+    with st.expander('Advanced'):
+        merge_threshold = st.slider(
+            'Merge markets whose narratives are this similar', 0.80, 0.99,
+            ap.MARKET_MERGE_THRESHOLD, 0.01,
+            help='Two markets of the same company whose narrative embeddings '
+                 'score above this are one market described twice, and are '
+                 'folded together at build time. Lower to merge more '
+                 'aggressively.',
+        )
 
 # ── Client picker ──────────────────────────────────────────────────────────
 
@@ -360,7 +397,8 @@ elif view.empty:
     )
 
 if not view.empty:
-    editor_df = view[['company', 'website', 'sources', 'contacts', 'status', 'aspects', 'built_at']].copy()
+    editor_df = view[['company', 'website', 'sources', 'contacts', 'status',
+                      'aspects', 'markets', 'built_at']].copy()
     editor_df.insert(0, 'build', view['status'] != _STATUS_CURRENT)
 
     edited = st.data_editor(
@@ -368,7 +406,8 @@ if not view.empty:
         hide_index=True,
         use_container_width=True,
         height=min(460, 60 + 36 * len(editor_df)),
-        disabled=['company', 'website', 'sources', 'contacts', 'status', 'aspects', 'built_at'],
+        disabled=['company', 'website', 'sources', 'contacts', 'status', 'aspects',
+                  'markets', 'built_at'],
         column_config={
             'build':    st.column_config.CheckboxColumn('Build', help='Build or rebuild this profile'),
             'company':  st.column_config.TextColumn('Client'),
@@ -377,6 +416,7 @@ if not view.empty:
             'contacts': st.column_config.NumberColumn('Contacts', format='%d'),
             'status':   st.column_config.TextColumn('Profile'),
             'aspects':  st.column_config.NumberColumn('Aspects', format='%d'),
+            'markets':  st.column_config.TextColumn('Markets', width='medium'),
             'built_at': st.column_config.TextColumn('Built'),
         },
         key=f'cp_dir_editor_{st.session_state.cp_build_nonce}_{show}_{search.strip().lower()}',
@@ -405,6 +445,9 @@ if not view.empty:
                 'company_keys':   selected_keys,
                 'sources':        include_keys,
                 'target_aspects': int(target_aspects),
+                'max_markets':    int(max_markets),
+                'assess_defense': bool(assess_defense),
+                'market_merge_threshold': float(merge_threshold),
                 'model':          model,
                 'concurrency':    _JOB_WORKERS,
                 'dry_run':        False,
@@ -436,6 +479,8 @@ if st.session_state.cp_build_summary:
         st.success(
             f'Built **{len(summary["built"])}** profile'
             f'{"s" if len(summary["built"]) != 1 else ""} → `{ap.PROFILES_BLOB}`'
+            + (f'  ·  {summary["defense"]} with a Defense market'
+               if summary.get('defense') else '')
             + (f'  ·  run `{summary["run_id"]}`' if summary.get('run_id') else '')
         )
     elif not summary['errors']:
@@ -496,27 +541,100 @@ new_summary = st.text_area(
 )
 
 aspects = ap.profile_aspects(prof_row)
+markets = ap.profile_markets(prof_row)
+
+if not markets:
+    st.warning(
+        'This profile has no markets — it was built before markets existed, or '
+        'the build produced none. Rebuild it above to match it by market; it '
+        'still works in the whole-company mode of Bulk Aspect Match.'
+    )
+elif not any(m.get('market') == ap.DEFENSE_MARKET for m in markets):
+    st.caption(
+        '🎖️ No Defense market: '
+        + (str(prof_row.get('dod_assessment') or '') or 'no reason recorded.')
+    )
+
 aspect_df = pd.DataFrame(
-    aspects or [{'label': '', 'kind': 'capability', 'text': '', 'keywords': '', 'evidence': ''}]
+    aspects or [{'label': '', 'kind': 'capability', 'text': '', 'keywords': '',
+                 'evidence': '', 'markets': []}]
 )
 for col in ('label', 'kind', 'text', 'keywords', 'evidence'):
     if col not in aspect_df.columns:
         aspect_df[col] = ''
+# Membership is edited as text; normalize_markets canonicalises it on save.
+aspect_df['markets'] = [
+    ', '.join(a.get('markets') or []) for a in (aspects or [{}])
+]
 
-st.markdown('**Aspects** — each row is embedded on its own and scored against every grant topic.')
+st.markdown(
+    '**Aspects** — each row is embedded on its own and scored against every '
+    'grant topic. `Markets` decides which market runs an aspect takes part in.'
+)
 edited_aspects = st.data_editor(
-    aspect_df[['label', 'kind', 'text', 'keywords', 'evidence']],
+    aspect_df[['label', 'kind', 'text', 'keywords', 'markets', 'evidence']],
     hide_index=True,
     use_container_width=True,
     num_rows='dynamic',
     column_config={
         'label':    st.column_config.TextColumn('Label', width='medium'),
-        'kind':     st.column_config.SelectboxColumn('Kind', options=ap.ASPECT_KINDS, width='small'),
+        'kind':     st.column_config.SelectboxColumn('Aspect type', options=ap.ASPECT_KINDS,
+                                                     width='small'),
         'text':     st.column_config.TextColumn('Aspect text (embedded)', width='large'),
         'keywords': st.column_config.TextColumn('Keywords (embedded)', width='medium'),
+        'markets':  st.column_config.TextColumn(
+            'Markets', width='medium',
+            help='Comma-separated, from: ' + ', '.join(ap.MARKET_CATEGORIES)
+                 + '. An aspect left blank is put in the primary market.'),
         'evidence': st.column_config.TextColumn('Evidence', width='medium'),
     },
     key=f'cp_aspect_editor_{sel_key}',
+)
+
+market_rows = [{
+    'market':    str(m.get('market') or ''),
+    'tier':      str(m.get('tier') or 'secondary'),
+    'subtitle':  str(m.get('subtitle') or ''),
+    'narrative': str(m.get('narrative') or ''),
+    'keywords':  str(m.get('keywords') or ''),
+    'aspects':   ', '.join(m.get('aspect_labels') or []),
+} for m in markets]
+# Profiles built before markets existed start with an empty table rather than
+# a seeded row: a placeholder market with no narrative fails the save check
+# below, which would block every other edit on the profile until the user
+# deleted a row they never added.
+market_df = pd.DataFrame(
+    market_rows,
+    columns=['market', 'tier', 'subtitle', 'narrative', 'keywords', 'aspects'],
+)
+
+st.markdown(
+    '**Markets** — each narrative is embedded too and scored alongside that '
+    "market's aspects, so a Defense use case can pull in topics no single "
+    'aspect would. The `Aspects` column is derived from the table above.'
+)
+if market_df.empty:
+    st.caption(
+        'This profile predates markets. Add rows here to give it some, or '
+        'rebuild it above — market-scoped match runs skip it until then.'
+    )
+edited_markets = st.data_editor(
+    market_df,
+    hide_index=True,
+    use_container_width=True,
+    num_rows='dynamic',
+    disabled=['aspects'],
+    column_config={
+        'market':    st.column_config.SelectboxColumn('Market', options=ap.MARKET_CATEGORIES,
+                                                      width='medium'),
+        'tier':      st.column_config.SelectboxColumn('Tier', options=ap.MARKET_TIERS,
+                                                      width='small'),
+        'subtitle':  st.column_config.TextColumn('Subtitle', width='medium'),
+        'narrative': st.column_config.TextColumn('Market narrative (embedded)', width='large'),
+        'keywords':  st.column_config.TextColumn('Keywords (embedded)', width='medium'),
+        'aspects':   st.column_config.TextColumn('Aspects (derived)', width='medium'),
+    },
+    key=f'cp_market_editor_{sel_key}',
 )
 
 save_col, del_col = st.columns([1, 1])
@@ -536,16 +654,46 @@ with save_col:
                 'text':     text,
                 'keywords': str(r.get('keywords') or '').strip(),
                 'evidence': str(r.get('evidence') or '').strip(),
+                'markets':  [s.strip() for s in str(r.get('markets') or '').split(',')
+                             if s.strip()],
+            })
+
+        cleaned_markets = []
+        missing_narrative = []
+        for _, r in edited_markets.iterrows():
+            name = ap.canonical_market(r.get('market'))
+            if not name:
+                continue
+            narrative = str(r.get('narrative') or '').strip()
+            if not narrative:
+                missing_narrative.append(name)
+                continue
+            tier = str(r.get('tier') or '').strip().lower()
+            cleaned_markets.append({
+                'market':    name,
+                'tier':      tier if tier in ap.MARKET_TIERS else 'secondary',
+                'subtitle':  str(r.get('subtitle') or '').strip()[:160],
+                'narrative': narrative,
+                'keywords':  str(r.get('keywords') or '').strip(),
             })
 
         if not cleaned:
             st.error('Every aspect needs both a label and aspect text.')
         elif len(cleaned) > ap.MAX_ASPECTS:
             st.error(f'At most {ap.MAX_ASPECTS} aspects per profile.')
+        elif missing_narrative:
+            st.error(
+                'These markets need a narrative before they can be embedded: '
+                + ', '.join(missing_narrative)
+            )
         else:
             try:
+                cleaned, cleaned_markets = ap.normalize_markets(cleaned, cleaned_markets)
                 tp      = TextProcessor(api_key=st.secrets['openai_api_key'])
                 vectors = [tp.get_embedding(ap.aspect_embed_text(a)) for a in cleaned]
+                market_vectors = [
+                    tp.get_embedding(ap.market_embed_text(m)) for m in cleaned_markets
+                ]
                 record  = ap.build_profile_record(
                     company_key     = sel_key,
                     company_name    = str(prof_row['company_name'] or ''),
@@ -553,6 +701,9 @@ with save_col:
                     profile_summary = new_summary.strip(),
                     aspects         = cleaned,
                     vectors         = vectors,
+                    markets         = cleaned_markets,
+                    market_vectors  = market_vectors,
+                    dod_assessment  = str(prof_row.get('dod_assessment') or ''),
                     sources_used    = str(prof_row['sources_used'] or '').split(',') if prof_row['sources_used'] else [],
                     fingerprint     = str(prof_row['source_fingerprint'] or ''),
                     # Recorded once, however many times the profile is edited
@@ -564,7 +715,10 @@ with save_col:
                 ap.save_profiles(_get_storage_client(), merged)
                 st.session_state.cp_profiles = merged
                 st.session_state.cp_flash = (
-                    f'Saved {len(cleaned)} aspect(s) for {record["company_name"]}.'
+                    f'Saved {len(cleaned)} aspect(s) and {len(cleaned_markets)} '
+                    f'market(s) for {record["company_name"]}.'
+                    + ('' if cleaned_markets else
+                       ' No markets — this profile is skipped by market-scoped runs.')
                 )
                 st.rerun()
             except Exception as e:

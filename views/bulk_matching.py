@@ -314,6 +314,18 @@ if not grant_agencies:
     st.warning('No grant agencies found in GCS.')
     st.stop()
 
+# Quick-select buttons run before the checkboxes are created, so writing their
+# session-state keys here is what sets the widget values for this run.
+ags1, ags2, _ags3 = st.columns([1, 1, 6])
+if ags1.button('Select all', key='bm_agency_all'):
+    for ag in grant_agencies:
+        st.session_state[f'bm_agency_{ag}'] = True
+    st.rerun()
+if ags2.button('Deselect all', key='bm_agency_none'):
+    for ag in grant_agencies:
+        st.session_state[f'bm_agency_{ag}'] = False
+    st.rerun()
+
 ag_cols = st.columns(min(len(grant_agencies), 6))
 selected_agencies = [
     ag

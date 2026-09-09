@@ -11,6 +11,7 @@ for current model identifiers — OpenAI renames these frequently.
 """
 
 import json
+import math
 import re
 
 # ── Models & pricing ────────────────────────────────────────────────────────
@@ -145,6 +146,154 @@ FIELD_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
 ]
 
 ALL_FIELDS: list[str] = [f for _, fields in FIELD_SECTIONS for f, _ in fields]
+
+
+# ── Numeric normalization ───────────────────────────────────────────────────
+# Research values are prose-y strings ("$0–250,000 (Estimated)", "48/100",
+# "~$4.2M", "50-100 employees"). For lead scoring in HubSpot those need to be
+# plain numbers, so every field below also gets a "{field}_num" companion
+# holding a single integer — the midpoint of a range, or the lone figure.
+
+NUMERIC_FIELDS: list[str] = [
+    'revenue_estimate',
+    'total_venture_funding',
+    'total_grant_funding',
+    'estimated_valuation',
+    'federal_awards_count_3yr',
+    'federal_awards_total_3yr',
+    'sbir_sttr_count_3yr',
+    'sbir_sttr_total_3yr',
+    'employee_count_current',
+    'estimated_proposals_per_year',
+    'score_total',
+    'score_funding_activity',
+    'score_momentum',
+    'score_org_capacity',
+    'score_budget_signals',
+    'score_fit_external_support',
+    'proposal_budget_estimate',
+    'confidence_score',
+]
+
+NUMERIC_SUFFIX = '_num'
+
+_NULLISH = {
+    '', '-', '—', '–', 'not found', 'notfound', 'unknown', 'n/a', 'na',
+    'none', 'nan', 'tbd', 'not applicable', 'not disclosed', 'undisclosed',
+    'no data', 'not available',
+}
+
+_MULTIPLIERS = {
+    'k': 1e3, 'thousand': 1e3,
+    'm': 1e6, 'mm': 1e6, 'million': 1e6,
+    'b': 1e9, 'bn': 1e9, 'billion': 1e9,
+}
+
+# A figure plus an optional scale suffix. The \b after the suffix stops the
+# "b" of "board members" or the "m" of "months" being read as a multiplier.
+_NUM_RE = re.compile(
+    r'(?P<num>\d+(?:,\d{3})*(?:\.\d+)?)'
+    r'\s*(?P<suffix>(?:thousand|million|billion|mm|bn|[kmb])\b)?',
+    re.I,
+)
+
+# Text allowed between two figures for them to count as a range. The trailing
+# currency/approximation characters matter: "$0 - $250,000" and "$250K-$1M"
+# both put a "$" between the two figures.
+_RANGE_SEP_RE = re.compile(
+    r'^\s*(?:-|–|—|~|to|and|through)\s*[~$€£]?\s*$', re.I
+)
+
+# Research prose routinely labels a figure with a fiscal year or a quarter
+# ("FY2024: $2.5M", "Q1 2025 revenue of $3M"). Those tokens are context, not
+# the value, and reading one as the answer writes a garbage number into a
+# HubSpot number property used for lead scoring. They are dropped whenever a
+# real figure survives alongside them — a bare year on its own is still
+# returned, since there it may genuinely be the answer.
+_YEAR_RE            = re.compile(r'^(?:19|20)\d{2}$')
+_PERIOD_BEFORE_RE   = re.compile(r'(?:^|[^a-z0-9])(?:q|fy|cy)\s*$', re.I)
+_CURRENCY_BEFORE_RE = re.compile(r'[$€£¥]\s*$')
+
+
+def _is_period_label(m, text: str) -> bool:
+    """True when a match reads as a fiscal-period label rather than a figure."""
+    raw = m.group('num')
+    if m.group('suffix') or ',' in raw or '.' in raw:
+        return False
+    before = text[:m.start()]
+    if _CURRENCY_BEFORE_RE.search(before):     # "$2024" is money, not a year
+        return False
+    if _PERIOD_BEFORE_RE.search(before):       # Q1, FY24, CY2025
+        return True
+    return bool(_YEAR_RE.match(raw))
+
+
+def to_number(value) -> float | None:
+    """Best-effort single number out of a research field value.
+
+    "$0-250,000 (Estimated)" → 125000.0   (midpoint of the range)
+    "~$4.2M"                 → 4200000.0
+    "1-2 million"            → 1500000.0  (suffix carries to the low end)
+    "48/100"                 → 48.0       (leading figure, not a range)
+    "50-100 employees"       → 75.0
+    "FY2024: $2.5M"          → 2500000.0  (the year is a label, not the value)
+    "Not found"              → None
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = re.sub(r'\([^)]*\)', ' ', str(value))   # drop "(Estimated)" labels
+    text = text.replace('%', ' ')
+    if text.strip().lower() in _NULLISH:
+        return None
+
+    matches = list(_NUM_RE.finditer(text))
+    if not matches:
+        return None
+    figures = [m for m in matches if not _is_period_label(m, text)]
+    if figures:
+        matches = figures
+
+    def figure(m, fallback_suffix: str | None = None) -> float:
+        n = float(m.group('num').replace(',', ''))
+        suffix = (m.group('suffix') or fallback_suffix or '').strip().lower()
+        return n * _MULTIPLIERS.get(suffix, 1.0)
+
+    lo = matches[0]
+    if len(matches) > 1:
+        hi = matches[1]
+        between = text[lo.end():hi.start()]
+        if _RANGE_SEP_RE.match(between):
+            # "1-2 million": the low end inherits the high end's scale
+            return (figure(lo, hi.group('suffix')) + figure(hi)) / 2
+
+    return figure(lo)
+
+
+def to_number_str(value) -> str:
+    """to_number() rendered as an integer string, '' when unparseable.
+
+    Empty is deliberate — a HubSpot number property left blank reads as
+    "no data", whereas a 0 would drag scoring models down.
+    """
+    n = to_number(value)
+    if n is None:
+        return ''
+    # Round half away from zero — round() is banker's rounding, which would
+    # turn the midpoint of "2-3 proposals" into 2.
+    return str(math.floor(n + 0.5) if n >= 0 else -math.floor(-n + 0.5))
+
+
+def numeric_columns(d: dict) -> dict[str, str]:
+    """{field}_num integer-string companions for every NUMERIC_FIELDS entry."""
+    return {
+        f'{f}{NUMERIC_SUFFIX}': to_number_str(d.get(f))
+        for f in NUMERIC_FIELDS
+    }
 
 
 # ── Prompt construction ─────────────────────────────────────────────────────
