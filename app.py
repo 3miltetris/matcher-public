@@ -69,6 +69,7 @@ pages = [
     st.Page("views/client_profiler.py",  title="Client Profiles",  icon="🧩"),
     st.Page("views/aspect_match.py",     title="Bulk Aspect Match", icon="🎯"),
     st.Page("views/drive_sync.py",       title="Drive Sync",       icon="🗂️"),
+    st.Page("views/fathom_sync.py",      title="Fathom Meetings",  icon="🎙️"),
     st.Page("views/resume_importer.py", title="Resume Importer",  icon="📄"),
     st.Page("views/resume_search.py",   title="Resume Search",    icon="🔎"),
     # Uncomment as pages are built:

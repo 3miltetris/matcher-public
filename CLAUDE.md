@@ -26,6 +26,7 @@ views/
   resume_importer.py          # Upload HubSpot contacts CSV → fetch resumes by URL → extract text → GPT expertise summary → embed → save
   resume_search.py            # Natural-language search across resume embeddings → ranked candidate list
   drive_sync.py               # Scan the client Google shared drive → auto-assign folders to clients (fuzzy match, saved assignments) → trigger drive-sync-job → results + new-client review queue
+  fathom_sync.py              # Fathom notetaker: connection test → metadata scan → external-invitee-domain → client assignments (review table) → pick clients → trigger fathom-sync-job → results + stored transcript browser
   client_profiler.py          # Pick clients + sources → trigger client-profile-job (multi-aspect capability profiles + their markets, from website summary / Drive docs / Deep Research) → poll status; review/edit aspects + markets in-process → data/client-profiles/profiles.parquet
   aspect_match.py             # Bulk multi-aspect match: whole company or per market (tier + category filters) × every selected grant topic → threshold/coverage filter → deduped Claude LLM re-rank → CSV
   suggestions.py              # Team feature-request board with upvoting
@@ -37,6 +38,7 @@ src/
       text_embedder.py        # TextProcessor class — embeddings, chunking, normalization
     GoogleBucketManager/
       bucket_manager.py       # BucketManager class — GCS upload/download
+    fathom_client.py        # Streamlit-free Fathom REST client — global rate-limit gate, retry/backoff, iter_meetings/get_transcript, domain + field helpers (shared by the Fathom Meetings view and fathom-sync-job)
     Scraping/
       web_scraper.py          # WebScraper class — Selenium-based scraper (legacy)
     email_generator.py        # async_generate_subject_line, async_josiah_copy
@@ -55,11 +57,13 @@ jobs/
   sam_gov_job.py              # Cloud Run Job — SAM.gov fetch metadata → screen (title+NAICS) → dedup → fetch descriptions for survivors → summarize → embed → save
   contact_import_job.py       # Cloud Run Job — download staged file → map cols → dedup → profile (scrape+GPT or Deep Research tech focus) → embed → save contacts
   drive_sync_job.py           # Cloud Run Job — Drive scan per assigned client → diff vs sync_state → extract changed docs → Claude profile merge → write docs columns + re-embed summary
+  fathom_sync_job.py          # Cloud Run Job — one cheap /meetings sweep → attribute by external invitee domain → fetch transcripts for new calls → store raw JSON + index parquet → Claude per-client digest → write meeting columns (never touches summary/embeddings)
   client_profile_job.py       # Cloud Run Job — merge each client's material rows → Claude aspect + market split (concurrent) → embed each aspect and market narrative → merge near-identical markets → upsert data/client-profiles/profiles.parquet
   Dockerfile                  # Image for matching-job (uses requirements.job.txt)
   Dockerfile.sam_gov          # Image for sam-gov-job (uses requirements.sam_gov_job.txt)
   Dockerfile.contact_import   # Image for contact-import-job — python:3.11-slim + Chromium system libs + playwright install chromium; also COPYs src/modules/{finance,tech}_research.py (shared Deep Research schema)
   Dockerfile.drive_sync       # Image for drive-sync-job — python:3.11-slim, no Chromium; COPYs src/modules/{doc_extract,drive_client}.py
+  Dockerfile.fathom_sync      # Image for fathom-sync-job — python:3.11-slim; COPYs src/modules/fathom_client.py
   Dockerfile.client_profile   # Image for client-profile-job — python:3.11-slim; COPYs src/modules/{aspect_profile,finance_research,tech_research}.py + GoogleBucketManager/bucket_manager.py
 
 requirements.txt                    # Streamlit app dependencies (includes aiohttp, tldextract, playwright, google-api-python-client, openpyxl)
@@ -67,6 +71,7 @@ requirements.job.txt                # matching-job dependencies (lean — no Str
 requirements.sam_gov_job.txt        # sam-gov-job dependencies (adds requests, beautifulsoup4, tiktoken, pymupdf)
 requirements.contact_import_job.txt # contact-import-job dependencies (aiohttp, playwright, tldextract, openpyxl, tiktoken, openai, pandas/numpy/pyarrow, GCS)
 requirements.drive_sync_job.txt     # drive-sync-job dependencies (anthropic, openai, google-api-python-client, pymupdf, python-docx, openpyxl, tiktoken)
+requirements.fathom_sync_job.txt    # fathom-sync-job dependencies (anthropic, requests, pandas/numpy/pyarrow, GCS — no openai: this job never embeds)
 requirements.client_profile_job.txt # client-profile-job dependencies (anthropic, openai, tiktoken, pandas/numpy/pyarrow, GCS)
 ```
 
@@ -129,13 +134,29 @@ requirements.client_profile_job.txt # client-profile-job dependencies (anthropic
 - **Sync:** pick exactly which assigned clients to process (multiselect showing each client's last-synced date + folder count, quick-select buttons for All / None / Never synced / Stale > 30 days, plus a read-only status table of every assigned client), pick which **unassigned folders** should produce new-client proposals (defaults to never-proposed folders; All / None / Never proposed buttons), choose a **time budget** (1 h → 24 h, default 4 h) and optionally raise the per-client document caps → `drive-sync-job` Cloud Run Job lists each client's folder recursively, diffs file `modifiedTime` against `drive-sync-configs/sync_state.json` (unchanged clients cost zero downloads/LLM calls; "Full re-scan" checkbox bypasses), extracts changed docs (Google Docs/Sheets/Slides exported; PDF/DOCX/XLSX/TXT/CSV binaries ≤15 MB via `src/modules/doc_extract.py`; caps: 40 docs / 150k chars per client, overflow deferred to next run), then one Claude (`claude-sonnet-4-6`) merge call per changed client: current `summary` + prior `client_docs_data` + new doc texts → `{no_meaningful_change, updated_summary, docs_digest, extracted}`. Writes `client_docs_data` (JSON) / `client_docs_summary` (digest) / `docs_updated_at` (ISO date) onto every contact row of the client; rewrites `summary` + re-embeds (`text-embedding-ada-002`, float64) **only when the change is meaningful**. Touched parquets + sync_state + interim status checkpoint every 10 clients (re-trigger resumes after timeout). Dry-run mode reports without writing.
 - **New clients:** unassigned folders produce proposals (name/summary/digest) in the status payload. **Website extraction:** business email/URL domains are harvested around each proposal folder — Drive share permissions (`permissions.list` on the folder, weight ×3), file `lastModifyingUser` emails (×2), and emails/URLs in doc text (×1) — with freemail/our-own/gov domains filtered out. The top candidates are passed to Claude as `candidate_domains` (it may pick one that clearly belongs to the company); if Claude leaves the website empty, a deterministic fallback fills it when a domain stem matches the company/folder name (exact → containment → acronym → difflib ≥ 0.8, frequency tie-break) — `website_source` records `claude` vs `domain_match`, and `candidate_domains` ships in the proposal for UI hints. Websites are never invented beyond these signals. The view's review queue requires a website per approval (**proposals with a pre-filled website are pre-checked for approval**), embeds in Streamlit, writes rows (clients convention: `company_name`/`summary`) to a new `data/all-contacts/clients/drive_sync_{date}_{hex6}.parquet`, and converts the folder into a normal assignment.
 
+**Stage 9 — Fathom meeting ingestion** (client calls → capability material for Stage 8)
+
+Client calls are where clients actually describe their technology, their R&D, and the federal awards they have already won — detail that never makes it onto a website or into a Drive folder. Stage 9 pulls those calls from the [Fathom](https://developers.fathom.ai) notetaker, stores them durably, and distils them per client into a digest the Stage 8 aspect builder reads as its `meetings` source.
+
+- **Attribution is by external calendar-invitee domain.** A meeting belongs to the client whose `companyWebsite` domain matches one of its external invitees; anything else lands in a review table and is remembered in `fathom-configs/assignments.json` (`domain → {client_key, match_type: auto|manual}`, plus `unassigned` / `skipped` buckets). Fathom's own HubSpot company match (`include_crm_matches`) is shown in the review table as a **hint only** and never auto-assigns. **Measured on the real store (2026-09-09): ~46% of swept meetings auto-attribute, leaving ~200 distinct unmatched domains.** Most of those are prospects and one-off calls that should be **skipped**, not clients that were mismatched — so triaging the review table once is the actual first-run workflow, not an edge case. Skipped domains are never offered again. Unattributed meetings are deliberately **not** marked synced, so assigning a domain later ingests its whole backlog on the next run without a full re-sync. Only meetings with at least one external invitee are swept — an internal-only call has no external domain and could never be attributed. **A meeting whose only external attendee is on a freemail domain is also unattributable:** it passes the API's `one_or_more_external` filter, but `fathom_client.bare_domain()` drops `GENERIC_DOMAINS` (gmail, outlook, …), so no domain survives to match on (19 of 400 meetings in a sample sweep). Those calls are reported as swept but never ingested, and there is no domain to assign in the review table.
+- **Via Fathom Meetings view** (`views/fathom_sync.py`): connection test (lists the newest meetings *and their recorders*, so the key's real visibility is verifiable) → metadata-only scan over a chosen window (no transcripts, no LLM calls) that auto-matches domains and files the rest for review → domain review `st.data_editor` → client multiselect (All / None / Never synced / Has calls quick-picks, labels showing last-synced date and calls seen vs ingested) → look-back window, time budget (1–24 h), dry run, full re-sync, and an Advanced expander for the per-client caps → trigger `fathom-sync-job` → poll `fathom-jobs/{run_id}/status.json`. A final section browses `data/fathom/meetings_index.parquet` and loads any stored transcript.
+- **`fathom-sync-job` pipeline:** one paginated `GET /meetings` sweep with `include_summary` + `include_action_items` + `include_crm_matches` (the AI summary rides along on each page, so only transcripts cost a per-meeting call) → attribute → skip `recording_id`s already in `fathom-configs/sync_state.json` → fetch transcripts for new attributed calls of the selected clients → store each call verbatim at `data/fathom/meetings/{recording_id}.json` and one row per call in `data/fathom/meetings_index.parquet` → one Claude (`claude-sonnet-4-6`) call per client merging prior digest + prior extraction + the new calls → write `client_meetings_data` / `client_meetings_summary` / `meetings_updated_at` onto every contact row of the client. Touched parquets + sync_state + interim status checkpoint every 10 clients; calls over `max_meetings_per_client` (default 12) or `per_client_char_cap` (default 120k) are **deferred, not marked synced**, so the next run picks them up. Active clients routinely exceed the per-client cap — the heaviest have 20–30 calls in a 90-day window against a default of 12 — so catching up a long-standing client takes 2–3 successive runs rather than one.
+- **This job never touches `summary` or `embeddings`** — by construction, the merge prompt has no `updated_summary` field. Meeting material influences grant matching only through the multi-aspect profiles, so Bulk Matching results are unaffected until a profile is rebuilt.
+- **Confirmed vs aspirational** is the prompt's central rule: transcripts are full of "we're thinking about pivoting to…". Only capability the company demonstrably has today goes in the main `extracted` arrays; anything hypothetical, planned, or belonging to a third party is pushed into `notable_updates` with its status made explicit, so the aspect builder can never read speculation as fact. This is why `aspect_profile._RULES` needed no change.
+- **The digest is scoped to the company, not the engagement.** These are consulting calls, so most of what is said is about our own work: deliverables in preparation, submission deadlines, portal mechanics, who owes whom what. A first pass let that through and it flowed straight into the profile source text, because `_meetings_text()` feeds the digest verbatim. The prompt now excludes the project-management wrapper while explicitly keeping the substance underneath it — which agencies and programs the company is pursuing still lands in `federal_programs_agencies`, and the technology being demonstrated still lands in `technologies`. Measured effect on one client: the digest went from opening on grant-calendar admin to opening on its sensor stack, and `technologies` fell 14 → 6 as pursuit items dropped out.
+- **`aspect_profile._meetings_text()` deliberately excludes the meeting list** (titles/dates live in `client_meetings_data['meetings']` for provenance and are shown in the view). Folding them into the source text would change `source_fingerprint` — and so flag every profile ⚠️ stale — every time a purely administrative call was ingested. When Claude reports `no_meaningful_change`, the prior digest and extraction are kept for the same reason.
+- **Sweep size and duration are predictable:** `GET /meetings` returns **10 meetings per page**, so a 90-day window over current call volume is ~103 pages ≈ 1,000 meetings, and at the heavy-tier 2.5 s gate the sweep alone takes ~4–5 minutes before the first transcript is fetched. Budget the time window accordingly — the sweep is the floor on run duration, not the transcripts.
+- **Rate limits are the binding constraint.** Fathom allows 60 requests/60 s in general but only **30/60 s for "heavy" calls** (anything carrying a summary or transcript), and its own docs warn this can collapse to 5/60 s under load. Every request therefore passes through one process-global pacing gate in `fathom_client` (1.05 s standard, 2.50 s heavy) with `Retry-After`-aware backoff; exhausted 429 retries raise `RateLimitStalledError`, which aborts the sweep with `stopped_early: "rate_limit"` rather than burning the task timeout on doomed waits.
+- **API keys are per user, never per org.** A key sees meetings its owner recorded plus meetings shared with their team — never other people's private unshared calls. Whichever admin's key is configured therefore defines the ceiling on what the matcher can ever ingest; the connection test exists to make that visible before a big run.
+- Webhooks (`new-meeting-content-ready`) are not used: they need a public HTTPS endpoint with HMAC verification, and the app is behind IAP.
+
 **Stage 8 — Multi-aspect profiling & matching** (clients → per-aspect embeddings → re-ranked client×topic matches)
 
 A client's single blended `summary` embedding averages away everything except its dominant theme, so a company with three unrelated capability areas matches poorly on all three. Stage 8 splits each client into a handful of independently embedded aspects and matches per aspect.
 
 Aspects are additionally grouped into the **markets** they serve, so a client's defense story can be matched on its own instead of being averaged in with its commercial work. Market names come from the fixed `aspect_profile.MARKET_CATEGORIES` vocabulary (Defense, Aerospace & Space, Health & Life Sciences, …, Other) so one market means the same thing for every client and can be picked from a single dropdown across the directory; everything client-specific lives in the market's free-form `subtitle` and `narrative`. Each market is tiered **primary** (core to the business today) or **secondary** (adjacent/opportunistic), and every aspect is earmarked to at least one market.
 
-- **Via Client Profiles view** (`views/client_profiler.py`): reads only material that already exists on the client rows — website summary/scrape (`summary`, `full_text`/`page_text`), Drive extractions (`client_docs_summary` + `client_docs_data.extracted`), and Deep Research output (`technology_data`, `financial_data`) — per-source include checkboxes (financials off by default, since it describes money not capability). Material is read per company as the **first non-empty value across its contact rows** (a partially-updated file can leave some rows blank; `aspect_profile.merge_company_row()`) and capped per source (~8k–14k chars). The view itself only builds the directory (material available + profile status) and triggers the job — **building runs in `client-profile-job`** (config → `client-profile-configs/{run_id}.json`, status polled at `client-profile-jobs/{run_id}/status.json`, resumable by run ID), so a large batch survives a closed tab. One Claude call per client (`claude-sonnet-4-6` default, Haiku optional, one strict-JSON retry, 4 clients concurrently) returns `{profile_summary, aspects:[{label, kind, text, keywords, evidence, markets}], markets:[{market, tier, subtitle, narrative, keywords, aspects}], dod_assessment}` — 2–8 aspects, each an independently searchable capability/technology/product/domain/market, plus up to `max_markets` (default 4) markets and a **Defense** market whenever a DoD use case is plausible even loosely (Defense does not count toward the cap; when there is genuinely none the one-sentence reason is stored in `dod_assessment`). Everything is grounded only in the supplied material. Each aspect's `label + text + keywords` **and each market's `market + subtitle + narrative + keywords`** are embedded (`text-embedding-ada-002`); markets of one company whose narrative vectors score ≥ `market_merge_threshold` (default 0.93) against each other are one market described twice and are folded together, and `aspect_profile.normalize_markets()` canonicalises names, caps the count, and puts any aspect the model left unassigned into the primary market. The profile is upserted as **one row per company** into `data/client-profiles/profiles.parquet`. Aspects and markets are both editable in the view (`st.data_editor` — aspect membership is edited as a comma-separated `Markets` column and re-derived on save) with a re-embed-and-save button (still in-process — one company), plus delete.
+- **Via Client Profiles view** (`views/client_profiler.py`): reads only material that already exists on the client rows — website summary/scrape (`summary`, `full_text`/`page_text`), Fathom meeting material (`client_meetings_summary` + `client_meetings_data.extracted`, Stage 9), Drive extractions (`client_docs_summary` + `client_docs_data.extracted`), and Deep Research output (`technology_data`, `financial_data`) — per-source include checkboxes (financials off by default, since it describes money not capability). Material is read per company as the **first non-empty value across its contact rows** (a partially-updated file can leave some rows blank; `aspect_profile.merge_company_row()`) and capped per source (~8k–14k chars). The view itself only builds the directory (material available + profile status) and triggers the job — **building runs in `client-profile-job`** (config → `client-profile-configs/{run_id}.json`, status polled at `client-profile-jobs/{run_id}/status.json`, resumable by run ID), so a large batch survives a closed tab. One Claude call per client (`claude-sonnet-4-6` default, Haiku optional, one strict-JSON retry, 4 clients concurrently) returns `{profile_summary, aspects:[{label, kind, text, keywords, evidence, markets}], markets:[{market, tier, subtitle, narrative, keywords, aspects}], dod_assessment}` — 2–8 aspects, each an independently searchable capability/technology/product/domain/market, plus up to `max_markets` (default 4) markets and a **Defense** market whenever a DoD use case is plausible even loosely (Defense does not count toward the cap; when there is genuinely none the one-sentence reason is stored in `dod_assessment`). Everything is grounded only in the supplied material. Each aspect's `label + text + keywords` **and each market's `market + subtitle + narrative + keywords`** are embedded (`text-embedding-ada-002`); markets of one company whose narrative vectors score ≥ `market_merge_threshold` (default 0.93) against each other are one market described twice and are folded together, and `aspect_profile.normalize_markets()` canonicalises names, caps the count, and puts any aspect the model left unassigned into the primary market. The profile is upserted as **one row per company** into `data/client-profiles/profiles.parquet`. Aspects and markets are both editable in the view (`st.data_editor` — aspect membership is edited as a comma-separated `Markets` column and re-derived on save) with a re-embed-and-save button (still in-process — one company), plus delete.
 - **Profiles built before markets existed** carry `n_markets` 0 and show as ⚠️ **no markets** in the directory: they still work in the whole-company match mode but are skipped (with a warning naming them) by market-scoped runs until rebuilt. They are pre-selected for rebuild alongside stale profiles.
 - **Staleness:** each profile stores a `source_fingerprint` (sha256 over *all* available source texts, not just the ones used). The view recomputes it live and flags profiles ⚠️ stale when the client's website/Drive/research material has changed since the build; the picker pre-selects stale + unprofiled clients. Clients with no material at all are listed separately, not offered.
 - **Nothing is written to the client parquets** — profiles live in their own store, so Client Editor / Client Research / Drive Sync keep rewriting client rows freely.
@@ -158,6 +179,7 @@ Aspects are additionally grouped into the **markets** they serve, so a client's 
 | `views/hubspot_import.py` | HubSpot Import | Three source modes: **Matching run** (concatenate segment CSVs → standard `matcher_*` properties), **Financial research run** (load `finance-research-runs/{run_id}/state.json` → per-field mapping table, **pre-filled by auto-assignment** (existing `matcher_fin_*` → name/label match → opt-in standard-property alias → close match, all type-checked): each financial field → existing HubSpot property or auto-created `matcher_fin_*`, with a `<field>_num` integer companion per money/count/score field created as a HubSpot `number` property for lead scoring), or **Client profiles** (load `data/client-profiles/profiles.parquet` → pick clients → flattened aspect + market fields → existing property or auto-created `matcher_profile_*`/`matcher_aspect_*`/`matcher_market_*`/`matcher_defense_*`). All submit as company imports via `/crm/v3/imports` (dedup by `domain`) and poll for completion |
 | `views/resume_importer.py` | Resume Importer | Upload HubSpot contacts CSV with resume URL column → dedup by email → fetch files (PDF/DOCX) via HubSpot Bearer auth → extract text → GPT expertise summary → embed → save to `data/resumes/` |
 | `views/resume_search.py` | Resume Search | Natural-language query → embed → cosine similarity against resume parquets → ranked candidate cards + CSV export. Supports an optional include keyword (single term) and comma-separated exclude keywords to pre-filter the resume pool before scoring. |
+| `views/fathom_sync.py` | Fathom Meetings | Test the Fathom connection (verifies which recorders the key can see) → metadata-only scan of a date window → auto-match external invitee domains to clients by `companyWebsite`, everything else to a review `st.data_editor` (`fathom-configs/assignments.json`) → pick clients (All / None / Never synced / Has calls) + look-back + time budget + dry run/full re-sync + per-client caps → trigger `fathom-sync-job` → poll `fathom-jobs/{run_id}/status.json` → results (updated/unchanged/errored, calls ingested, unmatched domains) + a browser over `data/fathom/meetings_index.parquet` that loads any stored transcript |
 | `views/drive_sync.py` | Drive Sync | Scan the client Google shared drive (sections → `{Client}_INTERNAL` folders) → fuzzy auto-assign folders to clients with persistent assignments (`drive-sync-configs/assignments.json`) + review table → select the exact clients to sync (last-synced dates + All/None/Never/Stale quick-picks) and the exact unassigned folders to propose as new clients, set the time budget (1–24 h) and per-client doc caps → trigger `drive-sync-job` (incremental via `sync_state.json`) → poll `drive-sync-jobs/{run_id}/status.json` → results + new-client review queue (approve with website → rows created in `data/all-contacts/clients/`) |
 | `views/client_profiler.py` | Client Profiles | Directory of client companies with the source material available per client (website / Drive / technology / financials), their markets, and profile status (none / current / ⚠️ stale by `source_fingerprint` / ⚠️ no markets) → pick clients + sources + target aspect count + max markets + Defense assessment + model → trigger `client-profile-job` → poll `client-profile-jobs/{run_id}/status.json` (one Claude call per client → embed each aspect and market → upsert `data/client-profiles/profiles.parquet`); an expander resumes monitoring by run ID. Second section reviews/edits a profile's aspects **and markets** (two `st.data_editor`s) and re-embeds in-process, or deletes it (delete is admin-only). **Admins only:** a third section bulk-deletes profiles, with an opt-in checkbox to delete the clients' contact rows too |
 | `views/aspect_match.py` | Bulk Aspect Match | Select profiled clients + grant agencies + filters → pick a match mode (whole company, or by market with tier + category dropdowns) → per-unit matmul of that unit's aspect vectors (plus the market narrative vector) against topic vectors → keep topics clearing the threshold on ≥ `min_hits` vectors, top-K per unit → async Claude re-rank 1–5 with the matched aspect as context, deduped by (client, topic, aspect) → results table + CSV download + `aspect-match-results/{run_id}/results.csv`. Runs in-process (keep the page open) |
@@ -178,6 +200,7 @@ Aspects are additionally grouped into the **markets** they serve, so a client's 
 | `email_generator.py` | `async_generate_subject_line`, `async_josiah_copy` | Async email copy generation. Subject line tries GPT-4o-mini first, falls back to Claude Haiku on 429. Both functions accept async client objects passed in from the caller. |
 | `grant_utils.py` | `normalize_grant_columns` | Call this whenever a topics DataFrame is loaded. Ensures `grant_summary` is always present: renames `description` → `grant_summary` if the column is absent, or fills empty `grant_summary` values from `description` if both exist. |
 | `finance_research.py` | `FIELD_SECTIONS`, `build_research_prompt`, `parse_research_output`, `build_financial_digest`, `response_cost_usd`, `NUMERIC_FIELDS`/`NUMERIC_SUFFIX`, `to_number`/`to_number_str`/`numeric_columns` | Deep Research helpers for the Client Research view (financial focus + shared plumbing) — 54-field output schema, prompt builder, JSON extract + `gpt-4o-mini` repair (`parse_research_output` takes an optional `fields=` list so it can normalize either focus's schema), headline digest (no AI call), and per-response cost from `usage`. `to_number()` pulls one figure out of a prose research value (range → midpoint, `$4.2M`/`250K` scale suffixes, `(Estimated)` labels and `%` stripped, `48/100` → `48`, nullish → `None`; a bare `k`/`m`/`b` only counts as a scale suffix at a word boundary, so "5 board members" stays 5; a fiscal-period label is skipped when a real figure follows it, so `"FY2024: $2.5M"` → `2500000` and `"Q1 2025 revenue of $3M"` → `3000000`, while a bare `"2024"` with nothing else in the string is still returned). `to_number_str()` renders it as a round-half-up integer string (`''` when unparseable — deliberately blank, not 0, so HubSpot reads "no data"), and `numeric_columns()` builds the `<field>_num` set consumed by HubSpot Import. Model IDs (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`) drift — verify against developers.openai.com/api/docs/models on API errors. |
+| `fathom_client.py` | `API_BASE`, `INCLUDABLE`, `GENERIC_DOMAINS`, `fathom_get`, `iter_meetings`, `get_transcript`, `bare_domain`, `external_domains`, `meeting_title`/`meeting_date`/`duration_minutes`/`summary_markdown`/`action_item_lines`/`attendee_lines`/`crm_company_names`, `transcript_text`, `meeting_block`, `call_count`, `FathomError`/`FathomAuthError`/`RateLimitStalledError` | Fathom notetaker REST client (Stage 9). Streamlit-free, shared by the Fathom Meetings view and `fathom_sync_job.py`. Plain `requests`, not the official `fathom-python` SDK (still 0.0.30 with documented breaking changes). `fathom_get` owns a **process-global pacing gate** — one shared timestamp at 1.05 s (standard) / 2.50 s (heavy: any summary or transcript payload), because a heavy call spends standard quota too — plus `Retry-After`-aware backoff, `FathomAuthError` on 401/403 (never retried), and `RateLimitStalledError` when 429s outlast the retries. `iter_meetings` follows `next_cursor`; `transcript_text` caps by dropping the **middle**, since meetings front-load what the company builds and back-load what it will do next. |
 | `aspect_profile.py` | `SOURCES`, `MATERIAL_COLS`, `merge_company_row`, `assemble_source_texts`, `source_fingerprint`, `build_aspect_system`, `build_aspect_user_message`, `parse_aspect_response`, `aspect_embed_text`, `MARKET_CATEGORIES`/`DEFENSE_MARKET`/`MARKET_TIERS`/`MAX_MARKETS`/`MARKET_MERGE_THRESHOLD`, `canonical_market`, `normalize_markets`, `merge_similar_markets`, `market_embed_text`, `market_label`, `profile_markets`, `market_aspect_indices`, `unpack_market_embeddings`, `pack_embeddings`/`unpack_embeddings`, `build_profile_record`, `load_profiles`/`save_profiles`/`upsert_profiles`/`delete_profile`, `company_key` | Multi-aspect client profiles (Stage 8). Streamlit-free (shared by the two views **and `client_profile_job.py`**): merges a company's contact rows into one material row, pulls source material off it per source, fingerprints it for staleness, builds the aspect-generation prompt, parses/normalizes Claude's JSON (unknown `kind` → `capability`, duplicate labels dropped, ≤ `MAX_ASPECTS`), and owns the `data/client-profiles/profiles.parquet` store. **Markets:** `canonical_market()` snaps a free-form name onto `MARKET_CATEGORIES` (exact → punctuation-squashed → `difflib` ≥ 0.85 → leading-word containment → `Other`); `normalize_markets()` collapses repeats of one category, caps the non-defense count, resolves membership in both directions (the model may state it on the aspect, the market, or both), puts orphan aspects in the primary market, and re-derives each market's `aspect_labels` — **the aspects own membership**, so editing or deleting an aspect row can never leave a stale pointer. A market **no aspect claims is kept as long as it has a narrative** (it is then scored on that narrative vector alone) — dropping it would silently delete a Defense market, and with it the only DoD framing in the profile, whenever the model's `aspects` list did not string-match an aspect label; only a market with neither aspects nor a narrative is discarded; `merge_similar_markets()` folds markets whose narrative vectors score ≥ the threshold into one. **Aspect and market vectors are stored flat** (`aspect_embeddings` = `n_aspects × embedding_dim`, `market_embeddings` = `n_markets × embedding_dim`, float64 in one list column each) — a flat double list round-trips through parquet without nested-list dtype ambiguity; always read them back via `unpack_embeddings()` / `unpack_market_embeddings()`. |
 | `tech_research.py` | `FIELD_SECTIONS`, `ALL_FIELDS`, `build_research_prompt`, `build_tech_digest`, `build_matching_summary` | Technology & R&D research schema/prompt/digest for the Client Research view's tech focus — ~40-field output (core technology, products, R&D activity, patents, TRL/maturity, differentiation, grant-alignment keywords). `build_matching_summary()` assembles embedding-ready text (confidence labels stripped) for the optional summary-rewrite at apply time. Reuses finance_research's models, pricing, and JSON parse/repair. |
 | `access_control.py` | `SUPER_ADMINS`, `current_user_email`, `is_admin`, `is_super_admin`, `role_label`, `require_admin`, `admin_only_notice`, `load_admins`/`save_admins`/`admin_emails` | Admin gating for the delete actions and the Admin Portal. Identity is the IAP email `app.py` puts in `st.session_state.user_email`; the admin list lives in `admin-config/admins.json` (cached per session — a newly added admin must reload the page). `SUPER_ADMINS` is a code constant: not editable from the UI, never stored in the JSON, and the only role allowed to change the list. A GCS read failure grants nothing beyond the super admins. Streamlit-only. |
@@ -241,7 +264,7 @@ URL normalization (adds `https://` if missing) happens at mapping time. The job 
 | `scraped_at` | str | ISO date of processing |
 | `uuid` | str | Unique record ID |
 
-Rows may additionally carry Deep Research columns — financial focus (Client Research view, `data/all-contacts/clients/` only): `financial_data` (JSON string of the full 54-field Deep Research output), `financial_summary` (human-readable digest), `financials_updated_at` (ISO date); technology focus (Client Research view on clients, or any source imported via the Contact Importer's `deep_research` profiling method): `technology_data` (JSON string of the ~40-field tech research output), `technology_summary` (digest), `technology_updated_at` (ISO date). For deep-research imports, `company_summary` holds `tech_research.build_matching_summary()` output (not a scraped-page GPT summary) and `embeddings` is its vector. Client rows updated by Drive Sync additionally carry `client_docs_data` (JSON: extracted fields + source_files + last_run), `client_docs_summary` (plain-text digest), and `docs_updated_at` (ISO date).
+Rows may additionally carry Deep Research columns — financial focus (Client Research view, `data/all-contacts/clients/` only): `financial_data` (JSON string of the full 54-field Deep Research output), `financial_summary` (human-readable digest), `financials_updated_at` (ISO date); technology focus (Client Research view on clients, or any source imported via the Contact Importer's `deep_research` profiling method): `technology_data` (JSON string of the ~40-field tech research output), `technology_summary` (digest), `technology_updated_at` (ISO date). For deep-research imports, `company_summary` holds `tech_research.build_matching_summary()` output (not a scraped-page GPT summary) and `embeddings` is its vector. Client rows updated by Drive Sync additionally carry `client_docs_data` (JSON: extracted fields + source_files + last_run), `client_docs_summary` (plain-text digest), and `docs_updated_at` (ISO date). Client rows updated by `fathom-sync-job` (Stage 9) carry `client_meetings_data` (JSON: `extracted` fields + `meetings` provenance list + `last_run`), `client_meetings_summary` (plain-text digest), and `meetings_updated_at` (ISO date) — that job never modifies `summary` or `embeddings`.
 
 ### Multi-aspect client profile (parquet, `data/client-profiles/profiles.parquet`)
 One row per client company — written by `client-profile-job` (and by single-profile edits in the Client Profiles view), read by Bulk Aspect Match and by HubSpot Import's **Client profiles** mode. Never written to the client contact parquets.
@@ -356,6 +379,10 @@ cc-matcher-bucket-jeg-v1/
         free_alert_2026-03-01_c1d8a2.parquet
     resumes/
       resumes_2026-06-24_a3f9c1.parquet   # individual resume records, deduped by email
+    fathom/
+      meetings/
+        123456789.json                # one raw Fathom call: metadata + invitees + AI summary + action items + full transcript turns
+      meetings_index.parquet          # one row per ingested call (recording_id, client_key, title, date, duration, transcript lines, blob_path)
     client-profiles/
       profiles.parquet                  # multi-aspect client profiles, one row per company (overwritten in place on every build/edit/delete — not versioned)
     deleted-clients/                    # backups written before any client deletion — restore source if a delete was a mistake
@@ -387,6 +414,13 @@ cc-matcher-bucket-jeg-v1/
     contact_import_2026-06-25_10-30-00_apollo.json
   contact-import-jobs/                  # contact-import-job completion status
     contact_import_2026-06-25_10-30-00_apollo/
+      status.json
+  fathom-configs/                       # Fathom Meetings state + job configs
+    assignments.json                  # domain → client_key assignments (+ unassigned/skipped review buckets, settings.lookback_days) — merged, never clobbered
+    sync_state.json                   # meetings: recording_id → {client_key, created_at, synced_at} (incremental skip) + clients: client_key → last-synced date
+    fathom_2026-09-09_10-30-00.json   # per-run job config
+  fathom-jobs/                          # fathom-sync-job progress + completion status
+    fathom_2026-09-09_10-30-00/
       status.json
   drive-sync-configs/                   # Drive Sync state + job configs
     assignments.json                  # drive_id + folder_id → client_key assignments (+ unassigned/skipped) — overwritten on save
@@ -612,6 +646,8 @@ openai_key = os.environ['OPENAI_API_KEY']
 | `gcp_service_account` | All views that touch GCS | `st.secrets['gcp_service_account']` dict |
 | `hubspot_api_key` | HubSpot Import view + Resume Importer + Contact Importer (HubSpot list pulls) | `st.secrets['hubspot_api_key']` — must be placed **above** `[gcp_service_account]` in secrets.toml. Private App requires scopes: `crm.import`, `crm.schemas.companies.write`, **`files`** (files scope required for Resume Importer to download attachments), **`crm.lists.read`** + **`crm.objects.companies.read`** (Contact Importer HubSpot list pulls). All five scopes are granted on the current Private App (verified 2026-08) — a 401/403 from HubSpot means an expired/rotated token, not a missing scope. |
 | `sam_gov_api_key` | SAM.gov Upload view (API fetch tab) | `st.secrets['sam_gov_api_key']` — free key from beta.sam.gov → Account Settings → API Keys. Passed into the sam-gov-job config JSON (not a Secret Manager secret). |
+| `fathom_api_key` | Fathom Meetings view (connection test + metadata scan) | `st.secrets.get('fathom_api_key')` — created at fathom.video → Settings → API Keys. Must sit **above** `[gcp_service_account]` in secrets.toml. Keys are **per user, not per org**: a key sees only meetings its owner recorded plus meetings shared with their team. The view degrades gracefully without it (a sync can still be triggered — the job reads its own copy from Secret Manager). |
+| `fathom-api-key` (Secret Manager) | Cloud Run fathom-sync-job | `os.environ['FATHOM_API_KEY']` — deliberately Secret Manager rather than the job config JSON, so the token never lands in a GCS blob (unlike the SAM.gov key) |
 | `anthropic-api-key` (Secret Manager) | Cloud Run matching job + sam-gov-job | `os.environ['ANTHROPIC_API_KEY']` |
 | `openai-api-key` (Secret Manager) | Cloud Run matching job + sam-gov-job + contact-import-job | `os.environ['OPENAI_API_KEY']` |
 
@@ -656,7 +692,7 @@ The Streamlit UI runs as a Cloud Run **service** (not job) named `matcher-app`, 
 
 - **Image:** `us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matcher-app:latest` — built from `Dockerfile.app` (repo root) via `cloudbuild.app.yaml`. Installs the `packages.txt` Chromium libs and Playwright's Chromium at build time (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`).
 - **Secrets:** the full local `.streamlit/secrets.toml` is stored in Secret Manager as `streamlit-secrets` and volume-mounted at `/app/.streamlit/secrets.toml`, so `st.secrets` works unchanged. To rotate/edit secrets: `gcloud secrets versions add streamlit-secrets --data-file=.streamlit/secrets.toml --project cc-matcher-v1`, then redeploy (or restart) the service.
-- **`.gcloudignore` / `.dockerignore`** exclude `.streamlit/`, `*.json` (service-account keys), and `notebooks/` from the build context — never remove those entries.
+- **`.gcloudignore` / `.dockerignore`** exclude `.streamlit/`, `*.json` (service-account keys), `notebooks/`, and `*_api_key.txt` / `*_api_key` from the build context — never remove those entries. The key-file patterns matter specifically because `Dockerfile.app` ends in `COPY . .`: an API key dropped at the repo root that is not excluded gets **baked into the published `matcher-app` image** in Artifact Registry, which no amount of not-committing prevents. The same three patterns are in `.gitignore`. Verify an exclusion with `gcloud meta list-files-for-upload | grep -i <name>` before building.
 - **Config:** 4 GiB / 2 CPU, `--timeout 3600`, `--session-affinity`, `--max-instances 1` (Streamlit session state is per-instance; do not scale out without sticky sessions verified), runs as `matcher-app@cc-matcher-v1.iam.gserviceaccount.com`.
 
 ### Build and deploy (run every time app/view code changes)
@@ -719,6 +755,7 @@ Two Cloud Run Jobs run the heavy pipeline work so Streamlit never hits memory or
 | `sam-gov-job` | `jobs/sam_gov_job.py` | `jobs/Dockerfile.sam_gov` | `requirements.sam_gov_job.txt` | SAM.gov Upload view (manual) + Cloud Scheduler (daily) |
 | `contact-import-job` | `jobs/contact_import_job.py` | `jobs/Dockerfile.contact_import` | `requirements.contact_import_job.txt` | Contact Importer view |
 | `drive-sync-job` | `jobs/drive_sync_job.py` | `jobs/Dockerfile.drive_sync` | `requirements.drive_sync_job.txt` | Drive Sync view |
+| `fathom-sync-job` | `jobs/fathom_sync_job.py` | `jobs/Dockerfile.fathom_sync` | `requirements.fathom_sync_job.txt` | Fathom Meetings view |
 | `client-profile-job` | `jobs/client_profile_job.py` | `jobs/Dockerfile.client_profile` | `requirements.client_profile_job.txt` | Client Profiles view |
 
 ### `matching-job` config schema (`job-configs/{run_id}.json`)
@@ -1211,6 +1248,126 @@ gcloud run jobs update drive-sync-job \
 
 ```bash
 gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=drive-sync-job" \
+  --limit 50 --format "value(textPayload)"
+```
+
+---
+
+### `fathom-sync-job` — build, deploy, and manage
+
+Ingests Fathom meeting transcripts and notes (Stage 9). No staging upload — the
+config just names the clients; everything else comes from the Fathom API.
+
+#### `fathom-sync-job` config schema (`fathom-configs/{run_id}.json`)
+
+```json
+{
+  "run_id":                  "fathom_2026-09-09_10-30-00",
+  "client_keys":             ["Acme Robotics||https://acme.com"],
+  "lookback_days":           90,
+  "created_after":           null,
+  "full_resync":             false,
+  "dry_run":                 false,
+  "max_meetings":            400,
+  "max_meetings_per_client": 12,
+  "per_client_char_cap":     120000,
+  "transcript_char_cap":     40000,
+  "task_timeout_s":          14400,
+  "model":                   "claude-sonnet-4-6"
+}
+```
+
+`client_keys` are `{company_name}||{companyWebsite}` identities — the same
+`client_key` Drive Sync and Client Profiles use; an empty list means every
+client with matched meetings. `created_after` (ISO-8601) overrides
+`lookback_days` when set. `max_meetings` caps how many **new attributed** calls
+one sweep will collect; `max_meetings_per_client` / `per_client_char_cap` cap
+what one Claude call sees, and the overflow is deferred rather than marked
+synced. `full_resync` re-ingests every call in the window; `dry_run` performs
+the whole pipeline (Fathom calls and the Claude merge included) but writes
+nothing except `status.json`.
+
+#### Status schema (`fathom-jobs/{run_id}/status.json`)
+
+```json
+{
+  "run_id": "...", "state": "running|complete|error", "dry_run": false,
+  "stopped_early": null, "note": "", "created_after": "2026-06-11T00:00:00Z",
+  "meetings_swept": 412, "meetings_new": 37, "meetings_ingested": 33,
+  "meetings_deferred": 4,
+  "clients_total": 12, "clients_done": 12,
+  "clients_updated": 9, "clients_unchanged": 2, "clients_errored": 1,
+  "api_calls_used": 51,
+  "results": [{"client_key": "...", "company_name": "...",
+               "outcome": "updated|unchanged|error|deferred",
+               "meetings_processed": 3, "note": ""}],
+  "unmatched_domains": [{"domain": "unknown-co.io", "meeting_count": 4,
+                          "sample_titles": ["..."], "crm_companies": ["..."]}],
+  "model": "claude-sonnet-4-6",
+  "dry_run_preview": [{"company_name": "...", "meetings": ["..."], "digest": "- bullet
+- bullet",
+                        "extracted_counts": {"technologies": 12, "capabilities": 11},
+                        "notable_updates": ["plans to..."]}],
+  "error": null
+}
+```
+
+**`dry_run_preview` exists because a dry run writes nothing** — without it the digest the run just paid Claude to produce is unobservable, and "the pipeline works" and "the extraction is any good" would need two separate runs to answer. Populated on dry runs only, for the first `_MAX_DRY_PREVIEWS` (3) clients, digest truncated to 4,000 chars; the view renders it under the results panel.
+
+`state: "running"` payloads are written at start and every 10 completed clients
+so the view can render a progress bar. `stopped_early` is `"timeout"` (time
+budget), `"rate_limit"` (429s outlasted the retries) or `"max_meetings"` (sweep
+cap) — in every case re-running the same selection continues where it left off,
+because only successfully written calls are recorded in `sync_state.json`.
+`unmatched_domains` is also merged into `fathom-configs/assignments.json`, so
+the view's review table sees domains the job discovered.
+
+#### One-time setup (run once — skip if job already exists)
+
+```bash
+# The Fathom key goes in Secret Manager, NOT the job config JSON
+gcloud secrets create fathom-api-key --data-file=- --project cc-matcher-v1   # paste the key, then Ctrl-D
+# matching-job@ already holds project-level roles/secretmanager.secretAccessor
+
+gcloud run jobs create fathom-sync-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/fathom-sync-job:latest \
+  --region us-central1 \
+  --memory 2Gi \
+  --cpu 2 \
+  --task-timeout 86400 \
+  --max-retries 0 \
+  --service-account matching-job@cc-matcher-v1.iam.gserviceaccount.com \
+  --set-secrets=ANTHROPIC_API_KEY=anthropic-api-key:latest \
+  --set-secrets=FATHOM_API_KEY=fathom-api-key:latest \
+  --project cc-matcher-v1
+
+# Streamlit's service account needs run.admin for runWithOverrides
+gcloud run jobs add-iam-policy-binding fathom-sync-job \
+  --region us-central1 \
+  --member="serviceAccount:matcher-app@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/run.admin" \
+  --project cc-matcher-v1
+```
+
+To rotate the key later: `gcloud secrets versions add fathom-api-key --data-file=- --project cc-matcher-v1`
+(the job resolves `:latest` at each execution, so no redeploy is needed), and
+update `fathom_api_key` in the `streamlit-secrets` secret for the view.
+
+#### Build and deploy (run every time `fathom_sync_job.py` or `fathom_client.py` changes)
+
+```bash
+gcloud builds submit --config cloudbuild.fathom_sync.yaml --project cc-matcher-v1 .
+
+gcloud run jobs update fathom-sync-job \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/fathom-sync-job:latest \
+  --task-timeout 86400 \
+  --region us-central1 --project cc-matcher-v1
+```
+
+#### View logs
+
+```bash
+gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=fathom-sync-job" \
   --limit 50 --format "value(textPayload)"
 ```
 

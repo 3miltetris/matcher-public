@@ -166,6 +166,7 @@ MATERIAL_COLS = [
     'company_name', 'companyWebsite', 'state',
     'summary', 'company_summary', 'full_text', 'page_text',
     'client_docs_summary', 'client_docs_data',
+    'client_meetings_summary', 'client_meetings_data',
     'technology_data', 'technology_summary',
     'financial_data', 'financial_summary',
 ]
@@ -221,6 +222,25 @@ def _drive_text(row) -> str:
     return '\n\n'.join(parts)
 
 
+def _meetings_text(row) -> str:
+    """Material distilled from the client's Fathom calls by fathom-sync-job.
+
+    Deliberately digest + extraction only, with no list of meeting titles: the
+    titles are provenance (they live in client_meetings_data['meetings'] and
+    are shown in the Fathom Meetings view), and folding them in here would
+    change source_fingerprint — and so flag every profile stale — every time a
+    purely administrative call was ingested."""
+    parts = []
+    digest = _s(row.get('client_meetings_summary'))
+    if digest:
+        parts.append('Client meeting digest:\n' + digest)
+    data  = _json_obj(row.get('client_meetings_data'))
+    lines = _flatten_kv(data.get('extracted') or {})
+    if lines:
+        parts.append('Extracted from client meetings:\n' + '\n'.join(lines))
+    return '\n\n'.join(parts)
+
+
 def _research_text(row, data_col: str, summary_col: str, fields: list[str]) -> str:
     data = _json_obj(row.get(data_col))
     if data:
@@ -247,6 +267,8 @@ SOURCES: list[dict] = [
      'cap':  8000, 'extract': _website_text},
     {'key': 'drive',      'label': 'Drive documents',             'default': True,
      'cap': 14000, 'extract': _drive_text},
+    {'key': 'meetings',   'label': 'Client meetings (Fathom)',     'default': True,
+     'cap': 14000, 'extract': _meetings_text},
     {'key': 'technology', 'label': 'Deep Research — technology',  'default': True,
      'cap': 14000, 'extract': _tech_text},
     {'key': 'financials', 'label': 'Deep Research — financials',  'default': False,

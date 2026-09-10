@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.fathom_sync_job.txt .
+RUN pip install --no-cache-dir -r requirements.fathom_sync_job.txt
+
+COPY jobs/fathom_sync_job.py jobs/fathom_sync_job.py
+
+# Shared streamlit-free module (also imported by views/fathom_sync.py)
+COPY src/__init__.py src/__init__.py
+COPY src/modules/__init__.py src/modules/__init__.py
+COPY src/modules/fathom_client.py src/modules/fathom_client.py
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "jobs/fathom_sync_job.py"]
