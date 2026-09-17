@@ -1,0 +1,11 @@
+steps:
+- name: "gcr.io/cloud-builders/docker"
+  args:
+  - "build"
+  - "-t"
+  - "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/deep-research-job:latest"
+  - "-f"
+  - "jobs/Dockerfile.deep_research"
+  - "."
+images:
+- "us-central1-docker.pkg.dev/cc-matcher-v1/matcher/deep-research-job:latest"

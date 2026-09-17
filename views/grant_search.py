@@ -24,6 +24,9 @@ from src.modules.grant_utils import normalize_grant_columns
 
 _BUCKET        = 'cc-matcher-bucket-jeg-v1'
 _TOPICS_PREFIX = 'data/all-topics/processed/'
+# Past awards live outside processed/ so nothing enumerating agencies can pick
+# them up by accident. Searching them here is opt-in, per search.
+_AWARDS_PREFIX = 'data/all-topics/awards/'
 
 
 def _get_storage_client() -> storage.Client:
@@ -47,7 +50,20 @@ def _list_agencies() -> list[str]:
         return []
 
 
-def _load_topics(agencies: list[str]) -> pd.DataFrame:
+def _list_award_sources() -> list[str]:
+    try:
+        client = _get_storage_client()
+        blobs = client.list_blobs(_BUCKET, prefix=_AWARDS_PREFIX, delimiter='/')
+        list(blobs)
+        return sorted(
+            p.replace(_AWARDS_PREFIX, '').strip('/')
+            for p in blobs.prefixes
+        )
+    except Exception:
+        return []
+
+
+def _load_topics(agencies: list[str], award_sources: list[str] | None = None) -> pd.DataFrame:
     client = _get_storage_client()
     frames = []
     for agency in agencies:
@@ -56,6 +72,15 @@ def _load_topics(agencies: list[str]) -> pd.DataFrame:
             if blob.name.endswith('.parquet'):
                 df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
                 df['broad_agency'] = agency
+                df['record_kind']  = 'solicitation'
+                frames.append(df)
+    for src in (award_sources or []):
+        prefix = f'{_AWARDS_PREFIX}{src}/'
+        for blob in client.list_blobs(_BUCKET, prefix=prefix):
+            if blob.name.endswith('.parquet'):
+                df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+                df['broad_agency'] = f'{src}-AWARDS'
+                df['record_kind']  = 'award'
                 frames.append(df)
     if not frames:
         return pd.DataFrame()
@@ -318,9 +343,26 @@ selected = [
     if cols[i % len(cols)].checkbox(agency, value=True, key=f'gs_agency_{agency}')
 ]
 
+_award_sources = _list_award_sources()
+_selected_awards: list[str] = []
+if _award_sources:
+    if st.checkbox(
+        'Include past awards (already-awarded contracts)',
+        value=False,
+        key='gs_include_awards',
+        help=(
+            'Adds completed award notices to the pool — useful for asking "who has won '
+            'work like this?". They are stored separately from open solicitations and '
+            'are never included unless you tick this. Results are tagged in a '
+            '`record_kind` column so an award is never mistaken for something to bid on.'
+        ),
+    ):
+        _selected_awards = _award_sources
+        st.caption(f'Award sources included: `{", ".join(_award_sources)}`')
+
 if st.button('Load Topics', type='primary', disabled=not selected):
     with st.spinner(f'Loading topics from {len(selected)} agenc{"y" if len(selected) == 1 else "ies"}…'):
-        df = _load_topics(selected)
+        df = _load_topics(selected, _selected_awards)
     if df.empty:
         st.warning('No topics found for the selected agencies.')
     else:
@@ -330,7 +372,11 @@ if st.button('Load Topics', type='primary', disabled=not selected):
         st.session_state.gs_search_mode = None
         st.session_state.gs_results_aspects = None
         _clear_aspect_widgets(10)
-        st.success(f'Loaded **{len(df):,}** topics.')
+        _n_awards = int((df.get('record_kind') == 'award').sum()) if 'record_kind' in df.columns else 0
+        st.success(
+            f'Loaded **{len(df) - _n_awards:,}** open topics'
+            + (f' and **{_n_awards:,}** past awards.' if _n_awards else '.')
+        )
 
 if st.session_state.gs_topics_df is None:
     st.stop()
@@ -574,6 +620,12 @@ if st.session_state.gs_results_df is not None:
         if 'llm_score' in results.columns:
             primary_cols = ['llm_score', 'llm_rationale'] + primary_cols
 
+        # Surface award/solicitation up front rather than leaving it buried among the
+        # trailing columns — a past award read as an open opportunity is the one
+        # mistake this whole separation exists to prevent.
+        if 'record_kind' in results.columns and (results['record_kind'] == 'award').any():
+            primary_cols = ['record_kind'] + primary_cols
+
         other_cols = [
             c for c in results.columns
             if c not in primary_cols and c != 'embeddings'
@@ -581,6 +633,8 @@ if st.session_state.gs_results_df is not None:
         result_cols = primary_cols + other_cols
 
         col_cfg: dict = {}
+        if 'record_kind' in result_cols:
+            col_cfg['record_kind'] = st.column_config.TextColumn('Kind', width='small')
         if 'similarity_score' in result_cols:
             col_cfg['similarity_score'] = st.column_config.NumberColumn('Score', format='%.4f')
         if 'min_aspect_score' in result_cols:

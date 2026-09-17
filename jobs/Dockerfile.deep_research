@@ -1,0 +1,39 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System libraries required by Chromium (Playwright) — same set as
+# Dockerfile.contact_import, the only other image that drives a browser.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget ca-certificates \
+    libnss3 libnspr4 \
+    libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 \
+    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+    libxrandr2 libgbm1 libasound2 \
+    libpango-1.0-0 libcairo2 \
+    libx11-6 libxcb1 libxext6 libx11-xcb1 libxshmfence1 \
+    fonts-liberation \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.deep_research_job.txt .
+RUN pip install --no-cache-dir -r requirements.deep_research_job.txt
+
+# Bake Chromium into the image (Cloud Run containers are read-only at runtime)
+RUN playwright install chromium
+
+COPY jobs/deep_research_job.py jobs/deep_research_job.py
+
+# Shared streamlit-free modules (also imported by views/funding_sources.py).
+# source_registry owns the sources.parquet store and the seen indexes;
+# browser_agent owns the Claude-plus-Playwright loop. Neither pulls in
+# TextProcessor or BucketManager — the job embeds with raw openai + tiktoken,
+# as every other job in this repo does.
+COPY src/__init__.py src/__init__.py
+COPY src/modules/__init__.py src/modules/__init__.py
+COPY src/modules/source_registry.py src/modules/source_registry.py
+COPY src/modules/browser_agent.py src/modules/browser_agent.py
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "jobs/deep_research_job.py"]

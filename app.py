@@ -61,6 +61,7 @@ pages = [
 
     st.Page("views/sam_gov_upload.py",    title="SAM.gov Upload",   icon="🏛️"),
     st.Page("views/grants_gov_fetch.py", title="Grants.gov Fetch", icon="🏦"),
+    st.Page("views/funding_sources.py", title="Funding Sources", icon="🛰️"),
     st.Page("views/hubspot_import.py", title="HubSpot Import", icon="🔗"),
     st.Page("views/suggestions.py",    title="Suggestions",    icon="💡"),
     st.Page("views/contact_importer.py", title="Contact Importer", icon="👤"),

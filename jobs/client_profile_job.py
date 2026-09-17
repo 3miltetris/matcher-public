@@ -8,14 +8,26 @@ selected company:
 
   1. Merge its contact rows into one material row (first non-empty per column)
   2. Assemble the selected source texts + fingerprint ALL available material
-  3. One Claude call → profile summary, 2-8 independently searchable aspects,
-     and the markets those aspects serve (up to 4, plus Defense when a DoD use
-     case is plausible), with every aspect earmarked to at least one market
-  4. Embed each aspect AND each market narrative (text-embedding-ada-002,
-     float64), then merge markets whose narratives are near-identical
-  5. Upsert the profile row into data/client-profiles/profiles.parquet
+  3. Claude pass 1 → profile summary, independently searchable aspects, and the
+     markets those aspects serve (ranked 1st, 2nd, 3rd..., up to max_markets
+     plus Defense when a DoD use case is plausible), every aspect earmarked to
+     at least one market
+  4. Embed each aspect, fold together any two that are near-identical, then
+     embed each market narrative and fold near-identical markets
+     (text-embedding-ada-002, float64)
+  5. Claude pass 2 (optional) → unexplored markets: customer worlds the company
+     does NOT serve, inferred by linking the aspects it already has. Stored in
+     their own columns, so speculation is never read back as capability
+  6. Upsert the profile row into data/client-profiles/profiles.parquet
 
-Clients are processed concurrently (one Claude call each), and the profile
+Aspect merging happens before market membership is re-derived, so a market can
+never end up pointing at an aspect that was folded away. Pass 2 is wrapped in
+its own error handling: it is additive, and losing it must never cost the pass-1
+work, which is a Claude call plus every embedding. Note that enabling it roughly
+doubles per-client latency, so the graceful time budget below is spent twice as
+fast.
+
+Clients are processed concurrently (one or two Claude calls each), and the profile
 store is re-read from GCS before every save so a profile edited in the
 Streamlit view mid-run is never clobbered wholesale. Progress and the
 partially-built store are checkpointed every few clients, so a timeout or
@@ -35,7 +47,10 @@ Config schema:
   "target_aspects": 4,
   "max_markets":    4,
   "assess_defense": true,
+  "assess_unexplored": true,
+  "max_unexplored": 3,
   "market_merge_threshold": 0.93,
+  "aspect_merge_threshold": 0.96,
   "model":          "claude-sonnet-4-6",
   "concurrency":    4,
   "dry_run":        false
@@ -127,8 +142,11 @@ def _get_embedding(text: str, oai: OpenAI, encoding: tiktoken.Encoding) -> list[
 
 # ── Claude ─────────────────────────────────────────────────────────────────────
 
-def _claude_aspects(anth: Anthropic, model: str, system: str, user_msg: str) -> dict:
-    """Aspect + market generation with one strict-JSON retry."""
+def _claude_json(anth: Anthropic, model: str, system: str, user_msg: str, parse):
+    """One Claude call with one strict-JSON retry, parsed by `parse`.
+
+    Shared by both passes: aspect+market generation and the unexplored-market
+    pass differ only in their prompt and their parser."""
     last_err = None
     for attempt in range(2):
         content = user_msg if attempt == 0 else (
@@ -146,7 +164,7 @@ def _claude_aspects(anth: Anthropic, model: str, system: str, user_msg: str) -> 
         if resp.stop_reason == 'max_tokens':
             raise ValueError('Claude hit the output token limit')
         try:
-            return ap.parse_aspect_response(resp.content[0].text)
+            return parse(resp.content[0].text)
         except ValueError as e:
             last_err = e
     raise ValueError(f'invalid response twice: {last_err}')
@@ -166,7 +184,10 @@ def main(config_blob_path: str) -> None:
     target       = int(config.get('target_aspects', 4))
     max_markets  = int(config.get('max_markets', ap.MAX_MARKETS))
     assess_def   = bool(config.get('assess_defense', True))
+    assess_unexp = bool(config.get('assess_unexplored', True))
+    max_unexp    = int(config.get('max_unexplored', ap.MAX_UNEXPLORED))
     merge_thresh = float(config.get('market_merge_threshold', ap.MARKET_MERGE_THRESHOLD))
+    aspect_merge = float(config.get('aspect_merge_threshold', ap.ASPECT_MERGE_THRESHOLD))
     model        = config.get('model', ap.DEFAULT_MODEL)
     dry_run      = bool(config.get('dry_run', False))
     workers      = max(1, min(_MAX_WORKERS, int(config.get('concurrency', _DEFAULT_WORKERS))))
@@ -184,7 +205,8 @@ def main(config_blob_path: str) -> None:
     oai      = OpenAI(api_key=_get_secret('openai-api-key'))
     encoding = tiktoken.get_encoding('cl100k_base')
 
-    system = ap.build_aspect_system(target, max_markets, assess_def)
+    system     = ap.build_aspect_system(target, max_markets, assess_def)
+    unexp_system = ap.build_unexplored_system(max_unexp) if assess_unexp else ''
 
     print('Loading client frames…', flush=True)
     frames = _load_client_frames(gcs)
@@ -206,6 +228,7 @@ def main(config_blob_path: str) -> None:
     built:    list[dict] = []
     records:  list[dict] = []
     errors:   list[str]  = []
+    warn_notes: list[str] = []
     deferred: list[str]  = []
     done = 0
 
@@ -223,10 +246,13 @@ def main(config_blob_path: str) -> None:
             'target_aspects': target,
             'max_markets':    max_markets,
             'assess_defense': assess_def,
+            'assess_unexplored': assess_unexp,
+            'max_unexplored': max_unexp,
             'clients_total':  total,
             'clients_done':   done,
             'built':          built,
             'errors':         errors,
+            'warnings':       warn_notes,
             'deferred':       deferred,
             'stopped_early':  stopped_early,
             'profiles_blob':  ap.PROFILES_BLOB,
@@ -256,13 +282,14 @@ def main(config_blob_path: str) -> None:
             if not texts:
                 return {'key': key, 'name': name, 'outcome': 'error',
                         'note': 'none of the selected sources have material'}
-            parsed = _claude_aspects(
+            parsed = _claude_json(
                 anth, model, system,
                 ap.build_aspect_user_message({
                     'company_name': name,
                     'website':      row.get('companyWebsite'),
                     'state':        row.get('state'),
                 }, texts),
+                ap.parse_aspect_response,
             )
             summary = parsed['profile_summary']
             aspects = parsed['aspects']
@@ -270,6 +297,18 @@ def main(config_blob_path: str) -> None:
 
             vectors = [_get_embedding(ap.aspect_embed_text(a), oai, encoding)
                        for a in aspects]
+            # Fold near-identical aspects together BEFORE market membership is
+            # re-derived below, so no market is left pointing at an aspect that
+            # was merged away. The merges are reported: a threshold that is
+            # eating distinct capabilities is invisible otherwise.
+            aspects, vectors, merges = ap.merge_similar_aspects(
+                aspects, vectors, aspect_merge
+            )
+            # Reported whether or not anything merged: cosine cannot reliably
+            # separate a genuine repeat from two facets of one platform, so the
+            # near misses are for a human to judge in the editor.
+            near = ap.nearest_aspect_pairs(aspects, vectors)
+
             market_vectors = [_get_embedding(ap.market_embed_text(m), oai, encoding)
                               for m in markets]
             if markets:
@@ -281,6 +320,36 @@ def main(config_blob_path: str) -> None:
                 by_name = {m['market']: v for m, v in zip(markets, market_vectors)}
                 aspects, markets = ap.normalize_markets(aspects, markets, max_markets)
                 market_vectors = [by_name[m['market']] for m in markets]
+
+            # Pass 2 - markets the company does NOT serve, inferred by
+            # linking the aspects it does have. Additive and separately
+            # guarded: a failure here must never discard the pass-1 work above,
+            # which cost a Claude call and every embedding.
+            unexplored, unexplored_vectors, unexp_err = [], [], ''
+            if assess_unexp:
+                try:
+                    unexplored = _claude_json(
+                        anth, model, unexp_system,
+                        ap.build_unexplored_user_message(
+                            {
+                                'company_name': name,
+                                'website':      row.get('companyWebsite'),
+                                'state':        row.get('state'),
+                            },
+                            summary, aspects, markets, ap.stated_intentions(row),
+                        ),
+                        lambda raw: ap.parse_unexplored_response(
+                            raw, markets, aspects, max_unexp
+                        ),
+                    )
+                    unexplored_vectors = [
+                        _get_embedding(ap.market_embed_text(m), oai, encoding)
+                        for m in unexplored
+                    ]
+                except Exception as e:
+                    traceback.print_exc()
+                    unexplored, unexplored_vectors = [], []
+                    unexp_err = str(e)[:300]
 
             record = ap.build_profile_record(
                 company_key     = key,
@@ -296,16 +365,21 @@ def main(config_blob_path: str) -> None:
                 model           = model,
                 markets         = markets,
                 market_vectors  = market_vectors,
+                unexplored         = unexplored,
+                unexplored_vectors = unexplored_vectors,
                 dod_assessment  = parsed['dod_assessment'],
             )
-            return {'key': key, 'name': name, 'outcome': 'built', 'record': record}
+            return {'key': key, 'name': name, 'outcome': 'built', 'record': record,
+                    'merges': merges, 'near_pairs': near,
+                    'unexplored_error': unexp_err}
         except Exception as e:
             traceback.print_exc()
             return {'key': key, 'name': name, 'outcome': 'error', 'note': str(e)[:300]}
 
     print(f'Building {total} profile(s) with {workers} worker(s), model={model}, '
           f'sources={",".join(sources)}, max_markets={max_markets}, '
-          f'assess_defense={assess_def}', flush=True)
+          f'assess_defense={assess_def}, assess_unexplored={assess_unexp} '
+          f'(max {max_unexp})', flush=True)
     _write_status(gcs, run_id, _status('running'))
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -329,9 +403,23 @@ def main(config_blob_path: str) -> None:
                     'has_defense':   ap.DEFENSE_MARKET in [
                         m.get('market') for m in ap.profile_markets(rec)
                     ],
+                    'n_unexplored':     rec['n_unexplored'],
+                    'unexplored_labels': rec['unexplored_labels'],
+                    'aspect_merges':    res.get('merges') or [],
+                    'aspect_near_pairs': res.get('near_pairs') or [],
                 })
+                for merge in (res.get('merges') or []):
+                    warn_notes.append(f'{name}: merged near-identical aspects {merge}')
+                if res.get('unexplored_error'):
+                    warn_notes.append(
+                        f'{name}: unexplored-market pass failed '
+                        f'({res["unexplored_error"]}) - the profile was saved '
+                        'without unexplored markets'
+                    )
                 print(f'[{done}/{total}] {name} → {rec["n_aspects"]} aspects, '
-                      f'{rec["n_markets"]} markets [{rec["market_labels"]}]', flush=True)
+                      f'{rec["n_markets"]} markets [{rec["market_labels"]}], '
+                      f'{rec["n_unexplored"]} unexplored '
+                      f'[{rec["unexplored_labels"]}]', flush=True)
             elif res['outcome'] == 'deferred':
                 stopped_early = 'timeout'
                 deferred.append(name)
@@ -351,7 +439,7 @@ def main(config_blob_path: str) -> None:
     _save_records()
     _write_status(gcs, run_id, _status('complete'))
     print(f'\nDone. {len(built)} built, {len(errors)} errored, '
-          f'{len(deferred)} deferred.', flush=True)
+          f'{len(deferred)} deferred, {len(warn_notes)} warning(s).', flush=True)
 
 
 if __name__ == '__main__':

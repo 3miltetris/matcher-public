@@ -416,13 +416,24 @@ with st.expander('⏰ Daily API Parameters', expanded=not _daily_exists):
         )
 
         _d_type_labels = st.multiselect(
-            'Notice types',
+            'Notice types (open solicitations)',
             list(_NOTICE_TYPE_OPTIONS.keys()),
             default=[
                 lbl for lbl, code in _NOTICE_TYPE_OPTIONS.items()
-                if code in _daily_params.get('notice_types', ['p', 'o', 'k', 'r'])
+                if code in _daily_params.get('notice_types', ['p', 'o', 'k', 'r', 's'])
             ],
             key='daily_notice_types',
+        )
+
+        _d_include_awards = st.checkbox(
+            'Also fetch past awards daily (separate store)',
+            value=bool(_daily_params.get('include_awards', False)),
+            key='daily_include_awards',
+            help=(
+                'Adds one more query per day for award notices, stored separately at '
+                'data/all-topics/awards/SAM-GOV/. Costs additional SAM.gov API calls — '
+                'check the daily quota headroom first.'
+            ),
         )
 
         _d_keyword = st.text_input(
@@ -458,6 +469,7 @@ with st.expander('⏰ Daily API Parameters', expanded=not _daily_exists):
                     'keyword':        _d_keyword.strip(),
                     'max_results':    int(_d_max),
                     'fetch_desc':     bool(_d_fetch_desc),
+                    'include_awards': bool(_d_include_awards),
                     'sam_gov_api_key': _sam_key,
                 },
                 'custom_cols': {},
@@ -474,6 +486,7 @@ with st.expander('⏰ Daily API Parameters', expanded=not _daily_exists):
         st.caption(
             f'**Current schedule:** last {_daily_params.get("lookback_days", 1)} day(s) · '
             f'notice types: `{", ".join(_daily_params.get("notice_types", []))}`'
+            + (' · past awards: **on**' if _daily_params.get('include_awards') else '')
         )
         with st.expander('Cloud Scheduler setup (one-time)', expanded=False):
             st.caption(
@@ -657,6 +670,47 @@ if st.session_state.sam_active_run:
                 if status.get('gcs_path'):
                     st.caption(f'Saved to `{status["gcs_path"]}`')
 
+                if status.get('awards_fetched'):
+                    st.success(
+                        f'Past awards — **{status.get("awards_saved", 0):,}** saved '
+                        f'(fetched {status.get("awards_fetched", 0):,}, '
+                        f'passed screening {status.get("awards_passed_screening", 0):,}, '
+                        f'after dedup {status.get("awards_after_dedup", 0):,}).'
+                    )
+                    if status.get('awards_gcs_path'):
+                        st.caption(f'Saved to `{status["awards_gcs_path"]}`')
+
+            if status.get('rows_deferred_quota') or status.get('awards_deferred'):
+                st.warning(
+                    f"SAM.gov's daily request quota ran out mid-run — "
+                    f"**{status.get('rows_deferred_quota', 0):,}** solicitation(s) and "
+                    f"**{status.get('awards_deferred', 0):,}** award(s) were deferred "
+                    f"rather than stored without their descriptions. They stay new and "
+                    f"will be picked up on the next run (the quota resets at midnight UTC)."
+                )
+
+            # Per-stream fetch report. The truncation warning matters most: a short
+            # read used to be completely silent, which is how ~45% of every day's
+            # notices went missing for months without anyone noticing.
+            _reports = status.get('fetch_reports') or []
+            _short = [r for r in _reports if r.get('truncated')]
+            if _short:
+                for r in _short:
+                    st.error(
+                        f'⚠️ SAM.gov returned only **{r.get("retrieved", 0):,}** of '
+                        f'**{r.get("total", 0):,}** matching {r.get("label", "")} records '
+                        f'after {r.get("pages", 0)} page(s). Narrow the date range or add '
+                        f'a keyword filter so each query stays under the ceiling — the '
+                        f'missing records were never screened.'
+                    )
+            if _reports:
+                with st.expander('📡 Fetch detail', expanded=bool(_short)):
+                    st.dataframe(
+                        pd.DataFrame(_reports), hide_index=True, use_container_width=True
+                    )
+                    if status.get('api_calls_used'):
+                        st.caption(f'SAM.gov API calls used: {status["api_calls_used"]:,}')
+
             _revs = status.get('revisions') or []
             if _revs:
                 with st.expander(f'📝 Revision details ({len(_revs)})', expanded=True):
@@ -743,12 +797,30 @@ with tab_api:
             api_date_to = st.date_input('Posted to', value=today_date, key='sam_api_date_to')
 
         selected_type_labels = st.multiselect(
-            'Notice types',
+            'Notice types (open solicitations)',
             list(_NOTICE_TYPE_OPTIONS.keys()),
-            default=['Solicitation', 'Presolicitation', 'Sources Sought'],
+            # Special Notice is in the default on purpose: 23 of the 25 Commercial
+            # Solutions Openings posted in a sampled 30-day window were Special
+            # Notices. Until 2026-09-15 the type filter was silently ignored by
+            # SAM.gov, so this default never mattered — now it decides coverage.
+            default=['Solicitation', 'Presolicitation', 'Sources Sought', 'Special Notice'],
             key='sam_api_notice_types',
         )
         selected_type_codes = [_NOTICE_TYPE_OPTIONS[lbl] for lbl in selected_type_labels]
+
+        api_include_awards = st.checkbox(
+            'Also fetch past awards (separate store)',
+            value=False,
+            key='sam_api_include_awards',
+            help=(
+                'Award notices are contracts that have already been awarded. They are '
+                'fetched by their own query and saved to data/all-topics/awards/SAM-GOV/ '
+                '— never to the solicitation store, so Bulk Matching can never target '
+                'already-awarded work. Each award carries the awardee, dollar amount, '
+                'award date, NAICS and set-aside straight from the search response. '
+                'Search them from the Grant Search page.'
+            ),
+        )
 
         api_keyword = st.text_input(
             'Keyword filter (optional)',
@@ -839,6 +911,7 @@ with tab_api:
                         'keyword':         api_keyword.strip(),
                         'max_results':     int(api_max),
                         'fetch_desc':      bool(api_fetch_desc),
+                        'include_awards':  bool(api_include_awards),
                         'sam_gov_api_key': sam_key,
                     },
                     'custom_cols': {

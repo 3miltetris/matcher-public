@@ -38,10 +38,11 @@ Config schema:
   "api_params": {
     "date_from":        "01/01/2026",
     "date_to":          "06/01/2026",
-    "notice_types":     ["p", "o", "k", "r"],
+    "notice_types":     ["p", "o", "k", "r", "s"],
     "keyword":          "",
     "max_results":      500,
     "fetch_desc":       true,
+    "include_awards":   false,
     "sam_gov_api_key":  "..."
   },
 
@@ -80,10 +81,17 @@ from openai import OpenAI
 
 _BUCKET           = 'cc-matcher-bucket-jeg-v1'
 _SAM_STORE_PREFIX = 'data/all-topics/processed/SAM-GOV/'
+# Past awards live OUTSIDE processed/ on purpose: Grant Search, Bulk Matching and
+# Bulk Aspect Match all enumerate the prefixes under processed/ as selectable
+# "agencies", and Bulk Matching pre-checks every one of them. An awards folder in
+# there would silently be matched against clients on every run — outreach for work
+# that has already been awarded. Anything that wants awards must opt in by path.
+_AWARD_STORE_PREFIX = 'data/all-topics/awards/SAM-GOV/'
 _STATUS_PREFIX    = 'sam-gov-jobs/'
 _SAM_API_BASE     = 'https://api.sam.gov/opportunities/v2/search'
 _SAM_DESC_BASE    = 'https://api.sam.gov/opportunities/v2/noticedesc'
-_SAM_PAGE_SIZE    = 1000
+_SAM_PAGE_SIZE    = 1000  # max accepted by SAM.gov; `offset` is a PAGE INDEX, not a record offset
+_SAM_MAX_PAGES    = 40    # runaway guard: 40 pages x 1000 = 40k notices per query stream
 _DESC_WORKERS     = 6   # SAM.gov allows 10 req/s — 6 workers is the concurrency cap
 _SAM_PAGE_SLEEP   = 3.0  # seconds between pagination requests
 _SAM_MAX_RETRIES  = 8   # max retries on throttle 429s (daily-quota 429s abort immediately)
@@ -99,6 +107,11 @@ _EMBED_WORKERS    = 8
 _SCREEN_MODEL     = 'claude-haiku-4-5-20251001'
 _SCREEN_MAX_CHARS = 3000
 _TOKEN_LIMIT      = 7500
+# Summaries that are really refusals. On the solicitation path these rows are
+# dropped; on the awards path the row is still worth keeping, so the refusal is
+# blanked instead and the embedding falls back to title + awardee.
+_THIN_PHRASES = ("don't have enough technical content", 'not enough technical content',
+                 'i cannot summarize', "i'm unable to summarize")
 
 # Revision handling
 _ATTACH_MAX_FILES     = 8      # attachments fetched per notice
@@ -107,7 +120,9 @@ _ATTACH_MAX_CHARS     = 40000  # total attachment text per notice
 _REV_WORKERS          = 4      # concurrent revised notices (each makes SAM + Claude calls)
 _REVCHECK_MAX_WINDOWS = 5      # one-year postedFrom/postedTo windows walked back per solnum lookup
 _REVCHECK_STATE_BLOB  = 'sam-gov-configs/revcheck_state.json'  # last-checked cursor per topic_number
-_REVCHECK_DEFAULT_BUDGET = 600  # SAM.gov API calls per revision-check run (daily key quota is 1,000)
+_REVCHECK_DEFAULT_BUDGET = 600  # SAM.gov API calls per revision-check run; assumes a
+                                # SAM.gov *system account* key (1,000/day). An individual
+                                # key dies far below this — see CLAUDE.md on quota tiers.
 _NOTICE_ID_RE         = re.compile(r'sam\.gov/opp/([^/]+)/view')
 
 _SCREEN_SYSTEM = """\
@@ -157,6 +172,51 @@ Summarize the opportunity in 3–5 sentences. Focus exclusively on:
 - Relevant domain, technology, or sector (e.g., AI/ML, biotech, defense electronics, advanced manufacturing)
 
 Strip out all procurement boilerplate: FAR clauses, set-aside language, submission deadlines, page limits, administrative instructions, and points of contact. Write in plain technical language. If the description is already short and technical, return it as-is.\
+"""
+
+_AWARD_SCREEN_SYSTEM = """\
+You are screening COMPLETED federal award notices for a consultancy that serves innovative startups, R&D companies, and deep tech small businesses.
+
+These are contracts that have ALREADY been awarded. They are not opportunities to bid on. We keep them as competitive and market intelligence: who is winning technical work, in which areas, at what size, and under which vehicles.
+
+Your only job is to decide: is this award worth tracking?
+
+Answer YES if the award tells us something useful about the market our clients compete in.
+Answer NO if it does not.
+
+---
+
+TRACK (YES) if any of the following are true:
+- The work awarded is technical R&D, applied research, prototyping, or novel development
+- The awardee is plausibly a small or mid-size technology company (not a facilities, construction or staffing firm)
+- It was awarded under a vehicle our clients pursue (SBIR, STTR, BAA, CSO, OTA, IDIQ with small business tracks)
+- It was set aside for small business, SDB, 8(a), HUBZone, WOSB or SDVOSB
+- The technical domain is one our clients work in (AI/ML, biotech, defense electronics, energy, advanced manufacturing, space, autonomy, etc.)
+
+DO NOT TRACK (NO) if any of the following are true:
+- The award is for construction, facilities maintenance, janitorial, food service, grounds, or logistics hauling
+- It is a commodity or off-the-shelf goods purchase with no development content
+- It is administrative, staffing, training, or professional-services support with no technical component
+- The work is routine sustainment with no innovation content
+
+Judge the WORK, not the dollar value - a small award for novel development is worth tracking; a large one for base operations support is not.
+
+---
+
+OUTPUT FORMAT:
+Respond only with valid JSON. No preamble, no markdown, no explanation outside the JSON.
+{"import": true, "confidence": "high", "reason": "One or two sentences explaining the decision."}\
+"""
+
+_AWARD_SUMMARY_SYSTEM = """\
+You are preparing a COMPLETED federal award notice for semantic matching against startup and R&D company profiles.
+
+This contract has already been awarded. Summarize in 3-5 sentences what technical work was bought. Focus exclusively on:
+- The specific technical problem, research area, or capability that was procured
+- Key deliverables or technical outcomes
+- Relevant domain, technology, or sector (e.g. AI/ML, biotech, defense electronics, advanced manufacturing)
+
+Write it so it can be compared against a company capability profile. Do NOT open with the awardee name or the dollar value - those are stored in their own fields and repeating them here crowds out the technical content the embedding needs. Strip all procurement boilerplate: FAR clauses, set-aside language, protest rights, administrative instructions and points of contact. Write in plain technical language.\
 """
 
 _REVISION_SYSTEM = """\
@@ -278,22 +338,166 @@ def _fetch_one_desc(notice_id: str, api_key: str) -> str:
         return ''
 
 
-def _fetch_descriptions_batch(notice_ids: list[str], api_key: str) -> list[str]:
-    results = [''] * len(notice_ids)
+def _fetch_descriptions_batch(notice_ids: list[str],
+                              api_key: str) -> tuple[list[str | None], bool]:
+    """Fetch descriptions, deferring rather than dying when the daily quota runs out.
+
+    Returns (descriptions, quota_exhausted). A row whose description could not be
+    fetched because the quota died comes back as None so the caller can drop it
+    from this run — it stays un-stored and is re-ingested next time. Letting
+    QuotaExhaustedError propagate instead would throw away the whole run,
+    including a Claude screening call for every fetched row.
+    """
+    results: list[str | None] = [''] * len(notice_ids)
+    quota_hit = False
     with ThreadPoolExecutor(max_workers=_DESC_WORKERS) as pool:
         futures = {pool.submit(_fetch_one_desc, nid, api_key): i for i, nid in enumerate(notice_ids)}
         done = 0
         for future in as_completed(futures):
             i = futures[future]
-            results[i] = future.result()
+            try:
+                results[i] = future.result()
+            except QuotaExhaustedError:
+                quota_hit = True
+                results[i] = None
             done += 1
             if done % 200 == 0 or done == len(notice_ids):
                 print(f'  descriptions: {done}/{len(notice_ids)}', flush=True)
-    return results
+    if quota_hit:
+        n_missing = sum(1 for r in results if r is None)
+        print(f'  SAM.gov daily quota exhausted — {n_missing:,} row(s) deferred to the '
+              f'next run (nothing partial is stored)', flush=True)
+    return results, quota_hit
 
 
-def _fetch_from_sam(api_params: dict) -> pd.DataFrame:
-    api_key   = api_params['sam_gov_api_key']
+def _award_field(item: dict, *path, default: str = '') -> str:
+    """Safely walk the nested `award` object SAM.gov returns on award notices."""
+    cur = item
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    if cur is None:
+        return default
+    return str(cur).strip()
+
+
+def _items_to_frame(items: list[dict]) -> pd.DataFrame:
+    """Map raw SAM.gov search results onto the job's working column set.
+
+    `type` / `baseType` and the whole `award` block ride along free in the search
+    response, so award intelligence (who won, how much, when) costs no extra call.
+    """
+    return pd.DataFrame({
+        'title':       [item.get('title', '')                                        for item in items],
+        'description': ['' for _ in items],
+        'naics_desc':  [item.get('naicsCode', '')                                    for item in items],
+        'notice_id':   [(item.get('solicitationNumber') or item.get('noticeId', '')) for item in items],
+        'agency':      [(item.get('subTier') or item.get('department', ''))          for item in items],
+        'posted_date': [item.get('postedDate', '')                                   for item in items],
+        'deadline':    [(item.get('responseDeadLine') or '')[:10]                    for item in items],
+        'sam_url':     [f"https://sam.gov/opp/{item['noticeId']}/view" if item.get('noticeId') else '' for item in items],
+        # Notice classification — the basis for splitting solicitations from awards
+        'notice_type': [_clean(item.get('type'))                                     for item in items],
+        'base_type':   [_clean(item.get('baseType'))                                 for item in items],
+        'set_aside':   [_clean(item.get('typeOfSetAsideDescription'))                for item in items],
+        'agency_path': [_clean(item.get('fullParentPathName'))                       for item in items],
+        # Award block — populated only on award notices
+        'award_date':    [_award_field(item, 'award', 'date')                        for item in items],
+        'award_number':  [_award_field(item, 'award', 'number')                      for item in items],
+        'award_amount':  [_award_field(item, 'award', 'amount')                      for item in items],
+        'awardee_name':  [_award_field(item, 'award', 'awardee', 'name')             for item in items],
+        'awardee_city':  [_award_field(item, 'award', 'awardee', 'location', 'city', 'name')  for item in items],
+        'awardee_state': [_award_field(item, 'award', 'awardee', 'location', 'state', 'code') for item in items],
+        # Kept for revision detection — the version-specific noticeId and attachment links.
+        # Dropped before saving (the output frame selects its columns explicitly).
+        '_raw_notice_id':  [item.get('noticeId', '')          for item in items],
+        '_resource_links': [item.get('resourceLinks') or []   for item in items],
+    })
+
+
+def _sam_search_all(api_key: str, date_from: str, date_to: str, ptypes: list[str],
+                    keyword: str, max_results: int, active: str | None,
+                    label: str) -> tuple[list[dict], dict]:
+    """Paginate one SAM.gov search query to exhaustion.
+
+    `offset` is a PAGE INDEX, not a record offset — SAM.gov's docs say so, and the
+    API confirms it by answering 200 OK with an empty `opportunitiesData` array for
+    any out-of-range page. Advancing it by the record count (the bug this replaces)
+    therefore asked for page 1,000, got an empty array, and left the loop through
+    the `not page_items` break: a silent stop at exactly 1,000 rows on every run,
+    with ~43-55% of each day's notices never fetched and no error raised anywhere.
+    """
+    items: list[dict] = []
+    total = 0
+    page  = 0
+
+    while page < _SAM_MAX_PAGES:
+        params: dict = {
+            'api_key':    api_key,
+            'postedFrom': date_from,
+            'postedTo':   date_to,
+            'limit':      _SAM_PAGE_SIZE,
+            'offset':     page,
+            # The documented parameter is `ptype`. This job sent `ntype` until
+            # 2026-09-15; SAM.gov silently ignores unknown parameters, so the
+            # notice-type filter had never once been applied and every run also
+            # pulled award notices, justifications and surplus-property sales.
+        }
+        if active:
+            params['active'] = active
+        if ptypes:
+            params['ptype'] = ','.join(ptypes)
+        if keyword:
+            params['keyword'] = keyword
+
+        if page > 0:
+            time.sleep(_SAM_PAGE_SLEEP)
+
+        data = _sam_get(_SAM_API_BASE, params).json()
+
+        if page == 0:
+            total = int(data.get('totalRecords') or 0)
+            print(f'  [{label}] SAM.gov total records: {total:,}', flush=True)
+
+        page_items = data.get('opportunitiesData') or []
+        items.extend(page_items)
+
+        if not page_items:
+            break
+        if max_results and len(items) >= max_results:
+            items = items[:max_results]
+            break
+        if total and len(items) >= total:
+            break
+        page += 1
+
+    capped    = bool(max_results) and len(items) >= max_results
+    truncated = bool(total) and len(items) < total and not capped
+    report = {
+        'label': label, 'total': total, 'retrieved': len(items),
+        'pages': page + 1, 'truncated': truncated, 'capped': capped,
+    }
+    if truncated:
+        # Either a per-query retrieval ceiling or a page limit we have not
+        # characterised. Reported loudly, because the old failure mode was silence.
+        print(f'  [{label}] WARNING: retrieved {len(items):,} of {total:,} — query '
+              f'truncated by SAM.gov after {page + 1} pages', flush=True)
+    else:
+        print(f'  [{label}] retrieved {len(items):,} items in {page + 1} page(s)', flush=True)
+    return items, report
+
+
+def _fetch_from_sam(api_params: dict) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+    """Fetch open solicitations and (optionally) past awards as two separate streams.
+
+    Returns (solicitations, awards, per-stream fetch reports). Awards get their own
+    query rather than being filtered out of a combined one: it keeps each query's
+    record count below any per-query ceiling, and `active=Yes` is plain wrong for
+    awards — they auto-archive ~15 days after posting, so the live filter would
+    hide almost all of them.
+    """
+    api_key = api_params['sam_gov_api_key']
 
     # Support dynamic date range for scheduled daily runs
     if api_params.get('lookback_days'):
@@ -303,70 +507,45 @@ def _fetch_from_sam(api_params: dict) -> pd.DataFrame:
     else:
         date_from = api_params['date_from']
         date_to   = api_params['date_to']
-    notice_types = api_params.get('notice_types', [])
-    keyword      = api_params.get('keyword', '')
-    max_results  = int(api_params.get('max_results', 0))
 
-    all_items: list[dict] = []
-    offset = 0
-    total: int | None = None
+    notice_types   = [t for t in api_params.get('notice_types', []) if t != 'a']
+    include_awards = bool(api_params.get('include_awards', False))
+    keyword        = api_params.get('keyword', '')
+    max_results    = int(api_params.get('max_results', 0))
 
-    print(f'Fetching from SAM.gov ({date_from} → {date_to})…', flush=True)
-    while True:
-        params: dict = {
-            'api_key':    api_key,
-            'postedFrom': date_from,
-            'postedTo':   date_to,
-            'limit':      _SAM_PAGE_SIZE,
-            'offset':     offset,
-            'active':     'Yes',
-        }
-        if notice_types:
-            params['ntype'] = ','.join(notice_types)
-        if keyword:
-            params['keyword'] = keyword
+    print(f'Fetching from SAM.gov ({date_from} -> {date_to})...', flush=True)
 
-        if offset > 0:
-            time.sleep(_SAM_PAGE_SLEEP)
+    reports: list[dict] = []
+    sol_items, sol_report = _sam_search_all(
+        api_key, date_from, date_to, notice_types, keyword, max_results,
+        active='Yes', label='solicitations',
+    )
+    reports.append(sol_report)
 
-        r    = _sam_get(_SAM_API_BASE, params)
-        data = r.json()
+    award_items: list[dict] = []
+    if include_awards:
+        award_items, award_report = _sam_search_all(
+            api_key, date_from, date_to, ['a'], keyword,
+            int(api_params.get('max_award_results', 0)),
+            active=None, label='awards',
+        )
+        reports.append(award_report)
 
-        if total is None:
-            total = int(data.get('totalRecords', 0))
-            print(f'  SAM.gov total records: {total:,}', flush=True)
+    sol_df   = _items_to_frame(sol_items)
+    award_df = _items_to_frame(award_items)
 
-        page_items = data.get('opportunitiesData') or []
-        all_items.extend(page_items)
+    # Belt and braces: route on the response's own `type` field too, so a notice
+    # returned under the wrong ptype still lands in the right store.
+    if not sol_df.empty:
+        misfiled = sol_df['notice_type'].str.lower() == 'award notice'
+        if misfiled.any():
+            print(f'  {int(misfiled.sum())} award notice(s) returned by the solicitation '
+                  f'query — routed to the awards store', flush=True)
+            award_df = pd.concat([award_df, sol_df[misfiled]], ignore_index=True)
+            sol_df   = sol_df[~misfiled].reset_index(drop=True)
 
-        if not page_items:
-            break
-        if max_results and len(all_items) >= max_results:
-            all_items = all_items[:max_results]
-            break
-        offset += len(page_items)
-        if total and offset >= total:
-            break
-
-    print(f'  fetched {len(all_items):,} items', flush=True)
-
-    # Descriptions are fetched later, after screening, to avoid burning API quota on rows
-    # that will be filtered out.  The caller is responsible for calling _fetch_descriptions_batch
-    # on the subset that passes screening when fetch_desc is True.
-    return pd.DataFrame({
-        'title':       [item.get('title', '')                                                    for item in all_items],
-        'description': ['' for _ in all_items],
-        'naics_desc':  [item.get('naicsCode', '')                                                for item in all_items],
-        'notice_id':   [(item.get('solicitationNumber') or item.get('noticeId', ''))             for item in all_items],
-        'agency':      [(item.get('subTier') or item.get('department', ''))                      for item in all_items],
-        'posted_date': [item.get('postedDate', '')                                               for item in all_items],
-        'deadline':    [(item.get('responseDeadLine') or '')[:10]                                for item in all_items],
-        'sam_url':     [f"https://sam.gov/opp/{item['noticeId']}/view" if item.get('noticeId') else '' for item in all_items],
-        # Kept for revision detection — the version-specific noticeId and attachment links.
-        # Dropped before saving (the output frame selects its columns explicitly).
-        '_raw_notice_id':  [item.get('noticeId', '')          for item in all_items],
-        '_resource_links': [item.get('resourceLinks') or []   for item in all_items],
-    })
+    print(f'  fetched {len(sol_df):,} solicitations, {len(award_df):,} awards', flush=True)
+    return sol_df, award_df, reports
 
 
 def _load_from_csv(client: storage.Client, csv_blob_path: str, col_map: dict) -> pd.DataFrame:
@@ -395,7 +574,8 @@ def _load_from_csv(client: storage.Client, csv_blob_path: str, col_map: dict) ->
 
 # ── Async screening ────────────────────────────────────────────────────────────
 
-async def _screen_all(df: pd.DataFrame, anth_key: str) -> pd.DataFrame:
+async def _screen_all(df: pd.DataFrame, anth_key: str,
+                      system: str = _SCREEN_SYSTEM) -> pd.DataFrame:
     titles = df['title'].astype(str).tolist()
     descs  = df['description'].astype(str).tolist()
     naics  = df['naics_desc'].astype(str).tolist() if 'naics_desc' in df.columns else [''] * len(df)
@@ -413,7 +593,7 @@ async def _screen_all(df: pd.DataFrame, anth_key: str) -> pd.DataFrame:
                         resp = await client.messages.create(
                             model=_SCREEN_MODEL,
                             max_tokens=200,
-                            system=_SCREEN_SYSTEM,
+                            system=system,
                             messages=[{'role': 'user', 'content': (
                                 f"Title: {titles[i]}\n"
                                 f"Description: {descs[i][:_SCREEN_MAX_CHARS]}\n"
@@ -450,7 +630,8 @@ async def _screen_all(df: pd.DataFrame, anth_key: str) -> pd.DataFrame:
 
 # ── Async summarization ────────────────────────────────────────────────────────
 
-async def _summarize_all(titles: list[str], descs: list[str], anth_key: str) -> list[str]:
+async def _summarize_all(titles: list[str], descs: list[str], anth_key: str,
+                         system: str = _SUMMARY_SYSTEM) -> list[str]:
     results: list[str] = [''] * len(titles)
     done_count = 0
     sem = asyncio.Semaphore(_SUMMARY_CONCUR)
@@ -464,7 +645,7 @@ async def _summarize_all(titles: list[str], descs: list[str], anth_key: str) -> 
                         resp = await client.messages.create(
                             model=_SCREEN_MODEL,
                             max_tokens=400,
-                            system=_SUMMARY_SYSTEM,
+                            system=system,
                             messages=[{'role': 'user', 'content': (
                                 f"Title: {titles[i]}\n\nDescription:\n{descs[i][:5000]}"
                             )}],
@@ -603,6 +784,181 @@ def _load_store_meta(client: storage.Client) -> tuple[dict[str, dict], set[str]]
             if blob.name not in entry['blobs']:
                 entry['blobs'].append(blob.name)
     return meta, titles
+
+
+def _load_award_meta(client: storage.Client) -> tuple[set[str], set[str]]:
+    """Existing award-store identity: (notice/solicitation numbers, titles).
+
+    Awards are terminal — nothing amends them — so unlike the solicitation store
+    this needs no version tracking, just enough to not re-ingest the same notice.
+    Dedup is on the version-specific noticeId as well as the solicitation number,
+    because one solicitation legitimately produces several award notices (multiple
+    awardees on one CSO or IDIQ) and those are distinct records worth keeping.
+    """
+    ids:    set[str] = set()
+    titles: set[str] = set()
+    for blob in client.list_blobs(_BUCKET, prefix=_AWARD_STORE_PREFIX):
+        if not blob.name.endswith('.parquet'):
+            continue
+        try:
+            pf   = pq.ParquetFile(io.BytesIO(blob.download_as_bytes()))
+            have = set(pf.schema_arrow.names)
+            cols = [c for c in ('topic_number', 'title', 'notice_version_id') if c in have]
+            df   = pf.read(columns=cols).to_pandas()
+        except Exception:
+            continue
+        for col in ('topic_number', 'notice_version_id'):
+            if col in df.columns:
+                ids.update(x for x in df[col].dropna().astype(str).str.strip() if x)
+        if 'title' in df.columns:
+            titles.update(df['title'].dropna().astype(str).str.lower().str.strip())
+    return ids, titles
+
+
+def _award_amount_num(v) -> float | None:
+    """Award amount as a float for sorting/filtering; None when unparseable.
+
+    Deliberately None rather than 0.0 — same reasoning as the HubSpot `_num`
+    companions: a missing amount must read as "no data", not as a $0 award.
+    """
+    s = _clean(v).replace('$', '').replace(',', '')
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _process_awards(gcs: storage.Client, award_df: pd.DataFrame, api_params: dict,
+                    anth_key: str, openai_key: str, custom_cols: dict) -> dict:
+    """Screen, summarize, embed and store past award notices.
+
+    Same shape as the solicitation pipeline, but with its own prompts (the question
+    is "is this award worth tracking?", not "should we bid?"), its own store, and
+    no revision handling — an award notice is final.
+    """
+    out_report = {
+        'awards_fetched':          len(award_df),
+        'awards_passed_screening': 0,
+        'awards_after_dedup':      0,
+        'awards_saved':            0,
+        'awards_deferred':         0,
+        'awards_gcs_path':         None,
+    }
+    if award_df.empty:
+        return out_report
+
+    print(f'Screening {len(award_df):,} award notices with Claude...', flush=True)
+    screened = asyncio.run(_screen_all(award_df, anth_key, system=_AWARD_SCREEN_SYSTEM))
+    passing  = screened[screened['_import'] == True].copy().reset_index(drop=True)
+    out_report['awards_passed_screening'] = len(passing)
+    print(f'  {len(passing):,} awards passed screening '
+          f'({len(award_df) - len(passing):,} filtered out)', flush=True)
+    if passing.empty:
+        return out_report
+
+    print('Loading existing awards for dedup...', flush=True)
+    existing_ids, existing_titles = _load_award_meta(gcs)
+    print(f'  {len(existing_ids):,} existing award IDs', flush=True)
+
+    def _is_dup(row: pd.Series) -> bool:
+        vid = _clean(row.get('_raw_notice_id'))
+        if vid and vid in existing_ids:
+            return True
+        nid = _clean(row.get('notice_id'))
+        if nid and nid in existing_ids:
+            return True
+        return _clean(row.get('title')).lower() in existing_titles
+
+    new_rows = passing[~passing.apply(_is_dup, axis=1)].reset_index(drop=True)
+    out_report['awards_after_dedup'] = len(new_rows)
+    print(f'  {len(passing) - len(new_rows):,} duplicate awards skipped, '
+          f'{len(new_rows):,} new', flush=True)
+    if new_rows.empty:
+        return out_report
+
+    if api_params.get('fetch_desc', True):
+        print(f'Fetching descriptions for {len(new_rows):,} awards...', flush=True)
+        descs, quota_hit = _fetch_descriptions_batch(
+            new_rows['notice_id'].tolist(), api_params['sam_gov_api_key'],
+        )
+        new_rows = new_rows.copy()
+        new_rows['description'] = ['' if d is None else d for d in descs]
+        if quota_hit:
+            keep = [d is not None for d in descs]
+            out_report['awards_deferred'] = int(len(keep) - sum(keep))
+            new_rows = new_rows[keep].reset_index(drop=True)
+            out_report['awards_after_dedup'] = len(new_rows)
+            if new_rows.empty:
+                return out_report
+
+    print(f'Summarizing {len(new_rows):,} awards...', flush=True)
+    summaries = asyncio.run(_summarize_all(
+        new_rows['title'].tolist(), new_rows['description'].tolist(),
+        anth_key, system=_AWARD_SUMMARY_SYSTEM,
+    ))
+
+    # An award notice is often a bare "X was awarded to Y" with no technical body.
+    # Those are still worth keeping as market intelligence, so unlike the
+    # solicitation path they are not dropped — the refusal text is blanked (storing
+    # "I don't have enough technical content" as grant_summary would both read as
+    # real content and poison the embedding) and they embed on title + awardee.
+    summaries = [
+        '' if any(p in s.lower() for p in _THIN_PHRASES) else s
+        for s in summaries
+    ]
+    embed_texts = [
+        s if s.strip() else f"{t} {_clean(a)}".strip()
+        for s, t, a in zip(summaries, new_rows['title'].tolist(), new_rows['awardee_name'].tolist())
+    ]
+    print(f'Generating embeddings for {len(new_rows):,} awards...', flush=True)
+    embeddings = _embed_all(embed_texts, openai_key)
+
+    today = datetime.today().strftime('%Y-%m-%d')
+    out = pd.DataFrame({
+        'topic_number':      new_rows['notice_id'].astype(str),
+        'agency':            new_rows['agency'].astype(str),
+        'title':             new_rows['title'].astype(str),
+        'description':       new_rows['description'].astype(str),
+        'open_date':         new_rows['posted_date'].astype(str),
+        'due_date':          '',
+        'source':            new_rows['sam_url'].astype(str),
+        'scraped_at':        today,
+        'sam_confidence':    new_rows['_confidence'].values,
+        'sam_reason':        new_rows['_reason'].values,
+        'grant_summary':     summaries,
+        'embeddings':        embeddings,
+        'notice_version_id': new_rows['_raw_notice_id'].astype(str),
+        'sam_status':        'awarded',
+        # Award-specific columns — the reason this store exists
+        'notice_type':       new_rows['notice_type'].astype(str),
+        'base_type':         new_rows['base_type'].astype(str),
+        'award_date':        new_rows['award_date'].astype(str),
+        'award_number':      new_rows['award_number'].astype(str),
+        'award_amount':      new_rows['award_amount'].astype(str),
+        'award_amount_num':  [_award_amount_num(v) for v in new_rows['award_amount']],
+        'awardee_name':      new_rows['awardee_name'].astype(str),
+        'awardee_city':      new_rows['awardee_city'].astype(str),
+        'awardee_state':     new_rows['awardee_state'].astype(str),
+        'set_aside':         new_rows['set_aside'].astype(str),
+        'agency_path':       new_rows['agency_path'].astype(str),
+        'naics_code':        new_rows['naics_desc'].astype(str),
+    })
+    for col_name, col_val in custom_cols.items():
+        out[col_name] = col_val
+
+    gcs_path = f'{_AWARD_STORE_PREFIX}sam_awards_{today}_{_secrets.token_hex(3)}.parquet'
+    buf = io.BytesIO()
+    out.to_parquet(buf, index=False)
+    buf.seek(0)
+    gcs.bucket(_BUCKET).blob(gcs_path).upload_from_file(
+        buf, content_type='application/octet-stream')
+
+    out_report['awards_saved']    = len(out)
+    out_report['awards_gcs_path'] = gcs_path
+    print(f'  {len(out):,} awards saved -> {gcs_path}', flush=True)
+    return out_report
 
 
 # ── Revision handling ──────────────────────────────────────────────────────────
@@ -1061,20 +1417,58 @@ def main(config_blob_path: str) -> None:
 
     # ── Step 1: Load input ─────────────────────────────────────────────────────
     print(f'Loading input data (mode={input_mode})…', flush=True)
+    award_df: pd.DataFrame = pd.DataFrame()
+    fetch_reports: list[dict] = []
     if input_mode == 'csv':
         df = _load_from_csv(gcs, config['csv_blob_path'], config['col_map'])
     else:
-        df = _fetch_from_sam(config['api_params'])
+        df, award_df, fetch_reports = _fetch_from_sam(config['api_params'])
 
     rows_fetched = len(df)
     print(f'  {rows_fetched:,} rows loaded', flush=True)
 
+    # ── Step 1b: Past awards ───────────────────────────────────────────────────
+    # Runs before the solicitation pipeline so that the award counts land in the
+    # status payload even when the solicitation stream exits early (nothing
+    # fetched, nothing passing screening, everything a duplicate).
+    award_report = {
+        'awards_fetched': 0, 'awards_passed_screening': 0,
+        'awards_after_dedup': 0, 'awards_saved': 0, 'awards_deferred': 0,
+        'awards_gcs_path': None,
+    }
+    if not award_df.empty:
+        award_report = _process_awards(
+            gcs, award_df, config.get('api_params', {}),
+            anth_key, openai_key, custom_cols,
+        )
+
+    def _status(**extra) -> dict:
+        """Status payload with the shared fields filled in.
+
+        Every early return writes one of these, so award counts, per-stream fetch
+        reports and the API call tally are never lost to an early exit.
+        """
+        payload = {
+            'run_id':                run_id,
+            'rows_fetched':          0,
+            'rows_passed_screening': 0,
+            'rows_after_dedup':      0,
+            'rows_saved':            0,
+            'rows_revised':          0,
+            'rows_deferred_quota':   0,
+            'revisions':             [],
+            'gcs_path':              None,
+            'fetch_reports':         fetch_reports,
+            'api_calls_used':        _SAM_CALL_COUNT[0],
+            'error':                 None,
+        }
+        payload.update(award_report)
+        payload.update(extra)
+        return payload
+
     if df.empty:
-        _write_status(gcs, run_id, {
-            'run_id': run_id, 'rows_fetched': 0, 'rows_passed_screening': 0,
-            'rows_after_dedup': 0, 'rows_saved': 0, 'gcs_path': None, 'error': None,
-        })
-        print('No rows to process — exiting.', flush=True)
+        _write_status(gcs, run_id, _status())
+        print('No solicitation rows to process — exiting.', flush=True)
         return
 
     # ── Step 2: Screen ─────────────────────────────────────────────────────────
@@ -1089,10 +1483,7 @@ def main(config_blob_path: str) -> None:
     )
 
     if passing.empty:
-        _write_status(gcs, run_id, {
-            'run_id': run_id, 'rows_fetched': rows_fetched, 'rows_passed_screening': 0,
-            'rows_after_dedup': 0, 'rows_saved': 0, 'gcs_path': None, 'error': None,
-        })
+        _write_status(gcs, run_id, _status(rows_fetched=rows_fetched))
         print('No rows passed screening — exiting.', flush=True)
         return
 
@@ -1122,6 +1513,7 @@ def main(config_blob_path: str) -> None:
     # but carry a new noticeId. Instead of dropping them, fetch the new content,
     # diff it with Claude, and rewrite the stored rows in place.
     rows_revised = 0
+    rows_deferred_quota = 0
     revision_reports: list[dict] = []
     if input_mode == 'api' and '_raw_notice_id' in passing.columns:
         rev_items: list[dict] = []
@@ -1158,12 +1550,10 @@ def main(config_blob_path: str) -> None:
                   flush=True)
 
     if new_rows.empty:
-        _write_status(gcs, run_id, {
-            'run_id': run_id, 'rows_fetched': rows_fetched,
-            'rows_passed_screening': rows_passed, 'rows_after_dedup': 0,
-            'rows_saved': 0, 'rows_revised': rows_revised,
-            'revisions': revision_reports[:200], 'gcs_path': None, 'error': None,
-        })
+        _write_status(gcs, run_id, _status(
+            rows_fetched=rows_fetched, rows_passed_screening=rows_passed,
+            rows_revised=rows_revised, revisions=revision_reports[:200],
+        ))
         print('All passing rows already in the store — exiting.', flush=True)
         return
 
@@ -1174,9 +1564,26 @@ def main(config_blob_path: str) -> None:
     if input_mode == 'api' and config.get('api_params', {}).get('fetch_desc', True):
         api_key = config['api_params']['sam_gov_api_key']
         print(f'Fetching descriptions for {rows_dedup:,} passing rows…', flush=True)
-        descriptions = _fetch_descriptions_batch(new_rows['notice_id'].tolist(), api_key)
+        descriptions, quota_hit = _fetch_descriptions_batch(new_rows['notice_id'].tolist(), api_key)
         new_rows = new_rows.copy()
-        new_rows['description'] = descriptions
+        new_rows['description'] = ['' if d is None else d for d in descriptions]
+        if quota_hit:
+            # Deferred, not stored empty: an un-stored row is still "new" next run,
+            # whereas a row saved without its description would be deduped away
+            # forever with nothing but a title in it.
+            keep = [d is not None for d in descriptions]
+            rows_deferred_quota = int(len(keep) - sum(keep))
+            new_rows   = new_rows[keep].reset_index(drop=True)
+            rows_dedup = len(new_rows)
+            if new_rows.empty:
+                _write_status(gcs, run_id, _status(
+                    rows_fetched=rows_fetched, rows_passed_screening=rows_passed,
+                    rows_revised=rows_revised, revisions=revision_reports[:200],
+                    rows_deferred_quota=rows_deferred_quota,
+                ))
+                print('SAM.gov quota exhausted before any description was fetched — '
+                      'all rows deferred to the next run.', flush=True)
+                return
 
     # ── Step 5: Summarize ──────────────────────────────────────────────────────
     print(f'Summarizing {rows_dedup:,} rows…', flush=True)
@@ -1187,7 +1594,6 @@ def main(config_blob_path: str) -> None:
     ))
 
     # Drop rows where the LLM couldn't produce a useful summary (sparse/title-only descriptions)
-    _THIN_PHRASES = ("don't have enough technical content", "not enough technical content", "i cannot summarize", "i'm unable to summarize")
     thin_mask = [any(p in s.lower() for p in _THIN_PHRASES) for s in summaries]
     n_thin = sum(thin_mask)
     if n_thin:
@@ -1198,12 +1604,10 @@ def main(config_blob_path: str) -> None:
         rows_dedup = len(new_rows)
 
     if new_rows.empty:
-        _write_status(gcs, run_id, {
-            'run_id': run_id, 'rows_fetched': rows_fetched,
-            'rows_passed_screening': rows_passed, 'rows_after_dedup': 0,
-            'rows_saved': 0, 'rows_revised': rows_revised,
-            'revisions': revision_reports[:200], 'gcs_path': None, 'error': None,
-        })
+        _write_status(gcs, run_id, _status(
+            rows_fetched=rows_fetched, rows_passed_screening=rows_passed,
+            rows_revised=rows_revised, revisions=revision_reports[:200],
+        ))
         print('All rows had insufficient descriptions — exiting.', flush=True)
         return
 
@@ -1252,17 +1656,16 @@ def main(config_blob_path: str) -> None:
     rows_saved = len(out)
     print(f'\nDone. {rows_saved:,} rows saved → {gcs_path}', flush=True)
 
-    _write_status(gcs, run_id, {
-        'run_id':                run_id,
-        'rows_fetched':          rows_fetched,
-        'rows_passed_screening': rows_passed,
-        'rows_after_dedup':      rows_dedup,
-        'rows_saved':            rows_saved,
-        'rows_revised':          rows_revised,
-        'revisions':             revision_reports[:200],
-        'gcs_path':              gcs_path,
-        'error':                 None,
-    })
+    _write_status(gcs, run_id, _status(
+        rows_fetched=rows_fetched,
+        rows_passed_screening=rows_passed,
+        rows_after_dedup=rows_dedup,
+        rows_saved=rows_saved,
+        rows_revised=rows_revised,
+        revisions=revision_reports[:200],
+        rows_deferred_quota=rows_deferred_quota,
+        gcs_path=gcs_path,
+    ))
 
 
 if __name__ == '__main__':

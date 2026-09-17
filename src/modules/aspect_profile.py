@@ -50,9 +50,43 @@ ASPECT_MODELS = ['claude-sonnet-4-6', 'claude-haiku-4-5-20251001']
 DEFAULT_MODEL = 'claude-sonnet-4-6'
 
 MIN_ASPECTS  = 2
-MAX_ASPECTS  = 8
+MAX_ASPECTS  = 12
 ASPECT_KINDS = ['technology', 'capability', 'product', 'domain', 'market']
 EMBED_DIM    = 1536
+# Cosine between two aspect vectors of the SAME company above which they are
+# one capability written twice, and are merged at build time.
+#
+# MEASURED, not reasoned: across three real clients rebuilt at 10-11 aspects,
+# the whole within-company pairwise distribution topped out at 0.89 / 0.90 /
+# 0.92 (median ~0.81). An earlier 0.96 - picked by reasoning about ada-002's
+# compressed range rather than by measuring - was unreachable and fired zero
+# times, which is strictly worse than not having the feature.
+#
+# The awkward finding is that cosine does NOT cleanly separate "same capability
+# twice" from "two facets of one platform". A 0.90 setting was then measured
+# across the whole book (277 clients): it fired 33 times, and roughly 12-14 of
+# those merges were WRONG in a systematic way - it absorbs a platform into its
+# own application, or merges two genuinely distinct products:
+#
+#   FOS Myopia Control Contact Lenses  -> FOS Myopia Control Spectacle Lenses
+#   Dendritic Cell Immunotherapy ASY-77A -> csHsp70-Targeted ADC Platform
+#   Coronary Bifurcation Stenting Platform -> FDA Breakthrough Device IP Portfolio
+#   Occupational Radiation Safety Monitoring -> Electronic Polymer Dosimeter Patch
+#
+# A platform and its applications SHOULD be separate aspects - they match
+# different grant topics, which is the entire point of multi-aspect profiling.
+# The 383 reported near-misses clustered tightly (median 0.867, p90 0.888, max
+# 0.900), so 0.90 sat inside a dense band rather than above it. 0.94 puts the
+# auto-merge above that band, where only near-identical text reaches: it fires
+# rarely and does little harm when it does. Duplicate detection in practice is
+# nearest_aspect_pairs() below - a reviewed list beats a silent deletion.
+#
+# Every merge is reported WITH its cosine, so the next adjustment can be made
+# from data rather than guessed (this round it could not: only the near-misses
+# carried scores).
+ASPECT_MERGE_THRESHOLD = 0.94
+# Pairs at or above this are reported for review even when they do not merge.
+ASPECT_NEAR_FLOOR = 0.85
 
 # ── Markets ───────────────────────────────────────────────────────────────
 # A market is the customer world a company sells its aspects into. Names come
@@ -80,17 +114,37 @@ MARKET_CATEGORIES = [
     'Other',
 ]
 DEFENSE_MARKET = 'Defense'
-MARKET_TIERS   = ['primary', 'secondary']
 MAX_MARKETS    = 4      # non-defense markets; Defense is additional
+# Markets are ranked 1st, 2nd, 3rd... rather than bucketed primary/secondary,
+# because everything downstream already wants an ordering. The rank is stored as
+# an INTEGER and rendered as an ordinal only at display time - storing "1st"
+# would repeat the prose-instead-of-number mistake the HubSpot _num companions
+# exist to undo. Profiles written before ranks existed carry 'primary' /
+# 'secondary' strings; market_tier_rank() coerces them on read, so no profile
+# has to be rebuilt to stay usable.
+MAX_MARKET_TIER = MAX_MARKETS + 1        # the non-defense cap, plus Defense
+_LEGACY_TIERS   = {'primary': 1, 'secondary': 2}
 # Cosine between two market narrative vectors of the SAME company above which
 # they are describing one market twice, and are merged at build time.
 MARKET_MERGE_THRESHOLD = 0.93
+
+# ── Unexplored markets ────────────────────────────────────────────────────
+# A second Claude pass links a company's existing aspects into markets it does
+# NOT serve yet. Those are hypotheses, so they get their own columns, their own
+# embedding block and their own re-rank prompt - never a status flag on the
+# confirmed `markets` array, which every consumer would then have to remember to
+# filter. Defense is assessed here too: a client with no confirmed Defense
+# market can still surface an unexplored one.
+MAX_UNEXPLORED     = 3
+MIN_LINKED_ASPECTS = 2
 
 PROFILE_COLUMNS = [
     'company_key', 'company_name', 'companyWebsite',
     'profile_summary', 'aspects', 'aspect_labels',
     'n_aspects', 'embedding_dim', 'aspect_embeddings',
     'markets', 'market_labels', 'n_markets', 'market_embeddings',
+    'unexplored_markets', 'unexplored_labels', 'n_unexplored',
+    'unexplored_embeddings',
     'dod_assessment',
     'sources_used', 'source_fingerprint', 'model', 'built_at',
 ]
@@ -258,6 +312,34 @@ def _fin_text(row) -> str:
     return _research_text(row, 'financial_data', 'financial_summary', fr.ALL_FIELDS)
 
 
+def stated_intentions(row, limit: int = 20) -> list[str]:
+    """What the client SAID it intends or is considering, as opposed to
+    capability it demonstrably has.
+
+    fathom-sync-job deliberately pushes anything hypothetical, planned, or
+    belonging to a third party into extracted['notable_updates'] instead of the
+    capability arrays, and drive-sync-job may do the same. Those lines already
+    reach the aspect prompt (via _meetings_text flattening all of `extracted`),
+    where _RULES now tells the model to ignore them. The unexplored-market pass
+    is the one place they are useful: a market the client is already thinking
+    about is the strongest candidate there is - as a lead, never as capability."""
+    out: list[str] = []
+    for col in ('client_meetings_data', 'client_docs_data'):
+        extracted = _json_obj(row.get(col)).get('extracted')
+        if not isinstance(extracted, dict):
+            continue
+        updates = extracted.get('notable_updates')
+        if isinstance(updates, str):
+            updates = [updates]
+        if isinstance(updates, np.ndarray):
+            updates = list(updates)
+        for item in (updates or []):
+            text = _s(item)
+            if text and text not in out:
+                out.append(text[:400])
+    return out[:limit]
+
+
 # Order matters — this is the order sources are shown to the model and in
 # the UI. `default` seeds the include-checkboxes in the Client Profiles view;
 # financial material is off by default because it describes the company's
@@ -317,6 +399,7 @@ Aspect rules:
 - Each aspect is ONE independently searchable thing: a core technology, a technical capability, a product or platform line, a scientific domain, or an application/market area. No two aspects may restate each other.
 - Write "text" the way a solicitation describes a needed capability: technical, concrete, 40-90 words. No marketing language, no boilerplate about the company being innovative or a leader.
 - Financial material (revenue, headcount, funding history) is background only — never make an aspect about finances.
+- Lines under "notable_updates" are things the company SAID it plans, is considering, or that belong to a third party. They are unverified: never build an aspect or a market out of them and never let them colour an aspect's text. Only capability the material shows the company has TODAY counts here.
 - "keywords": 5-12 comma-separated technical terms a solicitation would use for this aspect.
 - "kind": exactly one of technology, capability, product, domain, market.
 - "label": at most 6 words, distinct from every other label.
@@ -329,7 +412,7 @@ Market rules:
 - "market" MUST be copied exactly from this list, choosing the closest fit:
 {categories}
 - Never return the same market twice, and never split one market into near-identical entries. If two candidate markets would draw on the same aspects and read alike, return one.
-- "tier": "primary" for markets that are core to the business today, "secondary" for adjacent or opportunistic ones. At least one market must be primary.
+- "tier": an integer rank — 1 for the market most core to the business today, then 2, 3 and so on. No two markets may share a rank. Rank Defense on the same scale as every other market: 1 when the company is defense-first, a later rank when the DoD connection is real but adjacent to what it mainly sells.
 - "subtitle": at most 12 words naming what this company specifically does in that market.
 - "narrative": 40-90 words on what the company offers this market and which of its capabilities it draws on, written the way a solicitation describes a needed capability. Ground it in the material.
 - "keywords": 5-12 comma-separated terms a solicitation in this market would use.
@@ -338,12 +421,23 @@ Market rules:
 - Return ONLY a valid JSON object. No preamble, no markdown, no code fences."""
 
 _DEFENSE_EXTRA = (
-    ', plus a Defense market when one applies — Defense does not count toward that limit'
+    ', plus a Defense market when the material provides evidence for one — '
+    'Defense does not count toward that limit'
 )
 
-_DEFENSE_RULES = """- Assess separately whether this company has a plausible defense or DoD application, and include a "Defense" market whenever the connection is real even if it is loose: a dual-use technology, a component that could go into a defense platform, or a capability an office like DARPA, AFRL, ONR, DIU or a service SBIR program funds.
-- The Defense market's "narrative" must state the concrete use case — who in the department would use it and for what — without inventing programs, contracts, or customers.
-- Only if there is genuinely no defense application, omit the Defense market and give the one-sentence reason in "dod_assessment". Otherwise leave "dod_assessment" empty."""
+# A confirmed market is where the company sells TODAY, so Defense has to clear
+# an evidence bar like any other. The previous wording ("include Defense
+# whenever the connection is real even if it is loose") was written before the
+# unexplored pass existed, when a loose dual-use angle had nowhere else to go.
+# Measured cost of that: 115 of 282 profiles (41%) carried a confirmed Defense
+# market with ZERO defense token anywhere in their source material - a
+# music-therapy company had Defense as its second-most-core market. The
+# speculative angle now belongs to pass 2, which raises it as an *unexplored*
+# Defense market scored by the extension prompt.
+_DEFENSE_RULES = """- Include a "Defense" market ONLY when the supplied material shows an actual defense relationship, or an active pursuit of one: DoD funding or an award (including an SBIR/STTR from a defense agency), a named defense solicitation, contract or program the company is pursuing, a defense agency or prime contractor named as a customer or partner, or a product the company itself describes as built for defense use.
+- A merely plausible dual-use angle is NOT enough. If the company's technology could in principle serve defense but the material shows no defense funding, pursuit, customer or product, then omit the Defense market and give the one-sentence reason in "dod_assessment" — for example: "Dual-use potential in field-deployable diagnostics, but the material shows no DoD funding, pursuit or customer." The speculative angle is captured elsewhere in this pipeline; do not force it into this list.
+- When you do include Defense, its "narrative" must state the concrete use case — who in the department would use it and for what — and rest on the evidence in the material, without inventing programs, contracts, or customers.
+- Leave "dod_assessment" empty whenever a Defense market IS included."""
 
 _NO_DEFENSE_RULES = (
     '- Do not include a Defense market unless the supplied material is itself '
@@ -366,7 +460,7 @@ _SHAPE = """JSON shape:
   "markets": [
     {
       "market": "<exact name from the allowed market list>",
-      "tier": "<primary|secondary>",
+      "tier": <integer rank, 1 = most core to the business>,
       "subtitle": "<<=12 words on what this company does in this market>",
       "narrative": "<40-90 words on the offering and the capabilities behind it>",
       "keywords": "<comma-separated terms a solicitation in this market would use>",
@@ -476,14 +570,58 @@ def canonical_market(name) -> str:
     return 'Other'
 
 
+def market_tier_rank(market) -> int:
+    """Integer tier rank of a market: 1 = most important.
+
+    Accepts a market dict or a bare tier value, and coerces every historical
+    form so old profiles need no rebuild - an int, a digit string ("2", "2nd"),
+    or the legacy 'primary'/'secondary' buckets. Anything unrecognised sorts
+    last. EVERY read of a market's `tier` goes through this."""
+    value = market.get('tier') if isinstance(market, dict) else market
+    if isinstance(value, bool):
+        rank = MAX_MARKET_TIER
+    elif isinstance(value, (int, np.integer)):
+        rank = int(value)
+    elif isinstance(value, (float, np.floating)):
+        rank = MAX_MARKET_TIER if np.isnan(value) else int(value)
+    else:
+        raw = _s(value).lower()
+        digits = re.match(r'(\d+)', raw)
+        if raw in _LEGACY_TIERS:
+            rank = _LEGACY_TIERS[raw]
+        elif digits:
+            rank = int(digits.group(1))
+        else:
+            rank = MAX_MARKET_TIER
+    return max(1, min(MAX_MARKET_TIER, rank))
+
+
+_ORDINAL_SUFFIXES = {1: 'st', 2: 'nd', 3: 'rd'}
+
+
+def tier_ordinal(rank) -> str:
+    """1 -> '1st'. Display form only; the stored value stays an int."""
+    n = rank if isinstance(rank, int) else market_tier_rank(rank)
+    if 11 <= (n % 100) <= 13:
+        return f'{n}th'
+    return f"{n}{_ORDINAL_SUFFIXES.get(n % 10, 'th')}"
+
+
+def _renumber_tiers(markets: list[dict]) -> list[dict]:
+    """Dense 1..N ranks following the list's current order, so capping, merging
+    or a hand-edit can never leave a gap ('1st, 4th' with nothing between)."""
+    for i, market in enumerate(markets, start=1):
+        market['tier'] = min(i, MAX_MARKET_TIER)
+    return markets
+
+
 def _clean_market(item: dict) -> dict | None:
     market = canonical_market(item.get('market') or item.get('name') or item.get('label'))
     if not market:
         return None
-    tier = _s(item.get('tier')).lower()
     return {
         'market':        market,
-        'tier':          tier if tier in MARKET_TIERS else 'secondary',
+        'tier':          market_tier_rank(item),
         'subtitle':      _s(item.get('subtitle'))[:160],
         'narrative':     _s(item.get('narrative')) or _s(item.get('description')),
         'keywords':      _s(item.get('keywords')),
@@ -526,8 +664,7 @@ def normalize_markets(
         existing['aspect_labels'] = _name_list(
             existing['aspect_labels'] + cleaned['aspect_labels']
         )
-        if cleaned['tier'] == 'primary':
-            existing['tier'] = 'primary'
+        existing['tier'] = min(existing['tier'], cleaned['tier'])
         if len(cleaned['narrative']) > len(existing['narrative']):
             existing['narrative'] = cleaned['narrative']
             existing['subtitle']  = cleaned['subtitle'] or existing['subtitle']
@@ -547,11 +684,15 @@ def normalize_markets(
                     list(aspect.get('markets') or []) + [market['market']]
                 )
 
-    # Cap: Defense always survives, then primaries, then secondaries
+    # Cap: Defense always survives - it is assessed separately and never counts
+    # against max_markets - then the best-ranked non-defense markets.
+    _order_of = {id(m): i for i, m in enumerate(defs)}
     ordered = (
         [m for m in defs if m['market'] == DEFENSE_MARKET]
-        + [m for m in defs if m['market'] != DEFENSE_MARKET and m['tier'] == 'primary']
-        + [m for m in defs if m['market'] != DEFENSE_MARKET and m['tier'] == 'secondary']
+        + sorted(
+            (m for m in defs if m['market'] != DEFENSE_MARKET),
+            key=lambda m: (m['tier'], _order_of[id(m)]),
+        )
     )
     cap  = max(1, min(MAX_MARKETS, int(max_markets)))
     kept, n_other = [], 0
@@ -566,7 +707,7 @@ def normalize_markets(
     # Aspect membership, restricted to the surviving markets. An aspect the
     # model left unassigned lands in the primary market rather than dropping
     # out of every market run.
-    fallback = next((m['market'] for m in kept if m['tier'] == 'primary'), kept[0]['market'])
+    fallback = min(kept, key=lambda m: m['tier'])['market']
     for aspect in aspects:
         names = [canonical_market(n) for n in _name_list(aspect.get('markets'))]
         aspect['markets'] = _name_list([n for n in names if n in allowed]) or [fallback]
@@ -585,10 +726,116 @@ def normalize_markets(
     survivors = {m['market'] for m in kept}
     for aspect in aspects:
         aspect['markets'] = [n for n in aspect['markets'] if n in survivors]
-    kept.sort(key=lambda m: (
-        m['market'] != DEFENSE_MARKET, m['tier'] != 'primary', m['market']
-    ))
+    # Rank first, Defense only as the tiebreak: Defense earns its place rather
+    # than being pinned ahead of a client's actual core market. It stays
+    # cap-exempt above, so it can never be ranked out of the profile.
+    kept.sort(key=lambda m: (m['tier'], m['market'] != DEFENSE_MARKET, m['market']))
+    _renumber_tiers(kept)
     return aspects, kept
+
+
+def merge_similar_aspects(
+    aspects: list[dict],
+    vectors,
+    threshold: float = ASPECT_MERGE_THRESHOLD,
+) -> tuple[list[dict], list, list[str]]:
+    """Fold aspects whose vectors are near-identical into one.
+
+    A richer aspect set starts producing the same capability under two labels.
+    Merging rather than dropping means the absorbed aspect's keywords and market
+    membership survive on the survivor, so no market silently loses a member and
+    no capability is deleted outright. The survivor is the aspect with the longer
+    text - the richer description.
+
+    Returns (aspects, vectors, merges), where `merges` are
+    "0.951  absorbed -> survivor" strings for the run report: a threshold that is
+    eating distinct capabilities is invisible unless the merges are named, and
+    unfixable unless their scores are recorded."""
+    if len(aspects) < 2 or vectors is None or len(vectors) != len(aspects):
+        return aspects, [list(v) for v in (vectors or [])], []
+
+    arr   = np.asarray(vectors, dtype=np.float64)
+    norms = np.linalg.norm(arr, axis=1)
+    norms[norms == 0] = 1.0
+    unit  = arr / norms[:, None]
+
+    order = sorted(
+        range(len(aspects)),
+        key=lambda i: (-len(_s(aspects[i].get('text'))), i),
+    )
+    absorbed: dict[int, tuple[int, float]] = {}
+    keep_idx: list[int] = []
+    for i in order:
+        if i in absorbed:
+            continue
+        keep_idx.append(i)
+        for j in order:
+            if j == i or j in absorbed or j in keep_idx:
+                continue
+            score = float(unit[i] @ unit[j])
+            if score >= threshold:
+                absorbed[j] = (i, score)
+
+    if not absorbed:
+        return aspects, [list(v) for v in vectors], []
+
+    merges: list[str] = []
+    for j, (i, score) in sorted(absorbed.items()):
+        survivor, gone = aspects[i], aspects[j]
+        survivor['keywords'] = ', '.join(_name_list(
+            f"{_s(survivor.get('keywords'))},{_s(gone.get('keywords'))}"
+        ))
+        survivor['markets'] = _name_list(
+            list(survivor.get('markets') or []) + list(gone.get('markets') or [])
+        )
+        survivor['merged_from'] = ', '.join(
+            x for x in (_s(survivor.get('merged_from')), _s(gone.get('label'))) if x
+        )
+        # Cosine first, matching nearest_aspect_pairs()' format, so the two
+        # reports can be read against each other when tuning the threshold.
+        merges.append(
+            f"{score:.3f}  {_s(gone.get('label'))} -> {_s(survivor.get('label'))}"
+        )
+
+    keep_idx.sort()
+    return (
+        [aspects[i] for i in keep_idx],
+        [list(vectors[i]) for i in keep_idx],
+        merges,
+    )
+
+
+def nearest_aspect_pairs(
+    aspects: list[dict],
+    vectors,
+    floor: float = ASPECT_NEAR_FLOOR,
+    limit: int = 3,
+) -> list[str]:
+    """The closest surviving aspect pairs, as "0.894  A  ~  B" strings.
+
+    Reported per client so a human can see the near-duplicates the threshold
+    deliberately did not touch. Measurement showed cosine alone cannot reliably
+    tell a genuine repeat from two facets of one platform, so the human-facing
+    list is the more trustworthy half of duplicate detection - an auto-merge
+    tuned aggressively enough to catch the real repeats would also delete
+    legitimate distinctions."""
+    if len(aspects) < 2 or vectors is None or len(vectors) != len(aspects):
+        return []
+    arr   = np.asarray(vectors, dtype=np.float64)
+    norms = np.linalg.norm(arr, axis=1)
+    norms[norms == 0] = 1.0
+    unit  = arr / norms[:, None]
+    sims  = unit @ unit.T
+
+    found = []
+    for i in range(len(aspects)):
+        for j in range(i + 1, len(aspects)):
+            score = float(sims[i, j])
+            if score >= floor:
+                found.append((score, _s(aspects[i].get('label')),
+                              _s(aspects[j].get('label'))))
+    found.sort(reverse=True)
+    return [f'{sc:.3f}  {a}  ~  {b}' for sc, a, b in found[:limit]]
 
 
 def merge_similar_markets(
@@ -612,10 +859,13 @@ def merge_similar_markets(
     norms[norms == 0] = 1.0
     unit  = arr / norms[:, None]
 
+    # Survivor preference: better rank, then Defense, then earlier. Defense
+    # narratives hold the only DoD framing in the profile, so at equal rank they
+    # must never be the absorbed side of a merge.
     order = sorted(
         range(len(markets)),
-        key=lambda i: (markets[i]['market'] != DEFENSE_MARKET,
-                       markets[i]['tier'] != 'primary', i),
+        key=lambda i: (market_tier_rank(markets[i]),
+                       markets[i]['market'] != DEFENSE_MARKET, i),
     )
     absorbed: dict[str, str] = {}
     keep_idx: list[int] = []
@@ -648,6 +898,96 @@ def merge_similar_markets(
             if market['market'] in (a.get('markets') or [])
         ]
     return aspects, kept_markets, kept_vectors
+
+
+def _clean_unexplored(item: dict) -> dict | None:
+    market = canonical_market(item.get('market') or item.get('name') or item.get('label'))
+    if not market:
+        return None
+    return {
+        'market':        market,
+        'tier':          market_tier_rank(item),
+        'subtitle':      _s(item.get('subtitle'))[:160],
+        'narrative':     _s(item.get('narrative')) or _s(item.get('description')),
+        'keywords':      _s(item.get('keywords')),
+        'rationale':     _s(item.get('rationale'))[:600],
+        'aspect_labels': _name_list(item.get('aspects') or item.get('aspect_labels')),
+    }
+
+
+def _labels_in_text(aspects: list[dict], *texts) -> list[str]:
+    """Aspect labels that appear verbatim in the given text.
+
+    Observed on a real build: the model names the aspects it is combining in the
+    rationale prose ("The Single-Fiber CLE Optical Platform and Real-Time Edge AI
+    Inference Engine combine directly for this use case") while returning an
+    empty `aspects` array. Recovering them from the prose matters because the
+    linked aspects are the ONLY evidence the Bulk Aspect Match re-ranker judges
+    an unexplored market against - with none, it is asked whether a company
+    could extend into a topic without being told what the company can do, and
+    correctly scores it low."""
+    blob = ' '.join(_s(t) for t in texts).lower()
+    if not blob:
+        return []
+    out = []
+    for aspect in aspects:
+        label = _s(aspect.get('label'))
+        if label and label.lower() in blob:
+            out.append(label)
+    return out
+
+
+def normalize_unexplored(
+    confirmed: list[dict],
+    unexplored: list[dict],
+    max_unexplored: int = MAX_UNEXPLORED,
+    aspects: list[dict] | None = None,
+) -> list[dict]:
+    """Canonicalise unexplored market names, drop the ones that are not actually
+    unexplored, cap the count and dense-rank what survives.
+
+    Dropped: anything canonicalising to 'Other' (too vague to be worth a vector);
+    anything the company already serves, which is a contradiction in terms and
+    would return the same topics its confirmed market already does; anything
+    without a narrative, since the narrative vector is the ONLY thing an
+    unexplored market is scored on; and repeats of one category.
+
+    `aspect_labels` is filtered against the real aspect labels so a hallucinated
+    label can never reach the re-rank prompt as evidence. MIN_LINKED_ASPECTS is
+    asked for in the prompt but deliberately NOT enforced here - a market whose
+    labels simply failed to string-match would otherwise be deleted along with
+    its narrative, the same trap normalize_markets documents for Defense."""
+    served = {_s(m.get('market')) for m in (confirmed or [])}
+    known  = {_s(a.get('label')).lower(): _s(a.get('label')) for a in (aspects or [])}
+
+    kept: list[dict] = []
+    seen: set[str] = set()
+    for item in unexplored or []:
+        if not isinstance(item, dict):
+            continue
+        cleaned = _clean_unexplored(item)
+        if cleaned is None or cleaned['market'] == 'Other':
+            continue
+        if cleaned['market'] in served or cleaned['market'] in seen:
+            continue
+        if not cleaned['narrative']:
+            continue
+        if known:
+            cleaned['aspect_labels'] = [
+                known[l.lower()] for l in cleaned['aspect_labels'] if l.lower() in known
+            ]
+            if not cleaned['aspect_labels']:
+                # Nothing matched (empty array, or labels spelled differently) -
+                # fall back to the labels the prose names.
+                cleaned['aspect_labels'] = _labels_in_text(
+                    aspects, cleaned['narrative'], cleaned['rationale']
+                )
+        seen.add(cleaned['market'])
+        kept.append(cleaned)
+
+    kept.sort(key=lambda m: m['tier'])
+    cap = max(0, min(MAX_UNEXPLORED, int(max_unexplored)))
+    return _renumber_tiers(kept[:cap])
 
 
 def parse_aspect_response(raw: str) -> dict:
@@ -695,6 +1035,140 @@ def parse_aspect_response(raw: str) -> dict:
     }
 
 
+# -- Unexplored-market prompt (pass 2) --------------------------------------
+# A SECOND Claude call, deliberately not folded into the first. The aspect
+# prompt's whole discipline is "ground everything, never invent"; asking that
+# same call to also speculate about markets the company is not in would
+# contradict its central rule and contaminate the grounded output. This call
+# gets an explicitly speculative licence instead, and its output is stored in
+# its own columns so it can never be read back as confirmed capability.
+#
+# It reads pass 1's structured output rather than the raw material again: the
+# question is what the aspects COMBINE into, which is reasoning over the aspect
+# set, not another pass over the website.
+
+_UNEXPLORED_RULES = """You are a technical analyst at a firm that writes federal grant proposals for its clients. You are given a client's capability profile: a set of aspects (each an independently searchable capability, technology, product or domain it demonstrably has today) and the markets it already sells into.
+
+Your task is the opposite of building that profile. Identify up to {max_unexplored} markets the company does NOT currently serve but plausibly could, by combining capabilities it already has.
+
+Rules:
+- Work only from the aspects listed under ASPECTS. You may combine two or more of them into a new application, but you may never invent a capability, technology, product, customer, partner or certification that is not in that list.
+- Every unexplored market must draw on at least {min_linked} of the listed aspects, named exactly. A market resting on a single aspect is usually just that aspect's existing market described again - do not return it.
+- "market" MUST be copied exactly from this list, choosing the closest fit:
+{categories}
+- Never return a market listed under MARKETS ALREADY SERVED, and never return "Other".
+- "tier": an integer rank - 1 for the most promising unexplored market, then 2, 3. No two may share a rank. Judge promise by how little the company would have to add, not by how big the market is.
+- "subtitle": at most 12 words naming what this company specifically would offer that market.
+- "narrative": 40-90 words describing that offering the way a solicitation describes a needed capability, drawing explicitly on the named aspects. Write what the company WOULD offer - never assert that it already serves this market.
+- "keywords": 5-12 comma-separated technical terms a solicitation in this market would use.
+- "rationale": one or two sentences naming which aspects combine, and what the company would still have to build, qualify or certify to compete there. Be concrete about the gap - this is what a human reads to decide whether to chase it.
+- "aspects": the exact labels of the existing aspects this market draws on.
+- Anything under STATED INTENTIONS is what the client has SAID it is considering. It is unverified and is never evidence of capability, but a market the client is already thinking about is a strong candidate - prefer it when the listed aspects genuinely support it.
+- Assess a Defense market here too when the company does not already serve one: a dual-use application, a component that could go into a defense platform, or a capability a DARPA / AFRL / ONR / DIU / service SBIR programme funds. State the concrete use case in the narrative without inventing programmes, contracts or customers.
+- If the aspects genuinely do not support any market beyond the ones already served, return an empty "unexplored_markets" array. Never pad with speculation you cannot tie to a named aspect.
+- Return ONLY a valid JSON object. No preamble, no markdown, no code fences."""
+
+_UNEXPLORED_SHAPE = """JSON shape:
+{
+  "unexplored_markets": [
+    {
+      "market": "<exact name from the allowed market list>",
+      "tier": <integer rank, 1 = most promising>,
+      "subtitle": "<<=12 words on what this company would offer here>",
+      "narrative": "<40-90 words, capability-style, on what it would offer>",
+      "keywords": "<comma-separated terms a solicitation here would use>",
+      "rationale": "<which aspects combine, and the gap that remains>",
+      "aspects": ["<exact aspect label>", "..."]
+    }
+  ]
+}"""
+
+
+def build_unexplored_system(max_unexplored: int = MAX_UNEXPLORED) -> str:
+    return (
+        _UNEXPLORED_RULES.format(
+            max_unexplored=max(1, min(MAX_UNEXPLORED, int(max_unexplored))),
+            min_linked=MIN_LINKED_ASPECTS,
+            categories='\n'.join(
+                f'  - {c}' for c in MARKET_CATEGORIES if c != 'Other'
+            ),
+        )
+        + '\n\n' + _UNEXPLORED_SHAPE
+    )
+
+
+def build_unexplored_user_message(
+    company: dict,
+    profile_summary: str,
+    aspects: list[dict],
+    markets: list[dict],
+    intentions: list[str] | None = None,
+) -> str:
+    """company keys: company_name, website, state (all optional)."""
+    parts = [
+        'COMPANY\n'
+        f"Name: {_s(company.get('company_name')) or 'Unknown'}\n"
+        f"Website: {_s(company.get('website')) or 'Unknown'}\n"
+        f"State: {_s(company.get('state')) or 'Unknown'}"
+    ]
+    if _s(profile_summary):
+        parts.append('PROFILE SUMMARY\n' + _s(profile_summary))
+
+    aspect_lines = []
+    for i, aspect in enumerate(aspects or [], start=1):
+        block = f"{i}. {_s(aspect.get('label'))}"
+        kind = _s(aspect.get('kind'))
+        if kind:
+            block += f' ({kind})'
+        if _s(aspect.get('text')):
+            block += '\n   ' + _s(aspect.get('text'))
+        if _s(aspect.get('keywords')):
+            block += '\n   Keywords: ' + _s(aspect.get('keywords'))
+        aspect_lines.append(block)
+    parts.append(
+        'ASPECTS (capabilities this company demonstrably has today)\n'
+        + ('\n'.join(aspect_lines) or '(none)')
+    )
+
+    served = [
+        f'- {market_label(m)}'
+        + (f" - {_s(m.get('subtitle'))}" if _s(m.get('subtitle')) else '')
+        for m in (markets or [])
+    ]
+    parts.append(
+        'MARKETS ALREADY SERVED (do not return any of these)\n'
+        + ('\n'.join(served) or '(none recorded)')
+    )
+
+    if intentions:
+        parts.append(
+            'STATED INTENTIONS (unverified - the company said these; they are '
+            'leads, not capability)\n'
+            + '\n'.join(f'- {_s(i)}' for i in intentions if _s(i))
+        )
+    return '\n\n'.join(parts)
+
+
+def parse_unexplored_response(
+    raw: str,
+    confirmed: list[dict],
+    aspects: list[dict] | None = None,
+    max_unexplored: int = MAX_UNEXPLORED,
+) -> list[dict]:
+    """Normalised unexplored markets, safe to embed and store as-is.
+
+    An empty list is a legitimate answer - a company whose aspects support no
+    market beyond the ones it already serves is the expected outcome for a
+    single-product client. Only unparseable JSON raises."""
+    obj   = _extract_json(raw)
+    items = obj.get('unexplored_markets')
+    if items is None:
+        items = obj.get('markets')
+    return normalize_unexplored(
+        confirmed, list(items or []), max_unexplored, aspects
+    )
+
+
 def aspect_embed_text(aspect: dict) -> str:
     """Text actually embedded for an aspect — label + description + keywords."""
     parts = [_s(aspect.get('label')), _s(aspect.get('text'))]
@@ -719,10 +1193,9 @@ def market_embed_text(market: dict) -> str:
 
 
 def market_label(market: dict) -> str:
-    """'Defense (primary)' — display form used in labels and pickers."""
+    """'Defense (1st)' — display form used in labels and pickers."""
     name = _s(market.get('market')) or '—'
-    tier = _s(market.get('tier'))
-    return f'{name} ({tier})' if tier else name
+    return f'{name} ({tier_ordinal(market_tier_rank(market))})'
 
 
 # ── Embedding pack / unpack ─────────────────────────────────────────────────
@@ -780,6 +1253,35 @@ def unpack_market_embeddings(row, dtype=np.float32) -> np.ndarray:
     return unpack_embeddings(row, dtype=dtype, col='market_embeddings')
 
 
+def profile_unexplored(row) -> list[dict]:
+    """Unexplored-market dicts for a profile row - markets the company does NOT
+    serve, inferred by linking its aspects. Empty for every profile built before
+    the unexplored pass existed, and for companies whose aspects support none."""
+    return _json_list(row, 'unexplored_markets')
+
+
+def unpack_unexplored_embeddings(row, dtype=np.float32) -> np.ndarray:
+    return unpack_embeddings(row, dtype=dtype, col='unexplored_embeddings')
+
+
+def unexplored_aspect_indices(aspects: list[dict], market: dict) -> list[int]:
+    """Positions of the aspects an unexplored market says it would draw on.
+
+    Unlike a confirmed market these are NOT scored - an unexplored market is
+    scored on its narrative vector alone, because the confirmed aspect vectors
+    would just return the topics the confirmed markets already returned, and
+    _rerank_groups would then share one score between two different framings of
+    the same pair. They are looked up only to give the re-ranker the evidence of
+    what the company can actually do."""
+    # normalize_unexplored() backfills aspect_labels from the narrative and
+    # rationale prose when the model returned none, so this is rarely empty.
+    wanted = {_s(l).lower() for l in (market.get('aspect_labels') or [])}
+    return [
+        i for i, a in enumerate(aspects)
+        if _s(a.get('label')).lower() in wanted
+    ]
+
+
 def market_aspect_indices(aspects: list[dict], market_name: str) -> list[int]:
     """Positions of the aspects earmarked to a market — the aspect subset a
     market-scoped match run scores with."""
@@ -804,6 +1306,8 @@ def build_profile_record(
     model: str,
     markets: list[dict] | None = None,
     market_vectors=None,
+    unexplored: list[dict] | None = None,
+    unexplored_vectors=None,
     dod_assessment: str = '',
     built_at: str | None = None,
 ) -> dict:
@@ -815,6 +1319,14 @@ def build_profile_record(
         # A profile without vectors for its markets can't be matched per market
         # and would read as "has markets" in the UI - store none at all.
         markets, market_flat, n_markets = [], [], 0
+    # Same rule for the unexplored block: its narrative vector is the ONLY thing
+    # it is ever scored on, so an unexplored market without one is unmatchable.
+    unexplored = list(unexplored or [])
+    if (unexplored and unexplored_vectors is not None
+            and len(unexplored_vectors) == len(unexplored)):
+        unexp_flat, n_unexplored, _ = pack_embeddings(unexplored_vectors)
+    else:
+        unexplored, unexp_flat, n_unexplored = [], [], 0
     return {
         'company_key':        company_key,
         'company_name':       company_name,
@@ -829,6 +1341,10 @@ def build_profile_record(
         'market_labels':      ' | '.join(market_label(m) for m in markets),
         'n_markets':          n_markets,
         'market_embeddings':  market_flat,
+        'unexplored_markets':    json.dumps(unexplored, ensure_ascii=False),
+        'unexplored_labels':     ' | '.join(market_label(m) for m in unexplored),
+        'n_unexplored':          n_unexplored,
+        'unexplored_embeddings': unexp_flat,
         'dod_assessment':     dod_assessment,
         'sources_used':       ','.join(sources_used),
         'source_fingerprint': fingerprint,
@@ -859,7 +1375,7 @@ def save_profiles(gcs_client, df: pd.DataFrame, bucket: str = BUCKET) -> None:
             out[col] = None
     out = out[PROFILE_COLUMNS].reset_index(drop=True)
     # Written as plain ints so they survive the round-trip as ints, not floats
-    for col in ('n_aspects', 'embedding_dim', 'n_markets'):
+    for col in ('n_aspects', 'embedding_dim', 'n_markets', 'n_unexplored'):
         out[col] = out[col].fillna(0).astype('int64')
     BucketManager(bucket, client=gcs_client).upload_file(PROFILES_BLOB, out)
 

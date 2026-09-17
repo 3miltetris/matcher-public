@@ -160,6 +160,12 @@ _PROFILE_BASE_FIELDS: list[tuple[str, str, bool, bool]] = [
     ('n_markets',        'matcher_market_count',      True,  False),
     ('defense_market',   'matcher_defense_market',    True,  False),
     ('defense_use_case', 'matcher_defense_use_case',  True,  True),
+    # Markets the client does NOT serve, inferred from its aspects. Worth
+    # carrying over - it is the pipeline question sales actually asks - but
+    # clearly named so nobody reads it as current business.
+    ('unexplored_labels', 'matcher_unexplored_markets', True,  True),
+    ('unexplored_full',   'matcher_unexplored_full',    False, True),
+    ('n_unexplored',      'matcher_unexplored_count',   False, False),
     ('sources_used',     'matcher_profile_sources',   False, False),
     ('profile_model',    'matcher_profile_model',     False, False),
     ('profile_built_at', 'matcher_profile_built_at',  True,  False),
@@ -306,8 +312,12 @@ def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
 
     The aspects and markets live in the profile row as JSON arrays; HubSpot
     needs flat columns, so each company gets rolled-up fields (labels,
-    keywords, readable aspect and market blocks, the Defense use case) plus one
-    label/text pair per aspect.
+    keywords, readable aspect and market blocks, the Defense use case, the
+    unexplored markets) plus one label/text pair per aspect.
+
+    Market tiers are ranks (1st, 2nd, 3rd...) and are rendered as ordinals here;
+    profiles written before ranks existed carry 'primary'/'secondary' strings and
+    are coerced by ap.market_tier_rank(), so old rows still export.
     """
     profiles = ap.load_profiles(client)
     if profiles.empty:
@@ -315,8 +325,9 @@ def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
 
     rows = []
     for _, p in profiles.iterrows():
-        aspects = ap.profile_aspects(p)
-        markets = ap.profile_markets(p)
+        aspects    = ap.profile_aspects(p)
+        markets    = ap.profile_markets(p)
+        unexplored = ap.profile_unexplored(p)
         labels, kinds, keywords, blocks = [], [], [], []
         row = {
             'company_key':      str(p.get('company_key') or ''),
@@ -365,8 +376,8 @@ def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
         has_defense = False
         for m in markets:
             name  = str(m.get('market') or '')
-            tier  = str(m.get('tier') or '')
-            head  = f'{tier.upper()} · {name}' if tier else name
+            head  = (f'{ap.tier_ordinal(ap.market_tier_rank(m))} · {name}'
+                     if name else name)
             if m.get('subtitle'):
                 head += f' — {m["subtitle"]}'
             block = head
@@ -394,6 +405,28 @@ def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
         # The reason there is none is worth carrying over too — it stops the
         # team re-asking whether a client was ever assessed for defense.
         row['defense_use_case']  = defense_use_case or str(p.get('dod_assessment') or '')
+
+        unexp_blocks = []
+        for m in unexplored:
+            name = str(m.get('market') or '')
+            head = (f'{ap.tier_ordinal(ap.market_tier_rank(m))} · {name}'
+                    if name else name)
+            if m.get('subtitle'):
+                head += f' — {m["subtitle"]}'
+            block = head
+            if m.get('narrative'):
+                block += f'\n{m["narrative"]}'
+            if m.get('rationale'):
+                block += f'\nGap remaining: {m["rationale"]}'
+            if m.get('keywords'):
+                block += f'\nKeywords: {m["keywords"]}'
+            if m.get('aspect_labels'):
+                block += '\nDraws on: ' + ', '.join(m['aspect_labels'])
+            unexp_blocks.append(block)
+
+        row['unexplored_labels'] = str(p.get('unexplored_labels') or '')
+        row['unexplored_full']   = '\n\n'.join(unexp_blocks)
+        row['n_unexplored']      = str(len(unexplored))
         rows.append(row)
 
     # Companies differ in aspect count — missing per-aspect columns become ''
@@ -1153,8 +1186,8 @@ if mode == 'Financial research run':
 if mode == 'Client profiles':
 
     preview_cols = ['companyName', 'companyWebsite', 'n_aspects',
-                    'aspect_labels', 'market_labels', 'profile_built_at',
-                    'sources_used']
+                    'aspect_labels', 'market_labels', 'unexplored_labels',
+                    'profile_built_at', 'sources_used']
     st.dataframe(
         df[[c for c in preview_cols if c in df.columns]].head(50),
         use_container_width=True, hide_index=True,
@@ -1168,6 +1201,10 @@ if mode == 'Client profiles':
         st.text(str(row.get('aspects_full') or '')[:4000])
         st.caption('Markets block (`markets_full`):')
         st.text(str(row.get('markets_full') or '') or '— no markets on this profile')
+        st.caption('Unexplored markets block (`unexplored_full`) — markets this '
+                   'client does NOT serve:')
+        st.text(str(row.get('unexplored_full') or '')
+                or '— no unexplored markets on this profile')
 
     # ── Field mapping ─────────────────────────────────────────────────────────
 

@@ -17,6 +17,25 @@ Thumbs.db
 
 # Loose API-key drops at the repo root (Dockerfile.app does `COPY . .`,
 # so an unignored key file gets baked into the published image).
+# These are deliberately BROAD: on 2026-09-15 a key was dropped as
+# `sam-gov-key.txt`, which matched none of the original `*_api_key*` patterns
+# because it used hyphens and omitted the word "api". Match on "key" anywhere
+# in the name rather than trying to predict the spelling.
 *_api_key.txt
 *_api_key
 fathom_api_key.txt
+*api_key*
+*api-key*
+*_key.txt
+*-key.txt
+*_key
+*-key
+*.key
+*.pem
+key.txt
+
+# Local data drops (exported Google Sheets, scratch extracts). Dockerfile.app
+# ends in `COPY . .`, so an unignored CSV at the repo root is both committed
+# and baked into the published image.
+*.csv
+local-data/

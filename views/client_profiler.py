@@ -6,8 +6,13 @@ data/all-contacts/clients/ out of material that already exists on their
 rows — the website summary/scrape, Drive document extractions written by
 drive-sync-job, and Deep Research output written by the Client Research
 view. Claude splits that material into a handful of distinct, independently
-searchable aspects, then groups those aspects into the markets they serve
-(up to 4, plus Defense whenever a DoD use case is plausible). Every aspect and
+searchable aspects, folds together any two that turn out to describe the same
+capability, then groups them into the markets they serve — ranked 1st, 2nd,
+3rd… by how core each is to the business, plus Defense whenever a DoD use case
+is plausible. A second Claude pass then infers *unexplored* markets: customer
+worlds the company does NOT serve, reached by linking the aspects it already
+has. Those are hypotheses, so they are stored in their own columns and matched
+under their own kind, never mixed into the confirmed markets. Every aspect and
 every market narrative is embedded separately and the profile is stored as one
 row per company in data/client-profiles/profiles.parquet.
 
@@ -159,6 +164,7 @@ def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataF
             'status':      status,
             'aspects':     int(prof['n_aspects']) if prof is not None and pd.notna(prof.get('n_aspects')) else 0,
             'markets':     str(prof.get('market_labels') or '') if prof is not None else '',
+            'unexplored':  str(prof.get('unexplored_labels') or '') if prof is not None else '',
             'built_at':    str(prof.get('built_at') or '') if prof is not None else '',
             '_fingerprint': fp,
             '_available':  list(available.keys()),
@@ -237,12 +243,25 @@ if st.session_state.cp_active_run:
                 st.rerun()
         else:
             st.session_state.cp_build_summary = {
-                'built':    [b.get('company_name') or '—' for b in status.get('built') or []],
-                'defense':  sum(1 for b in status.get('built') or [] if b.get('has_defense')),
-                'errors':   list(status.get('errors') or []),
-                'deferred': list(status.get('deferred') or []),
-                'run_id':   run_id,
-                'dry_run':  bool(status.get('dry_run')),
+                'built':      [b.get('company_name') or '—' for b in status.get('built') or []],
+                'defense':    sum(1 for b in status.get('built') or [] if b.get('has_defense')),
+                'unexplored': sum(int(b.get('n_unexplored') or 0)
+                                  for b in status.get('built') or []),
+                'errors':     list(status.get('errors') or []),
+                # Aspect merges and a failed pass 2 are reported here rather than
+                # as errors: the profile was still built and saved.
+                'warnings':   list(status.get('warnings') or []),
+                # Near-duplicate aspect pairs that did NOT merge — cosine can't
+                # tell a repeat from two facets of one platform, so these are
+                # for a human to judge and merge in the editor below.
+                'near_pairs': [
+                    (b.get('company_name') or '—', pair)
+                    for b in status.get('built') or []
+                    for pair in (b.get('aspect_near_pairs') or [])
+                ],
+                'deferred':   list(status.get('deferred') or []),
+                'run_id':     run_id,
+                'dry_run':    bool(status.get('dry_run')),
             }
             st.session_state.cp_active_run   = None
             st.session_state.cp_profiles     = None   # rebuilt store — reload
@@ -339,7 +358,22 @@ with opt_l:
         'Assess a Defense / DoD use case', value=True,
         help='Adds a Defense market whenever there is a plausible defense '
              'application, even a loose one. When there is none, the reason is '
-             'stored on the profile instead.',
+             'stored on the profile instead. Defense is ranked on the same '
+             'scale as every other market and never counts against the cap.',
+    )
+    assess_unexplored = st.checkbox(
+        'Assess unexplored markets', value=True,
+        help='A second Claude call per client that links the aspects into '
+             'markets the company does NOT serve yet, each with the gap that '
+             'would remain. Roughly doubles build time per client. Stored '
+             'separately from the confirmed markets and matched under their own '
+             'kind in Bulk Aspect Match.',
+    )
+    max_unexplored = st.number_input(
+        'Max unexplored markets', min_value=1, max_value=ap.MAX_UNEXPLORED,
+        value=ap.MAX_UNEXPLORED, step=1, disabled=not assess_unexplored,
+        help='An empty result is a legitimate answer — a single-product client '
+             'may support no market beyond the ones it already serves.',
     )
 
 with opt_r:
@@ -359,6 +393,17 @@ with opt_r:
                  'score above this are one market described twice, and are '
                  'folded together at build time. Lower to merge more '
                  'aggressively.',
+        )
+        aspect_threshold = st.slider(
+            'Merge aspects whose vectors are this similar', 0.90, 0.995,
+            ap.ASPECT_MERGE_THRESHOLD, 0.005,
+            help='Two aspects scoring above this are one capability written '
+                 'twice; the longer text survives and absorbs the other\'s '
+                 'keywords and market membership. Deliberately higher than the '
+                 'market threshold — a company\'s aspects are all descriptions '
+                 'of one business in one register, so ada-002 puts genuinely '
+                 'distinct capabilities above 0.90 already. Every merge is '
+                 'named in the run report; lower this only after checking them.',
         )
 
 # ── Client picker ──────────────────────────────────────────────────────────
@@ -398,7 +443,7 @@ elif view.empty:
 
 if not view.empty:
     editor_df = view[['company', 'website', 'sources', 'contacts', 'status',
-                      'aspects', 'markets', 'built_at']].copy()
+                      'aspects', 'markets', 'unexplored', 'built_at']].copy()
     editor_df.insert(0, 'build', view['status'] != _STATUS_CURRENT)
 
     edited = st.data_editor(
@@ -407,7 +452,7 @@ if not view.empty:
         use_container_width=True,
         height=min(460, 60 + 36 * len(editor_df)),
         disabled=['company', 'website', 'sources', 'contacts', 'status', 'aspects',
-                  'markets', 'built_at'],
+                  'markets', 'unexplored', 'built_at'],
         column_config={
             'build':    st.column_config.CheckboxColumn('Build', help='Build or rebuild this profile'),
             'company':  st.column_config.TextColumn('Client'),
@@ -417,6 +462,7 @@ if not view.empty:
             'status':   st.column_config.TextColumn('Profile'),
             'aspects':  st.column_config.NumberColumn('Aspects', format='%d'),
             'markets':  st.column_config.TextColumn('Markets', width='medium'),
+            'unexplored': st.column_config.TextColumn('Unexplored', width='medium'),
             'built_at': st.column_config.TextColumn('Built'),
         },
         key=f'cp_dir_editor_{st.session_state.cp_build_nonce}_{show}_{search.strip().lower()}',
@@ -447,7 +493,10 @@ if not view.empty:
                 'target_aspects': int(target_aspects),
                 'max_markets':    int(max_markets),
                 'assess_defense': bool(assess_defense),
+                'assess_unexplored': bool(assess_unexplored),
+                'max_unexplored': int(max_unexplored),
                 'market_merge_threshold': float(merge_threshold),
+                'aspect_merge_threshold': float(aspect_threshold),
                 'model':          model,
                 'concurrency':    _JOB_WORKERS,
                 'dry_run':        False,
@@ -481,6 +530,8 @@ if st.session_state.cp_build_summary:
             f'{"s" if len(summary["built"]) != 1 else ""} → `{ap.PROFILES_BLOB}`'
             + (f'  ·  {summary["defense"]} with a Defense market'
                if summary.get('defense') else '')
+            + (f'  ·  {summary["unexplored"]} unexplored market(s) found'
+               if summary.get('unexplored') else '')
             + (f'  ·  run `{summary["run_id"]}`' if summary.get('run_id') else '')
         )
     elif not summary['errors']:
@@ -494,6 +545,24 @@ if st.session_state.cp_build_summary:
         )
     for err in summary['errors']:
         st.warning(err)
+    if summary.get('warnings'):
+        with st.expander(f'{len(summary["warnings"])} build note(s) — merged '
+                         'aspects and any failed unexplored pass'):
+            for note in summary['warnings']:
+                st.markdown(f'- {note}')
+    if summary.get('near_pairs'):
+        with st.expander(
+            f'{len(summary["near_pairs"])} near-duplicate aspect pair(s) — review '
+            'and merge by hand if they are the same capability'
+        ):
+            st.caption(
+                'These scored close but below the merge threshold. Measurement '
+                'showed cosine does not reliably separate a genuine repeat from '
+                'two facets of one platform, so nothing was merged automatically '
+                '— edit the profile in section 2 to combine any that are.'
+            )
+            for company, pair in summary['near_pairs']:
+                st.markdown(f'- **{company}** · `{pair}`')
     if st.button('Dismiss', key='cp_dismiss'):
         st.session_state.cp_build_summary = None
         st.rerun()
@@ -540,8 +609,9 @@ new_summary = st.text_area(
     help='Context given to the LLM re-ranker in Bulk Aspect Match. Not embedded.',
 )
 
-aspects = ap.profile_aspects(prof_row)
-markets = ap.profile_markets(prof_row)
+aspects    = ap.profile_aspects(prof_row)
+markets    = ap.profile_markets(prof_row)
+unexplored = ap.profile_unexplored(prof_row)
 
 if not markets:
     st.warning(
@@ -593,7 +663,7 @@ edited_aspects = st.data_editor(
 
 market_rows = [{
     'market':    str(m.get('market') or ''),
-    'tier':      str(m.get('tier') or 'secondary'),
+    'tier':      ap.market_tier_rank(m),
     'subtitle':  str(m.get('subtitle') or ''),
     'narrative': str(m.get('narrative') or ''),
     'keywords':  str(m.get('keywords') or ''),
@@ -607,11 +677,18 @@ market_df = pd.DataFrame(
     market_rows,
     columns=['market', 'tier', 'subtitle', 'narrative', 'keywords', 'aspects'],
 )
+# Explicit int dtype: an empty frame leaves the column as object, and a
+# NumberColumn over an object column renders the rank as text.
+market_df['tier'] = (
+    pd.to_numeric(market_df['tier'], errors='coerce').fillna(2).astype(int)
+)
 
 st.markdown(
     '**Markets** — each narrative is embedded too and scored alongside that '
     "market's aspects, so a Defense use case can pull in topics no single "
-    'aspect would. The `Aspects` column is derived from the table above.'
+    'aspect would. `Tier` is a rank: 1 is the market most core to the business '
+    'today. Ranks are renumbered densely on save, so gaps and ties resolve '
+    'themselves. The `Aspects` column is derived from the table above.'
 )
 if market_df.empty:
     st.caption(
@@ -627,14 +704,75 @@ edited_markets = st.data_editor(
     column_config={
         'market':    st.column_config.SelectboxColumn('Market', options=ap.MARKET_CATEGORIES,
                                                       width='medium'),
-        'tier':      st.column_config.SelectboxColumn('Tier', options=ap.MARKET_TIERS,
-                                                      width='small'),
+        'tier':      st.column_config.NumberColumn(
+            'Tier', min_value=1, max_value=ap.MAX_MARKET_TIER, step=1,
+            format='%d', width='small',
+            help='1 = most core to the business today.'),
         'subtitle':  st.column_config.TextColumn('Subtitle', width='medium'),
         'narrative': st.column_config.TextColumn('Market narrative (embedded)', width='large'),
         'keywords':  st.column_config.TextColumn('Keywords (embedded)', width='medium'),
         'aspects':   st.column_config.TextColumn('Aspects (derived)', width='medium'),
     },
     key=f'cp_market_editor_{sel_key}',
+)
+
+# -- Unexplored markets -------------------------------------------------
+unexplored_df = pd.DataFrame(
+    [{
+        'market':    str(m.get('market') or ''),
+        'tier':      ap.market_tier_rank(m),
+        'subtitle':  str(m.get('subtitle') or ''),
+        'narrative': str(m.get('narrative') or ''),
+        'keywords':  str(m.get('keywords') or ''),
+        'rationale': str(m.get('rationale') or ''),
+        'aspects':   ', '.join(m.get('aspect_labels') or []),
+    } for m in unexplored],
+    columns=['market', 'tier', 'subtitle', 'narrative', 'keywords', 'rationale',
+             'aspects'],
+)
+unexplored_df['tier'] = (
+    pd.to_numeric(unexplored_df['tier'], errors='coerce').fillna(1).astype(int)
+)
+
+st.markdown(
+    '**Unexplored markets** — markets this client does **not** serve, inferred '
+    'by linking the aspects it does have. Only the narrative is embedded and '
+    'scored (there are no aspects earmarked to an unexplored market), and Bulk '
+    'Aspect Match re-ranks these with a different prompt that asks how plausibly '
+    'the client could extend into a topic. A market listed here must not also '
+    'appear in the table above.'
+)
+if unexplored_df.empty:
+    st.caption(
+        'None recorded. Either this profile predates the unexplored pass, it was '
+        'built with the assessment off, or the aspects genuinely support no '
+        'market beyond the ones already served — all three are normal.'
+    )
+edited_unexplored = st.data_editor(
+    unexplored_df,
+    hide_index=True,
+    use_container_width=True,
+    num_rows='dynamic',
+    column_config={
+        'market':    st.column_config.SelectboxColumn('Market', options=ap.MARKET_CATEGORIES,
+                                                      width='medium'),
+        'tier':      st.column_config.NumberColumn(
+            'Tier', min_value=1, max_value=ap.MAX_MARKET_TIER, step=1,
+            format='%d', width='small',
+            help='1 = most promising unexplored market.'),
+        'subtitle':  st.column_config.TextColumn('Subtitle', width='medium'),
+        'narrative': st.column_config.TextColumn('Market narrative (embedded)', width='large'),
+        'keywords':  st.column_config.TextColumn('Keywords (embedded)', width='medium'),
+        'rationale': st.column_config.TextColumn(
+            'Gap remaining (not embedded)', width='large',
+            help='Which aspects combine, and what the client would still have '
+                 'to build or certify. Shown to the re-ranker as context.'),
+        'aspects':   st.column_config.TextColumn(
+            'Draws on aspects', width='medium',
+            help='Comma-separated aspect labels from the table above. Labels '
+                 'that match no aspect are dropped on save.'),
+    },
+    key=f'cp_unexplored_editor_{sel_key}',
 )
 
 save_col, del_col = st.columns([1, 1])
@@ -668,31 +806,75 @@ with save_col:
             if not narrative:
                 missing_narrative.append(name)
                 continue
-            tier = str(r.get('tier') or '').strip().lower()
             cleaned_markets.append({
                 'market':    name,
-                'tier':      tier if tier in ap.MARKET_TIERS else 'secondary',
+                'tier':      ap.market_tier_rank(r.get('tier')),
                 'subtitle':  str(r.get('subtitle') or '').strip()[:160],
                 'narrative': narrative,
                 'keywords':  str(r.get('keywords') or '').strip(),
             })
 
+        cleaned_unexplored = []
+        missing_unexp_narrative = []
+        for _, r in edited_unexplored.iterrows():
+            name = ap.canonical_market(r.get('market'))
+            if not name:
+                continue
+            narrative = str(r.get('narrative') or '').strip()
+            if not narrative:
+                # The narrative vector is the only thing an unexplored market is
+                # ever scored on, so one without it is unmatchable dead weight.
+                missing_unexp_narrative.append(name)
+                continue
+            cleaned_unexplored.append({
+                'market':    name,
+                'tier':      ap.market_tier_rank(r.get('tier')),
+                'subtitle':  str(r.get('subtitle') or '').strip()[:160],
+                'narrative': narrative,
+                'keywords':  str(r.get('keywords') or '').strip(),
+                'rationale': str(r.get('rationale') or '').strip()[:600],
+                'aspects':   [x.strip() for x in str(r.get('aspects') or '').split(',')
+                              if x.strip()],
+            })
+
+        # normalize_unexplored would silently drop a collision. Say so instead -
+        # the user meant one of the two tables, and we can't know which.
+        both_tables = sorted(
+            {m['market'] for m in cleaned_unexplored}
+            & {m['market'] for m in cleaned_markets}
+        )
+
         if not cleaned:
             st.error('Every aspect needs both a label and aspect text.')
         elif len(cleaned) > ap.MAX_ASPECTS:
             st.error(f'At most {ap.MAX_ASPECTS} aspects per profile.')
-        elif missing_narrative:
+        elif missing_narrative or missing_unexp_narrative:
             st.error(
                 'These markets need a narrative before they can be embedded: '
-                + ', '.join(missing_narrative)
+                + ', '.join(missing_narrative + missing_unexp_narrative)
+            )
+        elif both_tables:
+            st.error(
+                'Listed as both served and unexplored: ' + ', '.join(both_tables)
+                + '. An unexplored market is one the client does *not* serve — '
+                'remove it from one of the two tables.'
             )
         else:
             try:
                 cleaned, cleaned_markets = ap.normalize_markets(cleaned, cleaned_markets)
+                cleaned_unexplored = ap.normalize_unexplored(
+                    cleaned_markets, cleaned_unexplored, ap.MAX_UNEXPLORED, cleaned
+                )
                 tp      = TextProcessor(api_key=st.secrets['openai_api_key'])
                 vectors = [tp.get_embedding(ap.aspect_embed_text(a)) for a in cleaned]
                 market_vectors = [
                     tp.get_embedding(ap.market_embed_text(m)) for m in cleaned_markets
+                ]
+                # Same embed text as a confirmed market: what a solicitation
+                # would describe. The rationale is context for the re-ranker,
+                # not part of the vector.
+                unexplored_vectors = [
+                    tp.get_embedding(ap.market_embed_text(m)) for m in cleaned_unexplored
                 ]
                 record  = ap.build_profile_record(
                     company_key     = sel_key,
@@ -703,6 +885,8 @@ with save_col:
                     vectors         = vectors,
                     markets         = cleaned_markets,
                     market_vectors  = market_vectors,
+                    unexplored         = cleaned_unexplored,
+                    unexplored_vectors = unexplored_vectors,
                     dod_assessment  = str(prof_row.get('dod_assessment') or ''),
                     sources_used    = str(prof_row['sources_used'] or '').split(',') if prof_row['sources_used'] else [],
                     fingerprint     = str(prof_row['source_fingerprint'] or ''),
@@ -715,7 +899,8 @@ with save_col:
                 ap.save_profiles(_get_storage_client(), merged)
                 st.session_state.cp_profiles = merged
                 st.session_state.cp_flash = (
-                    f'Saved {len(cleaned)} aspect(s) and {len(cleaned_markets)} '
+                    f'Saved {len(cleaned)} aspect(s), {len(cleaned_markets)} '
+                    f'market(s) and {len(cleaned_unexplored)} unexplored '
                     f'market(s) for {record["company_name"]}.'
                     + ('' if cleaned_markets else
                        ' No markets — this profile is skipped by market-scoped runs.')
