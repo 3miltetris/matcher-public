@@ -21,10 +21,10 @@ import streamlit as st
 from anthropic import Anthropic
 from bs4 import BeautifulSoup
 from google.cloud import storage
-from google.oauth2 import service_account
 
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
+import src.modules.ui_common as uc
 
 # ── GCS ────────────────────────────────────────────────────────────────────
 
@@ -66,10 +66,7 @@ _GRANTS_RESERVED_COLS = frozenset({
 # ── Storage client ─────────────────────────────────────────────────────────
 
 def _get_storage_client() -> storage.Client:
-    creds = service_account.Credentials.from_service_account_info(
-        st.secrets['gcp_service_account']
-    )
-    return storage.Client(credentials=creds)
+    return uc.get_storage_client()
 
 
 # ── Grants.gov helpers ─────────────────────────────────────────────────────
@@ -414,330 +411,336 @@ def _embed_and_save(
     return gcs_path
 
 
-# ── Session state ──────────────────────────────────────────────────────────
+# ── Page ──────────────────────────────────────────────────────────────────
+# Body lives in render() so this module can be dispatched to by a parent
+# page. Only one render() runs per script run, which is what keeps the
+# st.stop() calls below correct.
 
-for _k in ['ggov_raw_df', 'ggov_screened_df', 'ggov_existing_keys']:
-    if _k not in st.session_state:
-        st.session_state[_k] = None
-if 'ggov_custom_cols' not in st.session_state:
-    st.session_state.ggov_custom_cols = []
+def render():
+    # ── Session state ──────────────────────────────────────────────────────────
 
-
-# ── Page ───────────────────────────────────────────────────────────────────
-
-st.title('🏦 Grants.gov Fetch')
-st.caption(
-    'Search Grants.gov for federal funding opportunities. '
-    'Claude screens each result for R&D relevance, then passing rows are embedded '
-    'and saved to the topic store. No API key required.'
-)
-
-# ── Section 1 · Fetch parameters ───────────────────────────────────────────
-
-st.subheader('1 · Fetch from Grants.gov')
-
-gg_exclude_expired = st.checkbox(
-    'Exclude already-closed opportunities',
-    value=True,
-    key='gg_exclude_expired',
-    help='Hide grants whose close date has already passed. Grants with no close date (common for forecasted) are always kept.',
-)
-
-gg_use_date_filter = st.checkbox('Filter by posted date', value=False, key='gg_use_date')
-gg_date_from: date | None = None
-gg_date_to:   date | None = None
-if gg_use_date_filter:
-    col_df, col_dt = st.columns(2)
-    with col_df:
-        gg_date_from = st.date_input(
-            'Posted from',
-            value=date.today() - timedelta(days=7),
-            key='gg_date_from',
-        )
-    with col_dt:
-        gg_date_to = st.date_input(
-            'Posted to',
-            value=date.today(),
-            key='gg_date_to',
-        )
-
-gg_keyword = st.text_input(
-    'Keyword (optional)',
-    placeholder='e.g. SBIR, cybersecurity, artificial intelligence, biotech',
-    key='gg_keyword',
-)
-
-col_s, col_f = st.columns(2)
-with col_s:
-    selected_status_labels = st.multiselect(
-        'Opportunity status',
-        list(_STATUS_OPTIONS.keys()),
-        default=['Posted', 'Forecasted'],
-        key='gg_statuses',
-    )
-with col_f:
-    selected_instr_labels = st.multiselect(
-        'Funding instruments',
-        list(_INSTRUMENT_OPTIONS.keys()),
-        default=['Grant', 'Cooperative Agreement'],
-        key='gg_instruments',
-    )
-
-col_a, col_m = st.columns(2)
-with col_a:
-    gg_agencies_raw = st.text_input(
-        'Agency codes (optional, comma-separated)',
-        placeholder='e.g. HHS, NSF, DOD, NIH',
-        key='gg_agencies',
-    )
-with col_m:
-    gg_max = st.number_input(
-        'Max results (0 = no cap)',
-        min_value=0,
-        value=200,
-        step=25,
-        key='gg_max',
-    )
-
-if st.button('🔍 Fetch from Grants.gov', type='primary', key='gg_fetch_btn'):
-    statuses    = [_STATUS_OPTIONS[lbl]    for lbl in selected_status_labels]
-    instruments = [_INSTRUMENT_OPTIONS[lbl] for lbl in selected_instr_labels]
-    agencies    = [a.strip().upper() for a in gg_agencies_raw.split(',') if a.strip()]
-
-    if not statuses:
-        st.error('Select at least one opportunity status.')
-    elif gg_use_date_filter and gg_date_from and gg_date_to and gg_date_from > gg_date_to:
-        st.error('"Posted from" must be on or before "Posted to".')
-    else:
-        try:
-            df_fetched, total = _search_grants(
-                keyword          = gg_keyword.strip(),
-                statuses         = statuses,
-                instruments      = instruments,
-                agencies         = agencies,
-                date_from        = gg_date_from,
-                date_to          = gg_date_to,
-                exclude_expired  = gg_exclude_expired,
-                max_results      = int(gg_max),
-            )
-            if df_fetched.empty:
-                st.warning(
-                    f'No opportunities matched the filters (API returned {total:,} total records). '
-                    'Try adjusting the posted-date range or status/instrument filters.'
-                )
-            else:
-                st.caption(f'API total: **{total:,}** — after filters: **{len(df_fetched):,}** rows.')
-                st.session_state.ggov_raw_df        = df_fetched
-                st.session_state.ggov_screened_df   = None
-                st.session_state.ggov_existing_keys = None
-                st.session_state.ggov_custom_cols   = []
-                st.rerun()
-        except requests.HTTPError as exc:
-            code = exc.response.status_code if exc.response is not None else '?'
-            st.error(f'Grants.gov API HTTP {code}: {exc}')
-        except Exception as exc:
-            st.error(f'Fetch failed: {exc}')
-
-if st.session_state.ggov_raw_df is None:
-    st.stop()
-
-df_raw = st.session_state.ggov_raw_df
-st.caption(f'**{len(df_raw):,}** rows loaded.')
-
-no_desc = (df_raw['description'].str.strip() == '').sum()
-if no_desc > 0:
-    st.info(
-        f'{no_desc} row(s) have no description text from the API. '
-        'These will be screened and embedded by title only.',
-        icon='ℹ️',
-    )
-
-_preview_cols = ['title', 'agency', 'posted_date', 'close_date', 'award_ceiling', 'description']
-st.dataframe(df_raw[_preview_cols].head(5), hide_index=True, use_container_width=True)
+    for _k in ['ggov_raw_df', 'ggov_screened_df', 'ggov_existing_keys']:
+        if _k not in st.session_state:
+            st.session_state[_k] = None
+    if 'ggov_custom_cols' not in st.session_state:
+        st.session_state.ggov_custom_cols = []
 
 
-# ── Section 2 · Screen with Claude ─────────────────────────────────────────
+    # ── Page ───────────────────────────────────────────────────────────────────
 
-st.divider()
-st.subheader('2 · Screen with Claude')
-
-n_rows   = len(df_raw)
-est_mins = max(1, n_rows // 60)
-screened = st.session_state.ggov_screened_df
-
-if screened is None:
+    st.title('🏦 Grants.gov Fetch')
     st.caption(
-        f'Claude Haiku will screen **{n_rows:,}** rows for relevance to R&D small businesses. '
-        f'Estimated time: ~{est_mins} min at {_SCREEN_WORKERS} concurrent workers.'
+        'Search Grants.gov for federal funding opportunities. '
+        'Claude screens each result for R&D relevance, then passing rows are embedded '
+        'and saved to the topic store. No API key required.'
     )
-    if st.button('⚡ Run Screening', type='primary', key='gg_screen_btn'):
+
+    # ── Section 1 · Fetch parameters ───────────────────────────────────────────
+
+    st.subheader('1 · Fetch from Grants.gov')
+
+    gg_exclude_expired = st.checkbox(
+        'Exclude already-closed opportunities',
+        value=True,
+        key='gg_exclude_expired',
+        help='Hide grants whose close date has already passed. Grants with no close date (common for forecasted) are always kept.',
+    )
+
+    gg_use_date_filter = st.checkbox('Filter by posted date', value=False, key='gg_use_date')
+    gg_date_from: date | None = None
+    gg_date_to:   date | None = None
+    if gg_use_date_filter:
+        col_df, col_dt = st.columns(2)
+        with col_df:
+            gg_date_from = st.date_input(
+                'Posted from',
+                value=date.today() - timedelta(days=7),
+                key='gg_date_from',
+            )
+        with col_dt:
+            gg_date_to = st.date_input(
+                'Posted to',
+                value=date.today(),
+                key='gg_date_to',
+            )
+
+    gg_keyword = st.text_input(
+        'Keyword (optional)',
+        placeholder='e.g. SBIR, cybersecurity, artificial intelligence, biotech',
+        key='gg_keyword',
+    )
+
+    col_s, col_f = st.columns(2)
+    with col_s:
+        selected_status_labels = st.multiselect(
+            'Opportunity status',
+            list(_STATUS_OPTIONS.keys()),
+            default=['Posted', 'Forecasted'],
+            key='gg_statuses',
+        )
+    with col_f:
+        selected_instr_labels = st.multiselect(
+            'Funding instruments',
+            list(_INSTRUMENT_OPTIONS.keys()),
+            default=['Grant', 'Cooperative Agreement'],
+            key='gg_instruments',
+        )
+
+    col_a, col_m = st.columns(2)
+    with col_a:
+        gg_agencies_raw = st.text_input(
+            'Agency codes (optional, comma-separated)',
+            placeholder='e.g. HHS, NSF, DOD, NIH',
+            key='gg_agencies',
+        )
+    with col_m:
+        gg_max = st.number_input(
+            'Max results (0 = no cap)',
+            min_value=0,
+            value=200,
+            step=25,
+            key='gg_max',
+        )
+
+    if st.button('🔍 Fetch from Grants.gov', type='primary', key='gg_fetch_btn'):
+        statuses    = [_STATUS_OPTIONS[lbl]    for lbl in selected_status_labels]
+        instruments = [_INSTRUMENT_OPTIONS[lbl] for lbl in selected_instr_labels]
+        agencies    = [a.strip().upper() for a in gg_agencies_raw.split(',') if a.strip()]
+
+        if not statuses:
+            st.error('Select at least one opportunity status.')
+        elif gg_use_date_filter and gg_date_from and gg_date_to and gg_date_from > gg_date_to:
+            st.error('"Posted from" must be on or before "Posted to".')
+        else:
+            try:
+                df_fetched, total = _search_grants(
+                    keyword          = gg_keyword.strip(),
+                    statuses         = statuses,
+                    instruments      = instruments,
+                    agencies         = agencies,
+                    date_from        = gg_date_from,
+                    date_to          = gg_date_to,
+                    exclude_expired  = gg_exclude_expired,
+                    max_results      = int(gg_max),
+                )
+                if df_fetched.empty:
+                    st.warning(
+                        f'No opportunities matched the filters (API returned {total:,} total records). '
+                        'Try adjusting the posted-date range or status/instrument filters.'
+                    )
+                else:
+                    st.caption(f'API total: **{total:,}** — after filters: **{len(df_fetched):,}** rows.')
+                    st.session_state.ggov_raw_df        = df_fetched
+                    st.session_state.ggov_screened_df   = None
+                    st.session_state.ggov_existing_keys = None
+                    st.session_state.ggov_custom_cols   = []
+                    st.rerun()
+            except requests.HTTPError as exc:
+                code = exc.response.status_code if exc.response is not None else '?'
+                st.error(f'Grants.gov API HTTP {code}: {exc}')
+            except Exception as exc:
+                st.error(f'Fetch failed: {exc}')
+
+    if st.session_state.ggov_raw_df is None:
+        st.stop()
+
+    df_raw = st.session_state.ggov_raw_df
+    st.caption(f'**{len(df_raw):,}** rows loaded.')
+
+    no_desc = (df_raw['description'].str.strip() == '').sum()
+    if no_desc > 0:
+        st.info(
+            f'{no_desc} row(s) have no description text from the API. '
+            'These will be screened and embedded by title only.',
+            icon='ℹ️',
+        )
+
+    _preview_cols = ['title', 'agency', 'posted_date', 'close_date', 'award_ceiling', 'description']
+    st.dataframe(df_raw[_preview_cols].head(5), hide_index=True, use_container_width=True)
+
+
+    # ── Section 2 · Screen with Claude ─────────────────────────────────────────
+
+    st.divider()
+    st.subheader('2 · Screen with Claude')
+
+    n_rows   = len(df_raw)
+    est_mins = max(1, n_rows // 60)
+    screened = st.session_state.ggov_screened_df
+
+    if screened is None:
+        st.caption(
+            f'Claude Haiku will screen **{n_rows:,}** rows for relevance to R&D small businesses. '
+            f'Estimated time: ~{est_mins} min at {_SCREEN_WORKERS} concurrent workers.'
+        )
+        if st.button('⚡ Run Screening', type='primary', key='gg_screen_btn'):
+            anth_key = st.secrets['anthropic_api_key']
+            try:
+                st.session_state.ggov_screened_df = _run_screening(df_raw, anth_key)
+                st.rerun()
+            except Exception as e:
+                st.error(f'Screening failed: {e}')
+        st.stop()
+
+    passing  = screened[screened['_import'] == True].copy()
+    failing  = screened[screened['_import'] == False].copy()
+    pass_pct = len(passing) / len(screened) * 100 if len(screened) > 0 else 0
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric('Total rows',   f'{len(screened):,}')
+    m2.metric('Passing',      f'{len(passing):,}  ({pass_pct:.0f}%)')
+    m3.metric('Filtered out', f'{len(failing):,}')
+
+    if st.button('↺ Re-run screening', key='gg_rescreen_btn'):
+        st.session_state.ggov_screened_df = None
+        st.rerun()
+
+    _disp_cols = ['title', 'agency', '_confidence', '_reason']
+    _disp_cfg  = {
+        'title':        st.column_config.TextColumn('Title',      width='medium'),
+        'agency':       st.column_config.TextColumn('Agency',     width='small'),
+        '_confidence':  st.column_config.TextColumn('Confidence', width='small'),
+        '_reason':      st.column_config.TextColumn('Reason',     width='large'),
+    }
+
+    with st.expander(f'✅ Passing ({len(passing)})', expanded=True):
+        if passing.empty:
+            st.info('No rows passed screening.')
+        else:
+            st.dataframe(
+                passing[_disp_cols].reset_index(drop=True),
+                hide_index=True,
+                use_container_width=True,
+                column_config=_disp_cfg,
+            )
+
+    with st.expander(f'❌ Filtered out ({len(failing)})', expanded=False):
+        if failing.empty:
+            st.info('Nothing was filtered out.')
+        else:
+            st.dataframe(
+                failing[_disp_cols].reset_index(drop=True),
+                hide_index=True,
+                use_container_width=True,
+                column_config=_disp_cfg,
+            )
+
+
+    # ── Section 3 · Save ──────────────────────────────────────────────────────
+
+    st.divider()
+    st.subheader('3 · Save to topic store')
+
+    if passing.empty:
+        st.warning('No passing rows to save — nothing to embed.')
+        st.stop()
+
+    if st.session_state.ggov_existing_keys is None:
+        with st.spinner('Checking existing records for duplicates…'):
+            try:
+                existing_ids, existing_titles = _load_existing_keys(_get_storage_client())
+                st.session_state.ggov_existing_keys = (existing_ids, existing_titles)
+            except Exception as e:
+                st.warning(f'Could not load existing records for dedup check: {e}')
+                st.session_state.ggov_existing_keys = (set(), set())
+
+    existing_ids, existing_titles = st.session_state.ggov_existing_keys
+
+
+    def _is_dup(row: pd.Series) -> bool:
+        if str(row.get('notice_id', '')).strip() in existing_ids:
+            return True
+        if str(row.get('title', '')).strip().lower() in existing_titles:
+            return True
+        return False
+
+
+    dup_mask = passing.apply(_is_dup, axis=1)
+    dupes    = passing[dup_mask]
+    new_rows = passing[~dup_mask]
+
+    if not dupes.empty:
+        st.info(f'**{len(dupes)}** row(s) skipped — notice ID or title already exists in the store.', icon='ℹ️')
+        with st.expander(f'Skipped duplicates ({len(dupes)})', expanded=False):
+            st.dataframe(
+                dupes[['title', 'notice_id']].reset_index(drop=True),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    if new_rows.empty:
+        st.success('All passing rows are already in the store — nothing new to save.')
+        st.stop()
+
+    with st.expander('➕ Custom columns', expanded=bool(st.session_state.ggov_custom_cols)):
+        st.caption(
+            'Add extra columns to tag every saved topic with campaign-specific metadata. '
+            'Columns are saved to the parquet and available as optional fields in HubSpot import.'
+        )
+
+        for entry in list(st.session_state.ggov_custom_cols):
+            gc1, gc2, gc3 = st.columns([2, 4, 1])
+            with gc1:
+                st.text(entry['name'])
+            with gc2:
+                entry['value'] = st.text_input(
+                    'Value', value=entry['value'],
+                    key=f'gcfill_{entry["name"]}', label_visibility='collapsed',
+                )
+            with gc3:
+                if st.button('✕', key=f'gcrm_{entry["name"]}', use_container_width=True):
+                    st.session_state.ggov_custom_cols = [
+                        e for e in st.session_state.ggov_custom_cols if e['name'] != entry['name']
+                    ]
+                    st.rerun()
+
+        if st.session_state.ggov_custom_cols:
+            st.divider()
+
+        gna1, gna2, gna3 = st.columns([2, 4, 1])
+        with gna1:
+            new_gc_name = st.text_input(
+                'Column name', placeholder='e.g. campaign_name',
+                key='ggov_new_gc_name', label_visibility='collapsed',
+            )
+        with gna2:
+            new_gc_val = st.text_input(
+                'Value', placeholder='e.g. Spring 2026',
+                key='ggov_new_gc_val', label_visibility='collapsed',
+            )
+        with gna3:
+            if st.button('Add', key='ggov_add_gc_btn', use_container_width=True):
+                clean = new_gc_name.strip().replace(' ', '_').lower()
+                existing_names = {e['name'] for e in st.session_state.ggov_custom_cols}
+                if (
+                    clean
+                    and clean not in _GRANTS_RESERVED_COLS
+                    and clean not in existing_names
+                ):
+                    st.session_state.ggov_custom_cols.append({'name': clean, 'value': new_gc_val.strip()})
+                    st.rerun()
+
+    st.caption(
+        f'**{len(new_rows)}** new rows will be summarized, embedded (`text-embedding-ada-002`), and saved to '
+        f'`{_GRANTS_PREFIX}grants_gov_{{date}}_{{hex}}.parquet`.'
+    )
+
+    if st.button('💾 Embed & Save', type='primary', key='gg_save_btn'):
+        oai_key  = st.secrets['openai_api_key']
         anth_key = st.secrets['anthropic_api_key']
+        extra_cols_dict = {e['name']: e['value'] for e in st.session_state.ggov_custom_cols} or None
         try:
-            st.session_state.ggov_screened_df = _run_screening(df_raw, anth_key)
+            path = _embed_and_save(
+                new_rows.reset_index(drop=True),
+                oai_key,
+                anth_key,
+                extra_cols=extra_cols_dict,
+            )
+            st.success(f'Saved **{path}** — {len(new_rows)} topics ready for matching.')
+            st.session_state.ggov_raw_df        = None
+            st.session_state.ggov_screened_df   = None
+            st.session_state.ggov_existing_keys = None
+            st.session_state.ggov_custom_cols   = []
             st.rerun()
         except Exception as e:
-            st.error(f'Screening failed: {e}')
-    st.stop()
-
-passing  = screened[screened['_import'] == True].copy()
-failing  = screened[screened['_import'] == False].copy()
-pass_pct = len(passing) / len(screened) * 100 if len(screened) > 0 else 0
-
-m1, m2, m3 = st.columns(3)
-m1.metric('Total rows',   f'{len(screened):,}')
-m2.metric('Passing',      f'{len(passing):,}  ({pass_pct:.0f}%)')
-m3.metric('Filtered out', f'{len(failing):,}')
-
-if st.button('↺ Re-run screening', key='gg_rescreen_btn'):
-    st.session_state.ggov_screened_df = None
-    st.rerun()
-
-_disp_cols = ['title', 'agency', '_confidence', '_reason']
-_disp_cfg  = {
-    'title':        st.column_config.TextColumn('Title',      width='medium'),
-    'agency':       st.column_config.TextColumn('Agency',     width='small'),
-    '_confidence':  st.column_config.TextColumn('Confidence', width='small'),
-    '_reason':      st.column_config.TextColumn('Reason',     width='large'),
-}
-
-with st.expander(f'✅ Passing ({len(passing)})', expanded=True):
-    if passing.empty:
-        st.info('No rows passed screening.')
-    else:
-        st.dataframe(
-            passing[_disp_cols].reset_index(drop=True),
-            hide_index=True,
-            use_container_width=True,
-            column_config=_disp_cfg,
-        )
-
-with st.expander(f'❌ Filtered out ({len(failing)})', expanded=False):
-    if failing.empty:
-        st.info('Nothing was filtered out.')
-    else:
-        st.dataframe(
-            failing[_disp_cols].reset_index(drop=True),
-            hide_index=True,
-            use_container_width=True,
-            column_config=_disp_cfg,
-        )
-
-
-# ── Section 3 · Save ──────────────────────────────────────────────────────
-
-st.divider()
-st.subheader('3 · Save to topic store')
-
-if passing.empty:
-    st.warning('No passing rows to save — nothing to embed.')
-    st.stop()
-
-if st.session_state.ggov_existing_keys is None:
-    with st.spinner('Checking existing records for duplicates…'):
-        try:
-            existing_ids, existing_titles = _load_existing_keys(_get_storage_client())
-            st.session_state.ggov_existing_keys = (existing_ids, existing_titles)
-        except Exception as e:
-            st.warning(f'Could not load existing records for dedup check: {e}')
-            st.session_state.ggov_existing_keys = (set(), set())
-
-existing_ids, existing_titles = st.session_state.ggov_existing_keys
-
-
-def _is_dup(row: pd.Series) -> bool:
-    if str(row.get('notice_id', '')).strip() in existing_ids:
-        return True
-    if str(row.get('title', '')).strip().lower() in existing_titles:
-        return True
-    return False
-
-
-dup_mask = passing.apply(_is_dup, axis=1)
-dupes    = passing[dup_mask]
-new_rows = passing[~dup_mask]
-
-if not dupes.empty:
-    st.info(f'**{len(dupes)}** row(s) skipped — notice ID or title already exists in the store.', icon='ℹ️')
-    with st.expander(f'Skipped duplicates ({len(dupes)})', expanded=False):
-        st.dataframe(
-            dupes[['title', 'notice_id']].reset_index(drop=True),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-if new_rows.empty:
-    st.success('All passing rows are already in the store — nothing new to save.')
-    st.stop()
-
-with st.expander('➕ Custom columns', expanded=bool(st.session_state.ggov_custom_cols)):
-    st.caption(
-        'Add extra columns to tag every saved topic with campaign-specific metadata. '
-        'Columns are saved to the parquet and available as optional fields in HubSpot import.'
-    )
-
-    for entry in list(st.session_state.ggov_custom_cols):
-        gc1, gc2, gc3 = st.columns([2, 4, 1])
-        with gc1:
-            st.text(entry['name'])
-        with gc2:
-            entry['value'] = st.text_input(
-                'Value', value=entry['value'],
-                key=f'gcfill_{entry["name"]}', label_visibility='collapsed',
-            )
-        with gc3:
-            if st.button('✕', key=f'gcrm_{entry["name"]}', use_container_width=True):
-                st.session_state.ggov_custom_cols = [
-                    e for e in st.session_state.ggov_custom_cols if e['name'] != entry['name']
-                ]
-                st.rerun()
-
-    if st.session_state.ggov_custom_cols:
-        st.divider()
-
-    gna1, gna2, gna3 = st.columns([2, 4, 1])
-    with gna1:
-        new_gc_name = st.text_input(
-            'Column name', placeholder='e.g. campaign_name',
-            key='new_gc_name', label_visibility='collapsed',
-        )
-    with gna2:
-        new_gc_val = st.text_input(
-            'Value', placeholder='e.g. Spring 2026',
-            key='new_gc_val', label_visibility='collapsed',
-        )
-    with gna3:
-        if st.button('Add', key='add_gc_btn', use_container_width=True):
-            clean = new_gc_name.strip().replace(' ', '_').lower()
-            existing_names = {e['name'] for e in st.session_state.ggov_custom_cols}
-            if (
-                clean
-                and clean not in _GRANTS_RESERVED_COLS
-                and clean not in existing_names
-            ):
-                st.session_state.ggov_custom_cols.append({'name': clean, 'value': new_gc_val.strip()})
-                st.rerun()
-
-st.caption(
-    f'**{len(new_rows)}** new rows will be summarized, embedded (`text-embedding-ada-002`), and saved to '
-    f'`{_GRANTS_PREFIX}grants_gov_{{date}}_{{hex}}.parquet`.'
-)
-
-if st.button('💾 Embed & Save', type='primary', key='gg_save_btn'):
-    oai_key  = st.secrets['openai_api_key']
-    anth_key = st.secrets['anthropic_api_key']
-    extra_cols_dict = {e['name']: e['value'] for e in st.session_state.ggov_custom_cols} or None
-    try:
-        path = _embed_and_save(
-            new_rows.reset_index(drop=True),
-            oai_key,
-            anth_key,
-            extra_cols=extra_cols_dict,
-        )
-        st.success(f'Saved **{path}** — {len(new_rows)} topics ready for matching.')
-        st.session_state.ggov_raw_df        = None
-        st.session_state.ggov_screened_df   = None
-        st.session_state.ggov_existing_keys = None
-        st.session_state.ggov_custom_cols   = []
-        st.rerun()
-    except Exception as e:
-        st.error(f'Save failed: {e}')
+            st.error(f'Save failed: {e}')

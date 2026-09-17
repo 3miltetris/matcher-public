@@ -14,11 +14,11 @@ import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
 from anthropic import Anthropic
-from google.oauth2 import service_account
 from google.cloud import storage
 
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
+import src.modules.ui_common as uc
 
 # ── GCS ────────────────────────────────────────────────────────────────────
 
@@ -27,10 +27,7 @@ _TOPICS_PREFIX = 'data/all-topics/processed/'
 
 
 def _get_storage_client() -> storage.Client:
-    creds = service_account.Credentials.from_service_account_info(
-        st.secrets['gcp_service_account']
-    )
-    return storage.Client(credentials=creds)
+    return uc.get_storage_client()
 
 # ── Extraction prompt ──────────────────────────────────────────────────────
 
@@ -156,283 +153,289 @@ def _embed_and_save(df: pd.DataFrame, broad_agency: str, oai_key: str) -> list[s
     return saved
 
 
-# ── Session state ──────────────────────────────────────────────────────────
+# ── Page ──────────────────────────────────────────────────────────────────
+# Body lives in render() so this module can be dispatched to by a parent
+# page. Only one render() runs per script run, which is what keeps the
+# st.stop() calls below correct.
 
-if 'topics_df' not in st.session_state:
-    st.session_state.topics_df = None
-if 'save_results' not in st.session_state:
-    st.session_state.save_results = []
-if 'topic_custom_cols' not in st.session_state:
-    st.session_state.topic_custom_cols = []
+def render():
+    # ── Session state ──────────────────────────────────────────────────────────
+
+    if 'ti_topics_df' not in st.session_state:
+        st.session_state.ti_topics_df = None
+    if 'ti_save_results' not in st.session_state:
+        st.session_state.ti_save_results = []
+    if 'ti_custom_cols' not in st.session_state:
+        st.session_state.ti_custom_cols = []
 
 
-# ── Page ───────────────────────────────────────────────────────────────────
+    # ── Page ───────────────────────────────────────────────────────────────────
 
-st.title('📄 Topic Importer')
-st.caption(
-    'Extract grant topics from a solicitation PDF or pasted text. '
-    'Review and edit, then save with embeddings to the processed store.'
-)
-
-# Show any post-save success banners
-for msg in st.session_state.save_results:
-    st.success(msg)
-
-# ── Section 1 · Input document ─────────────────────────────────────────────
-
-st.subheader('1 · Input document')
-
-pdf_tab, text_tab = st.tabs(['📎 Upload PDF', '📋 Paste Text'])
-with pdf_tab:
-    uploaded_pdf = st.file_uploader('PDF solicitation file', type='pdf', label_visibility='collapsed')
-with text_tab:
-    pasted_text = st.text_area(
-        'Paste text',
-        height=220,
-        placeholder='Paste the full solicitation text here…',
-        label_visibility='collapsed',
-    )
-
-input_col1, input_col2 = st.columns(2)
-with input_col1:
-    sub_agency_input = st.text_input(
-        'Sub-agency',
-        placeholder='e.g. ARMY, USSOCOM, NCI — pre-fills the agency column for all extracted topics',
-    )
-with input_col2:
-    source_input = st.text_input(
-        'Source',
-        placeholder='e.g. SAM.gov, Agency website — pre-fills the source column for all extracted topics',
-    )
-
-extract_btn = st.button('⚡ Extract Topics', type='primary')
-
-if extract_btn:
-    source_text = ''
-    if uploaded_pdf is not None:
-        with st.spinner('Reading PDF…'):
-            source_text = _pdf_to_text(uploaded_pdf.read())
-    elif pasted_text.strip():
-        source_text = pasted_text.strip()
-    else:
-        st.error('Please upload a PDF or paste text first.')
-
-    if source_text:
-        char_count = len(source_text)
-        if char_count > 400_000:
-            st.warning(
-                f'Document is very long ({char_count:,} chars). '
-                'Consider trimming it to the relevant section to reduce cost and latency.'
-            )
-
-        anth_key = st.secrets['anthropic_api_key']
-
-        with st.spinner('Calling Claude to extract topics — this may take a moment for long documents…'):
-            try:
-                topics = _extract_topics(source_text, anth_key)
-            except json.JSONDecodeError as e:
-                st.error(f'Claude returned unparseable JSON: {e}')
-                st.stop()
-            except Exception as e:
-                st.error(f'Extraction failed: {e}')
-                st.stop()
-
-        if not topics:
-            st.warning('No topics found in the document.')
-        else:
-            st.session_state.topics_df        = _build_df(topics, sub_agency_input.strip(), source_input.strip())
-            st.session_state.save_results      = []
-            st.session_state.topic_custom_cols = []
-            st.success(f'Extracted **{len(topics)}** topic(s). Review and edit below.')
-
-# ── Section 2 · Review & edit ──────────────────────────────────────────────
-
-if st.session_state.topics_df is not None:
-    st.divider()
-    st.subheader('2 · Review & edit')
-
-    # Agency quick-fill bar
-    fill_left, fill_right, _ = st.columns([2, 1, 3])
-    with fill_left:
-        fill_value = st.text_input(
-            'Agency name',
-            value=sub_agency_input.strip(),
-            placeholder='Type agency name…',
-            label_visibility='collapsed',
-            key='agency_fill_input',
-        )
-    with fill_right:
-        if st.button('Apply to all rows', key='apply_agency', width='stretch'):
-            df = st.session_state.topics_df.copy()
-            df['agency'] = fill_value.strip()
-            st.session_state.topics_df = df
-            st.rerun()
-
-    # Source quick-fill bar
-    src_left, src_right, _ = st.columns([2, 1, 3])
-    with src_left:
-        source_fill_value = st.text_input(
-            'Source',
-            value=source_input.strip(),
-            placeholder='e.g. SAM.gov, Agency website…',
-            label_visibility='collapsed',
-            key='source_fill_input',
-        )
-    with src_right:
-        if st.button('Apply to all rows', key='apply_source', width='stretch'):
-            df = st.session_state.topics_df.copy()
-            df['source'] = source_fill_value.strip()
-            st.session_state.topics_df = df
-            st.rerun()
-
-    # Data editor — always sync edits back to session state so they survive reruns
-    edited_df = st.data_editor(
-        st.session_state.topics_df,
-        width='stretch',
-        num_rows='dynamic',
-        column_config={
-            'topic_number': st.column_config.TextColumn('Topic #',      width='small'),
-            'title':        st.column_config.TextColumn('Title',        width='medium'),
-            'agency':       st.column_config.TextColumn('Agency',       width='small'),
-            'source':       st.column_config.TextColumn('Source',       width='small'),
-            'due_date':     st.column_config.TextColumn('Due Date',       width='small'),
-            'funding_amount':st.column_config.TextColumn('Funding Amount', width='small'),
-            'scraped_at':   st.column_config.TextColumn('Scraped At',    width='small'),
-            'grant_summary': st.column_config.TextColumn('Description',  width='large'),
-        },
-        hide_index=True,
-        key='topics_editor',
-    )
-    # Persist edits so "Apply to all rows" and Save see the latest table state
-    st.session_state.topics_df = edited_df
-
-    # ── Custom columns ──────────────────────────────────────────────────────
-
-    with st.expander('➕ Custom columns', expanded=bool(st.session_state.topic_custom_cols)):
-        st.caption(
-            'Add extra columns to tag every topic with campaign-specific metadata. '
-            'Columns are saved to the parquet and available as optional fields in HubSpot import.'
-        )
-
-        for col_name in list(st.session_state.topic_custom_cols):
-            cc1, cc2, cc3, cc4 = st.columns([2, 3, 2, 1])
-            with cc1:
-                st.text(col_name)
-            with cc2:
-                cur_val = (
-                    str(st.session_state.topics_df[col_name].iloc[0])
-                    if col_name in st.session_state.topics_df.columns and len(st.session_state.topics_df) > 0
-                    else ''
-                )
-                fill_v = st.text_input(
-                    'Value', value=cur_val,
-                    key=f'ccfill_{col_name}', label_visibility='collapsed',
-                )
-            with cc3:
-                if st.button('Apply to all', key=f'ccapply_{col_name}', use_container_width=True):
-                    _df = st.session_state.topics_df.copy()
-                    _df[col_name] = fill_v
-                    st.session_state.topics_df = _df
-                    st.rerun()
-            with cc4:
-                if st.button('✕', key=f'ccrm_{col_name}', use_container_width=True):
-                    _df = st.session_state.topics_df.copy()
-                    _df = _df.drop(columns=[col_name], errors='ignore')
-                    st.session_state.topics_df = _df
-                    st.session_state.topic_custom_cols.remove(col_name)
-                    st.rerun()
-
-        if st.session_state.topic_custom_cols:
-            st.divider()
-
-        na1, na2, na3 = st.columns([2, 3, 1])
-        with na1:
-            new_cc_name = st.text_input(
-                'Column name', placeholder='e.g. campaign_name',
-                key='new_cc_name', label_visibility='collapsed',
-            )
-        with na2:
-            new_cc_val = st.text_input(
-                'Default value', placeholder='e.g. Spring 2026',
-                key='new_cc_val', label_visibility='collapsed',
-            )
-        with na3:
-            if st.button('Add', key='add_cc_btn', use_container_width=True):
-                clean = new_cc_name.strip().replace(' ', '_').lower()
-                if (
-                    clean
-                    and clean not in _RESERVED_COLS
-                    and clean not in st.session_state.topic_custom_cols
-                ):
-                    _df = st.session_state.topics_df.copy()
-                    _df[clean] = new_cc_val.strip()
-                    st.session_state.topics_df = _df
-                    st.session_state.topic_custom_cols.append(clean)
-                    st.rerun()
-
-    # ── Section 3 · Save ──────────────────────────────────────────────────
-
-    st.divider()
-    st.subheader('3 · Save to processed store')
-
-    existing_agencies = _get_broad_agencies()
-    agency_options    = existing_agencies + ['+ New agency…']
-
-    dest_col, new_col = st.columns([2, 2])
-    with dest_col:
-        selection = st.selectbox(
-            'Broad agency (destination folder)',
-            agency_options,
-            help='Determines the subfolder under `processed/` the parquet is saved into.',
-        )
-    broad_agency = ''
-    if selection == '+ New agency…':
-        with new_col:
-            broad_agency = st.text_input(
-                'New broad agency name',
-                placeholder='e.g. DOD, HHS, NASA',
-            ).strip().upper()
-    else:
-        broad_agency = selection
-
-    n_topics    = len(edited_df)
-    n_agencies  = edited_df['agency'].nunique()
-    agency_word = 'sub-agency' if n_agencies == 1 else 'sub-agencies'
-    dest_label  = f'`processed/{broad_agency}/`' if broad_agency else '`processed/…/`'
-
+    st.title('📄 Topic Importer')
     st.caption(
-        f'**{n_topics}** topic(s) across **{n_agencies}** {agency_word} → {dest_label}  '
-        f'— one parquet per unique sub-agency, named `{{sub_agency}}_{{date}}_{{hex}}.parquet`'
+        'Extract grant topics from a solicitation PDF or pasted text. '
+        'Review and edit, then save with embeddings to the processed store.'
     )
 
-    # A blank sub-agency lands in the store as agency='' (and a parquet named
-    # `_{date}_{hex}.parquet`). Matching then has no agency for the subject line,
-    # so block the save rather than shipping rows the email pre-write can't label.
-    blank_agency = int(
-        edited_df['agency'].fillna('').astype(str).str.strip()
-        .str.lower().isin(['', 'nan', 'none']).sum()
-    )
-    if blank_agency:
-        st.warning(
-            f'**{blank_agency}** of **{n_topics}** topic(s) have no agency. '
-            'Fill the Agency column (or use "Apply to all rows" above) before saving '
-            '— topics without an agency produce mislabelled email subject lines.'
+    # Show any post-save success banners
+    for msg in st.session_state.ti_save_results:
+        st.success(msg)
+
+    # ── Section 1 · Input document ─────────────────────────────────────────────
+
+    st.subheader('1 · Input document')
+
+    pdf_tab, text_tab = st.tabs(['📎 Upload PDF', '📋 Paste Text'])
+    with pdf_tab:
+        uploaded_pdf = st.file_uploader('PDF solicitation file', type='pdf', label_visibility='collapsed')
+    with text_tab:
+        pasted_text = st.text_area(
+            'Paste text',
+            height=220,
+            placeholder='Paste the full solicitation text here…',
+            label_visibility='collapsed',
         )
 
-    save_disabled = (not broad_agency) or bool(blank_agency)
-    if st.button('💾 Save & Embed', type='primary', disabled=save_disabled):
-        descriptions = edited_df['grant_summary'].astype(str).str.strip()
-        if descriptions.eq('').all() or descriptions.eq('None').all():
-            st.error('All descriptions are empty — nothing to embed.')
-        else:
-            oai_key = st.secrets['openai_api_key']
+    input_col1, input_col2 = st.columns(2)
+    with input_col1:
+        sub_agency_input = st.text_input(
+            'Sub-agency',
+            placeholder='e.g. ARMY, USSOCOM, NCI — pre-fills the agency column for all extracted topics',
+        )
+    with input_col2:
+        source_input = st.text_input(
+            'Source',
+            placeholder='e.g. SAM.gov, Agency website — pre-fills the source column for all extracted topics',
+        )
 
-            try:
-                out_paths = _embed_and_save(edited_df, broad_agency, oai_key)
-                st.session_state.save_results = [
-                    f'Saved **{p}**' for p in out_paths
-                ]
-                st.session_state.topics_df = None
+    extract_btn = st.button('⚡ Extract Topics', type='primary')
+
+    if extract_btn:
+        source_text = ''
+        if uploaded_pdf is not None:
+            with st.spinner('Reading PDF…'):
+                source_text = _pdf_to_text(uploaded_pdf.read())
+        elif pasted_text.strip():
+            source_text = pasted_text.strip()
+        else:
+            st.error('Please upload a PDF or paste text first.')
+
+        if source_text:
+            char_count = len(source_text)
+            if char_count > 400_000:
+                st.warning(
+                    f'Document is very long ({char_count:,} chars). '
+                    'Consider trimming it to the relevant section to reduce cost and latency.'
+                )
+
+            anth_key = st.secrets['anthropic_api_key']
+
+            with st.spinner('Calling Claude to extract topics — this may take a moment for long documents…'):
+                try:
+                    topics = _extract_topics(source_text, anth_key)
+                except json.JSONDecodeError as e:
+                    st.error(f'Claude returned unparseable JSON: {e}')
+                    st.stop()
+                except Exception as e:
+                    st.error(f'Extraction failed: {e}')
+                    st.stop()
+
+            if not topics:
+                st.warning('No topics found in the document.')
+            else:
+                st.session_state.ti_topics_df        = _build_df(topics, sub_agency_input.strip(), source_input.strip())
+                st.session_state.ti_save_results      = []
+                st.session_state.ti_custom_cols = []
+                st.success(f'Extracted **{len(topics)}** topic(s). Review and edit below.')
+
+    # ── Section 2 · Review & edit ──────────────────────────────────────────────
+
+    if st.session_state.ti_topics_df is not None:
+        st.divider()
+        st.subheader('2 · Review & edit')
+
+        # Agency quick-fill bar
+        fill_left, fill_right, _ = st.columns([2, 1, 3])
+        with fill_left:
+            fill_value = st.text_input(
+                'Agency name',
+                value=sub_agency_input.strip(),
+                placeholder='Type agency name…',
+                label_visibility='collapsed',
+                key='ti_agency_fill_input',
+            )
+        with fill_right:
+            if st.button('Apply to all rows', key='ti_apply_agency', width='stretch'):
+                df = st.session_state.ti_topics_df.copy()
+                df['agency'] = fill_value.strip()
+                st.session_state.ti_topics_df = df
                 st.rerun()
-            except Exception as e:
-                st.error(f'Save failed: {e}')
+
+        # Source quick-fill bar
+        src_left, src_right, _ = st.columns([2, 1, 3])
+        with src_left:
+            source_fill_value = st.text_input(
+                'Source',
+                value=source_input.strip(),
+                placeholder='e.g. SAM.gov, Agency website…',
+                label_visibility='collapsed',
+                key='ti_source_fill_input',
+            )
+        with src_right:
+            if st.button('Apply to all rows', key='ti_apply_source', width='stretch'):
+                df = st.session_state.ti_topics_df.copy()
+                df['source'] = source_fill_value.strip()
+                st.session_state.ti_topics_df = df
+                st.rerun()
+
+        # Data editor — always sync edits back to session state so they survive reruns
+        edited_df = st.data_editor(
+            st.session_state.ti_topics_df,
+            width='stretch',
+            num_rows='dynamic',
+            column_config={
+                'topic_number': st.column_config.TextColumn('Topic #',      width='small'),
+                'title':        st.column_config.TextColumn('Title',        width='medium'),
+                'agency':       st.column_config.TextColumn('Agency',       width='small'),
+                'source':       st.column_config.TextColumn('Source',       width='small'),
+                'due_date':     st.column_config.TextColumn('Due Date',       width='small'),
+                'funding_amount':st.column_config.TextColumn('Funding Amount', width='small'),
+                'scraped_at':   st.column_config.TextColumn('Scraped At',    width='small'),
+                'grant_summary': st.column_config.TextColumn('Description',  width='large'),
+            },
+            hide_index=True,
+            key='ti_topics_editor',
+        )
+        # Persist edits so "Apply to all rows" and Save see the latest table state
+        st.session_state.ti_topics_df = edited_df
+
+        # ── Custom columns ──────────────────────────────────────────────────────
+
+        with st.expander('➕ Custom columns', expanded=bool(st.session_state.ti_custom_cols)):
+            st.caption(
+                'Add extra columns to tag every topic with campaign-specific metadata. '
+                'Columns are saved to the parquet and available as optional fields in HubSpot import.'
+            )
+
+            for col_name in list(st.session_state.ti_custom_cols):
+                cc1, cc2, cc3, cc4 = st.columns([2, 3, 2, 1])
+                with cc1:
+                    st.text(col_name)
+                with cc2:
+                    cur_val = (
+                        str(st.session_state.ti_topics_df[col_name].iloc[0])
+                        if col_name in st.session_state.ti_topics_df.columns and len(st.session_state.ti_topics_df) > 0
+                        else ''
+                    )
+                    fill_v = st.text_input(
+                        'Value', value=cur_val,
+                        key=f'ccfill_{col_name}', label_visibility='collapsed',
+                    )
+                with cc3:
+                    if st.button('Apply to all', key=f'ccapply_{col_name}', use_container_width=True):
+                        _df = st.session_state.ti_topics_df.copy()
+                        _df[col_name] = fill_v
+                        st.session_state.ti_topics_df = _df
+                        st.rerun()
+                with cc4:
+                    if st.button('✕', key=f'ccrm_{col_name}', use_container_width=True):
+                        _df = st.session_state.ti_topics_df.copy()
+                        _df = _df.drop(columns=[col_name], errors='ignore')
+                        st.session_state.ti_topics_df = _df
+                        st.session_state.ti_custom_cols.remove(col_name)
+                        st.rerun()
+
+            if st.session_state.ti_custom_cols:
+                st.divider()
+
+            na1, na2, na3 = st.columns([2, 3, 1])
+            with na1:
+                new_cc_name = st.text_input(
+                    'Column name', placeholder='e.g. campaign_name',
+                    key='ti_new_cc_name', label_visibility='collapsed',
+                )
+            with na2:
+                new_cc_val = st.text_input(
+                    'Default value', placeholder='e.g. Spring 2026',
+                    key='ti_new_cc_val', label_visibility='collapsed',
+                )
+            with na3:
+                if st.button('Add', key='ti_add_cc_btn', use_container_width=True):
+                    clean = new_cc_name.strip().replace(' ', '_').lower()
+                    if (
+                        clean
+                        and clean not in _RESERVED_COLS
+                        and clean not in st.session_state.ti_custom_cols
+                    ):
+                        _df = st.session_state.ti_topics_df.copy()
+                        _df[clean] = new_cc_val.strip()
+                        st.session_state.ti_topics_df = _df
+                        st.session_state.ti_custom_cols.append(clean)
+                        st.rerun()
+
+        # ── Section 3 · Save ──────────────────────────────────────────────────
+
+        st.divider()
+        st.subheader('3 · Save to processed store')
+
+        existing_agencies = _get_broad_agencies()
+        agency_options    = existing_agencies + ['+ New agency…']
+
+        dest_col, new_col = st.columns([2, 2])
+        with dest_col:
+            selection = st.selectbox(
+                'Broad agency (destination folder)',
+                agency_options,
+                help='Determines the subfolder under `processed/` the parquet is saved into.',
+            )
+        broad_agency = ''
+        if selection == '+ New agency…':
+            with new_col:
+                broad_agency = st.text_input(
+                    'New broad agency name',
+                    placeholder='e.g. DOD, HHS, NASA',
+                ).strip().upper()
+        else:
+            broad_agency = selection
+
+        n_topics    = len(edited_df)
+        n_agencies  = edited_df['agency'].nunique()
+        agency_word = 'sub-agency' if n_agencies == 1 else 'sub-agencies'
+        dest_label  = f'`processed/{broad_agency}/`' if broad_agency else '`processed/…/`'
+
+        st.caption(
+            f'**{n_topics}** topic(s) across **{n_agencies}** {agency_word} → {dest_label}  '
+            f'— one parquet per unique sub-agency, named `{{sub_agency}}_{{date}}_{{hex}}.parquet`'
+        )
+
+        # A blank sub-agency lands in the store as agency='' (and a parquet named
+        # `_{date}_{hex}.parquet`). Matching then has no agency for the subject line,
+        # so block the save rather than shipping rows the email pre-write can't label.
+        blank_agency = int(
+            edited_df['agency'].fillna('').astype(str).str.strip()
+            .str.lower().isin(['', 'nan', 'none']).sum()
+        )
+        if blank_agency:
+            st.warning(
+                f'**{blank_agency}** of **{n_topics}** topic(s) have no agency. '
+                'Fill the Agency column (or use "Apply to all rows" above) before saving '
+                '— topics without an agency produce mislabelled email subject lines.'
+            )
+
+        save_disabled = (not broad_agency) or bool(blank_agency)
+        if st.button('💾 Save & Embed', type='primary', disabled=save_disabled):
+            descriptions = edited_df['grant_summary'].astype(str).str.strip()
+            if descriptions.eq('').all() or descriptions.eq('None').all():
+                st.error('All descriptions are empty — nothing to embed.')
+            else:
+                oai_key = st.secrets['openai_api_key']
+
+                try:
+                    out_paths = _embed_and_save(edited_df, broad_agency, oai_key)
+                    st.session_state.ti_save_results = [
+                        f'Saved **{p}**' for p in out_paths
+                    ]
+                    st.session_state.ti_topics_df = None
+                    st.rerun()
+                except Exception as e:
+                    st.error(f'Save failed: {e}')

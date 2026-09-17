@@ -681,7 +681,7 @@ if 'am_pick_nonce' not in st.session_state:
 
 # ── Page ───────────────────────────────────────────────────────────────────
 
-st.title('🎯 Bulk Aspect Match')
+st.title('🎯 Aspect Match')
 st.caption(
     'Score every client aspect against every selected grant topic, keep the '
     'topics that clear the threshold, then have Claude re-rank the survivors.'

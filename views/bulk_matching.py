@@ -84,7 +84,16 @@ def _load_topics(client: storage.Client, agencies: list[str]) -> pd.DataFrame:
         return pd.DataFrame()
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', FutureWarning)
-        return pd.concat(frames, ignore_index=True)
+        topics = pd.concat(frames, ignore_index=True)
+    # Notices marked archived by the SAM.gov revision check are no longer live.
+    # matching_job applies the same filter (jobs/matching_job.py), so without
+    # this the view's topic counts and filter preview overstate what the run
+    # will actually score.
+    if 'sam_status' in topics.columns:
+        topics = topics[
+            topics['sam_status'].fillna('').astype(str) != 'archived'
+        ].reset_index(drop=True)
+    return topics
 
 
 # ── Filter helpers ────────────────────────────────────────────────────────────
@@ -628,3 +637,11 @@ if st.session_state.bm_run_summary:
     c1.metric('Rows saved',       f'{summary["total_saved"]:,}')
     c2.metric('Total candidates', f'{summary["total_candidates"]:,}')
     c3.metric('Segments',         summary['segments'])
+
+
+# ── Next step ──────────────────────────────────────────────────────────────
+
+st.divider()
+st.caption('Next step')
+st.page_link('views/hubspot_import.py', label='HubSpot Import', icon='🔗')
+st.caption('Push a completed matching run into the CRM as company records.')

@@ -291,7 +291,7 @@ if 'fr_active_run' not in st.session_state:
 
 # ── Page ───────────────────────────────────────────────────────────────────
 
-st.title('🧪 Client Research')
+st.title('🧪 Deep Research')
 st.caption(
     'Run OpenAI Deep Research on client companies — financial diligence or '
     'technology/R&D profiling — then save the findings onto their client '

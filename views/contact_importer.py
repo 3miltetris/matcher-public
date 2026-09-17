@@ -255,7 +255,7 @@ for _k in ('ci_raw_df', 'ci_file_bytes', 'ci_file_ext', 'ci_deduped_df',
 
 # ── Page ───────────────────────────────────────────────────────────────────────
 
-st.title('📋 Contact Importer')
+st.title('👤 Import Contacts')
 st.caption(
     'Upload a lead spreadsheet (Apollo, SBA, or any source), map columns, '
     'scrape company websites, and add contacts to the matching database.'
@@ -681,3 +681,11 @@ if st.button('🚀 Start import job', type='primary', key='ci_trigger_btn',
     except Exception as e:
         st.error(f'Failed to start job: {e}')
         st.code(traceback.format_exc())
+
+
+# ── Next step ──────────────────────────────────────────────────────────────
+
+st.divider()
+st.caption('Next step')
+st.page_link('views/finance_researcher.py', label='Deep Research', icon='🧪')
+st.caption('Research the imported companies in depth — financials, or technology and R&D.')

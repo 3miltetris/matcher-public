@@ -64,7 +64,7 @@ if 'sug_submitted' not in st.session_state:
 
 # ── Page ───────────────────────────────────────────────────────────────────
 
-st.title('💡 Feature Suggestions')
+st.title('💡 Suggestions')
 st.caption('Have an idea? Submit it below and upvote the features you want to see built.')
 
 # ── Submit form ────────────────────────────────────────────────────────────

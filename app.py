@@ -54,34 +54,63 @@ if not st.session_state.get("authenticated"):
             st.error("Incorrect password.")
     st.stop()
 
-pages = [
-    st.Page("views/topic_importer.py", title="Topic Importer", icon="📄"),
-    st.Page("views/grant_search.py",   title="Grant Search",   icon="🔍"),
-    st.Page("views/bulk_matching.py",  title="Bulk Matching",  icon="⚙️"),
+# ── Navigation ─────────────────────────────────────────────────────────────
+# Grouped to mirror the pipeline: grant supply in, client demand in, match,
+# export. Several entries are parent pages that dispatch to one sub-view per
+# run (see views/grant_sources.py) — st.tabs cannot be used for those because
+# st.stop() unwinds the whole script run and would blank the other tabs.
+#
+# url_path is pinned on every page whose title changed, so retitling does not
+# break existing bookmarks.
 
-    st.Page("views/sam_gov_upload.py",    title="SAM.gov Upload",   icon="🏛️"),
-    st.Page("views/grants_gov_fetch.py", title="Grants.gov Fetch", icon="🏦"),
-    st.Page("views/funding_sources.py", title="Funding Sources", icon="🛰️"),
-    st.Page("views/hubspot_import.py", title="HubSpot Import", icon="🔗"),
-    st.Page("views/suggestions.py",    title="Suggestions",    icon="💡"),
-    st.Page("views/contact_importer.py", title="Contact Importer", icon="👤"),
-    st.Page("views/client_editor.py",    title="Client Editor",    icon="✏️"),
-    st.Page("views/finance_researcher.py", title="Client Research", icon="🧪"),
-    st.Page("views/client_profiler.py",  title="Client Profiles",  icon="🧩"),
-    st.Page("views/aspect_match.py",     title="Bulk Aspect Match", icon="🎯"),
-    st.Page("views/drive_sync.py",       title="Drive Sync",       icon="🗂️"),
-    st.Page("views/fathom_sync.py",      title="Fathom Meetings",  icon="🎙️"),
-    st.Page("views/resume_importer.py", title="Resume Importer",  icon="📄"),
-    st.Page("views/resume_search.py",   title="Resume Search",    icon="🔎"),
-    # Uncomment as pages are built:
-    # st.Page("views/matcher.py",          title="Matcher",          icon="🎯"),
-    # st.Page("views/match_history.py",    title="Match History",    icon="📊"),
-]
+pages = {
+    "": [
+        st.Page("views/home.py", title="Home", icon="🏠",
+                url_path="home", default=True),
+    ],
+    "Grants": [
+        st.Page("views/grant_sources.py", title="Grant Sources", icon="📥",
+                url_path="grant_sources"),
+        st.Page("views/grant_search.py", title="Grant Search", icon="🔍",
+                url_path="grant_search"),
+    ],
+    "Clients": [
+        st.Page("views/contact_importer.py", title="Import Contacts", icon="👤",
+                url_path="contact_importer"),
+        st.Page("views/client_editor.py", title="Client Records", icon="✏️",
+                url_path="client_editor"),
+        st.Page("views/finance_researcher.py", title="Deep Research", icon="🧪",
+                url_path="finance_researcher"),
+        st.Page("views/client_profiler.py", title="Capability Profiles", icon="🧩",
+                url_path="client_profiler"),
+        st.Page("views/client_sync.py", title="Client Sync", icon="🔄",
+                url_path="client_sync"),
+    ],
+    "Matching": [
+        st.Page("views/bulk_matching.py", title="Bulk Matching", icon="⚙️",
+                url_path="bulk_matching"),
+        st.Page("views/aspect_match.py", title="Aspect Match", icon="🎯",
+                url_path="aspect_match"),
+    ],
+    "Talent": [
+        st.Page("views/resumes.py", title="Resumes", icon="📇",
+                url_path="resumes"),
+    ],
+    "Export & admin": [
+        st.Page("views/hubspot_import.py", title="HubSpot Import", icon="🔗",
+                url_path="hubspot_import"),
+        st.Page("views/suggestions.py", title="Suggestions", icon="💡",
+                url_path="suggestions"),
+    ],
+}
 
 # Admin-only page — hidden from the navigation for everyone else. The page
 # guards itself too, so hiding it here is convenience, not the control.
 if ac.is_admin():
-    pages.append(st.Page("views/admin_portal.py", title="Admin Portal", icon="🛡️"))
+    pages["Export & admin"].append(
+        st.Page("views/admin_portal.py", title="Admin Portal", icon="🛡️",
+                url_path="admin_portal")
+    )
 
 if st.session_state.get("user_email"):
     st.sidebar.caption(

@@ -19,10 +19,10 @@ import pandas as pd
 import requests as req_lib
 import streamlit as st
 from google.cloud import storage
-from google.oauth2 import service_account
 from openai import OpenAI
 
 from src.modules.Embedding.text_embedder import TextProcessor
+import src.modules.ui_common as uc
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -65,10 +65,7 @@ def _detect_col(columns: list[str], field: str) -> str | None:
 # ── GCS ────────────────────────────────────────────────────────────────────
 
 def _get_storage_client() -> storage.Client:
-    creds = service_account.Credentials.from_service_account_info(
-        st.secrets['gcp_service_account']
-    )
-    return storage.Client(credentials=creds)
+    return uc.get_storage_client()
 
 
 def _load_existing_emails(client: storage.Client) -> set[str]:
@@ -247,277 +244,283 @@ def _run_summarization(rows: list[dict], openai_key: str, progress) -> list[dict
     return results
 
 
-# ── Session state ──────────────────────────────────────────────────────────
+# ── Page ──────────────────────────────────────────────────────────────────
+# Body lives in render() so this module can be dispatched to by a parent
+# page. Only one render() runs per script run, which is what keeps the
+# st.stop() calls below correct.
 
-for _k in ('ri_raw_df', 'ri_mapped_rows', 'ri_deduped_rows', 'ri_processed_rows',
-           'ri_email_col', 'ri_url_col'):
-    if _k not in st.session_state:
-        st.session_state[_k] = None
+def render():
+    # ── Session state ──────────────────────────────────────────────────────────
 
-
-# ── Page ───────────────────────────────────────────────────────────────────
-
-st.title('📄 Resume Importer')
-st.caption(
-    'Upload a HubSpot contacts export with a resume URL column → fetch + extract text → '
-    'GPT expertise summary → embed → save to GCS.'
-)
-
-# ── 1 · Upload ─────────────────────────────────────────────────────────────
-
-st.subheader('1 · Upload HubSpot CSV')
-uploaded = st.file_uploader(
-    'Upload CSV or Excel',
-    type=['csv', 'xlsx', 'xls'],
-    label_visibility='collapsed',
-)
-
-if uploaded:
-    try:
-        if uploaded.name.endswith(('.xlsx', '.xls')):
-            raw = pd.read_excel(uploaded, dtype=str)
-        else:
-            try:
-                raw = pd.read_csv(uploaded, dtype=str, encoding='utf-8')
-            except UnicodeDecodeError:
-                uploaded.seek(0)
-                raw = pd.read_csv(uploaded, dtype=str, encoding='latin-1')
-        raw = raw.dropna(how='all')
-
-        if (st.session_state.ri_raw_df is None
-                or len(raw) != len(st.session_state.ri_raw_df)):
-            st.session_state.ri_raw_df        = raw
-            st.session_state.ri_mapped_rows   = None
-            st.session_state.ri_deduped_rows  = None
-            st.session_state.ri_processed_rows = None
-    except Exception as e:
-        st.error(f'Could not read file: {e}')
-
-if st.session_state.ri_raw_df is None:
-    st.stop()
-
-df_raw = st.session_state.ri_raw_df
-st.caption(f'**{len(df_raw):,}** rows loaded.')
-st.dataframe(df_raw.head(5), hide_index=True, use_container_width=True)
-
-# ── 2 · Column mapping ─────────────────────────────────────────────────────
-
-st.divider()
-st.subheader('2 · Map columns')
-
-cols     = df_raw.columns.tolist()
-none_opt = '— none —'
-col_opts = [none_opt] + cols
-
-
-def _sel(field: str, label: str, required: bool = False) -> str | None:
-    detected = _detect_col(cols, field)
-    idx      = col_opts.index(detected) if detected in col_opts else 0
-    val      = st.selectbox(
-        label + (' *' if required else ''),
-        col_opts,
-        index=idx,
-        key=f'ri_map_{field}',
-    )
-    return val if val != none_opt else None
-
-
-mc1, mc2, mc3 = st.columns(3)
-with mc1:
-    m_email = _sel('email',      'Email',      required=True)
-    m_url   = _sel('resume_url', 'Resume URL', required=True)
-with mc2:
-    m_first = _sel('firstName', 'First name')
-    m_last  = _sel('lastName',  'Last name')
-with mc3:
-    m_phone = _sel('phone',   'Phone')
-    m_comp  = _sel('company', 'Company')
-
-if not m_email:
-    st.warning('Email column is required.')
-    st.stop()
-if not m_url:
-    st.warning('Resume URL column is required.')
-    st.stop()
-
-# Invalidate downstream state when key columns change
-if (st.session_state.ri_email_col is not None and (
-        st.session_state.ri_email_col != m_email
-        or st.session_state.ri_url_col != m_url)):
-    st.session_state.ri_mapped_rows   = None
-    st.session_state.ri_deduped_rows  = None
-    st.session_state.ri_processed_rows = None
-
-
-def _build_mapped_rows() -> list[dict]:
-    def _pick(col: str | None, row: pd.Series) -> str:
-        return str(row[col]).strip() if col and col in row.index else ''
-
-    rows = []
-    for _, row in df_raw.iterrows():
-        email = _pick(m_email, row).lower()
-        url   = _pick(m_url,   row)
-        if not email or not url:
-            continue
-        rows.append({
-            'email':      email,
-            'resume_url': url,
-            'firstName':  _pick(m_first, row),
-            'lastName':   _pick(m_last,  row),
-            'phone':      _pick(m_phone, row),
-            'company':    _pick(m_comp,  row),
-        })
-    return rows
-
-
-# ── 3 · Deduplicate ────────────────────────────────────────────────────────
-
-st.divider()
-st.subheader('3 · Deduplicate')
-
-if st.button('🔍 Check for duplicates', key='ri_dedup_btn'):
-    with st.spinner('Checking GCS for existing emails…'):
-        try:
-            mapped = _build_mapped_rows()
-            client  = _get_storage_client()
-            existing = _load_existing_emails(client)
-            new_rows = [r for r in mapped if r['email'] not in existing]
-            st.session_state.ri_mapped_rows   = mapped
-            st.session_state.ri_deduped_rows  = new_rows
-            st.session_state.ri_email_col     = m_email
-            st.session_state.ri_url_col       = m_url
-            st.session_state.ri_processed_rows = None
-            st.rerun()
-        except Exception as e:
-            st.error(f'Dedup check failed: {e}')
-
-if st.session_state.ri_deduped_rows is None:
-    mapped_preview = _build_mapped_rows()
-    st.caption(f'**{len(mapped_preview):,}** rows with email + URL. Click to check for duplicates.')
-    st.stop()
-
-deduped = st.session_state.ri_deduped_rows
-n_all   = len(st.session_state.ri_mapped_rows or [])
-n_exist = n_all - len(deduped)
-
-dm1, dm2, dm3 = st.columns(3)
-dm1.metric('Valid rows',     f'{n_all:,}')
-dm2.metric('Already stored', f'{n_exist:,}')
-dm3.metric('New to import',  f'{len(deduped):,}')
-
-if not deduped:
-    st.success('All contacts already stored — nothing to import.')
-    st.stop()
-
-# ── 4 · Fetch + Summarise ──────────────────────────────────────────────────
-
-st.divider()
-st.subheader('4 · Fetch resumes & generate expertise summaries')
-
-hs_token = st.secrets.get('hubspot_api_key', None)
-
-if st.session_state.ri_processed_rows is None:
-    if st.button('▶ Fetch & summarise', type='primary'):
-        oai_key = st.secrets['openai_api_key']
-
-        prog_fetch = st.progress(0, text='Fetching resumes…')
-        fetched    = _run_fetch_and_extract(deduped, hs_token, prog_fetch)
-        prog_fetch.empty()
-
-        statuses: dict[str, int] = {}
-        for r in fetched:
-            ft = r.get('file_type', 'unknown')
-            statuses[ft] = statuses.get(ft, 0) + 1
-        st.write('**Fetch results:**', statuses)
-
-        # Show a sample of failure reasons to diagnose auth/URL issues
-        failed_rows = [r for r in fetched if r.get('file_type') == 'fetch_failed']
-        if failed_rows:
-            with st.expander(f'Failure diagnostics (sample of {min(5, len(failed_rows))})'):
-                for r in failed_rows[:5]:
-                    st.markdown(f'**URL:** `{r.get("resume_url", "")[:120]}`')
-                    st.markdown(f'**Reason:** `{r.get("fetch_error", "unknown")}`')
-                    st.divider()
-
-        ok_rows = [r for r in fetched
-                   if len(str(r.get('resume_text', '')).strip()) >= _MIN_TEXT_LEN]
-        failed  = len(fetched) - len(ok_rows)
-        if failed:
-            st.warning(f'{failed} resume(s) could not be fetched or had no extractable text.')
-        if not ok_rows:
-            st.error('No resume text extracted — check URLs and try again.')
-            st.stop()
-
-        with st.expander(f'Preview extracted text ({len(ok_rows)} resumes) — verify before summarising'):
-            for r in ok_rows[:5]:
-                name = f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or r.get('email', '?')
-                st.markdown(f'**{name}** (`{r.get("file_type")}`)')
-                st.text(str(r.get('resume_text', ''))[:600])
-                st.divider()
-            if len(ok_rows) > 5:
-                st.caption(f'Showing 5 of {len(ok_rows)}.')
-
-        prog_sum   = st.progress(0, text='Summarising…')
-        summarised = _run_summarization(ok_rows, oai_key, prog_sum)
-        prog_sum.empty()
-
-        st.session_state.ri_processed_rows = summarised
-        st.rerun()
-    st.stop()  # wait for the button click before rendering steps 5+
-else:
-    summarised = st.session_state.ri_processed_rows
-
-proc_df = pd.DataFrame(summarised)
-preview_cols = [c for c in ['email', 'firstName', 'lastName', 'file_type', 'expertise_summary']
-                if c in proc_df.columns]
-st.dataframe(proc_df[preview_cols].head(20), use_container_width=True, hide_index=True)
-if len(proc_df) > 20:
-    st.caption(f'Showing 20 of {len(proc_df)} rows.')
-
-# ── 5 · Embed & save ───────────────────────────────────────────────────────
-
-st.divider()
-st.subheader('5 · Embed & save to GCS')
-
-if st.button('▶ Embed & save', type='primary'):
-    oai_key  = st.secrets['openai_api_key']
-    tp       = TextProcessor(api_key=oai_key)
-    embed_df = proc_df.copy()
-
-    prog = st.progress(0, text='Embedding…')
-    embeddings = []
-    total = len(embed_df)
-    for i, (_, row) in enumerate(embed_df.iterrows()):
-        text = str(row.get('expertise_summary') or '').strip()
-        embeddings.append(tp.get_embedding(text) if text else [])
-        prog.progress((i + 1) / total, text=f'Embedding… {i + 1}/{total}')
-    prog.empty()
-
-    embed_df['embeddings']   = embeddings
-    embed_df['processed_at'] = datetime.utcnow().date().isoformat()
-    embed_df['uuid']         = [str(uuid.uuid4()) for _ in range(len(embed_df))]
-    embed_df = embed_df.drop(columns=['resume_text'], errors='ignore')
-
-    ordered_cols = [c for c in [
-        'uuid', 'email', 'firstName', 'lastName', 'phone', 'company',
-        'resume_url', 'file_type', 'expertise_summary', 'embeddings', 'processed_at',
-    ] if c in embed_df.columns]
-    out_df = embed_df[ordered_cols]
-
-    date_str  = datetime.utcnow().strftime('%Y-%m-%d')
-    hex_str   = secrets.token_hex(3)
-    blob_path = f'{_RESUMES_PREFIX}resumes_{date_str}_{hex_str}.parquet'
-
-    try:
-        client = _get_storage_client()
-        buf    = io.BytesIO()
-        out_df.to_parquet(buf, index=False)
-        buf.seek(0)
-        blob = client.bucket(_BUCKET).blob(blob_path)
-        blob.upload_from_file(buf, content_type='application/octet-stream')
-        st.success(f'Saved {len(out_df):,} resumes → `{blob_path}`')
-        for _k in ('ri_raw_df', 'ri_mapped_rows', 'ri_deduped_rows', 'ri_processed_rows',
-                   'ri_email_col', 'ri_url_col'):
+    for _k in ('ri_raw_df', 'ri_mapped_rows', 'ri_deduped_rows', 'ri_processed_rows',
+               'ri_email_col', 'ri_url_col'):
+        if _k not in st.session_state:
             st.session_state[_k] = None
-    except Exception as e:
-        st.error(f'GCS upload failed: {e}')
+
+
+    # ── Page ───────────────────────────────────────────────────────────────────
+
+    st.title('📄 Resume Importer')
+    st.caption(
+        'Upload a HubSpot contacts export with a resume URL column → fetch + extract text → '
+        'GPT expertise summary → embed → save to GCS.'
+    )
+
+    # ── 1 · Upload ─────────────────────────────────────────────────────────────
+
+    st.subheader('1 · Upload HubSpot CSV')
+    uploaded = st.file_uploader(
+        'Upload CSV or Excel',
+        type=['csv', 'xlsx', 'xls'],
+        label_visibility='collapsed',
+    )
+
+    if uploaded:
+        try:
+            if uploaded.name.endswith(('.xlsx', '.xls')):
+                raw = pd.read_excel(uploaded, dtype=str)
+            else:
+                try:
+                    raw = pd.read_csv(uploaded, dtype=str, encoding='utf-8')
+                except UnicodeDecodeError:
+                    uploaded.seek(0)
+                    raw = pd.read_csv(uploaded, dtype=str, encoding='latin-1')
+            raw = raw.dropna(how='all')
+
+            if (st.session_state.ri_raw_df is None
+                    or len(raw) != len(st.session_state.ri_raw_df)):
+                st.session_state.ri_raw_df        = raw
+                st.session_state.ri_mapped_rows   = None
+                st.session_state.ri_deduped_rows  = None
+                st.session_state.ri_processed_rows = None
+        except Exception as e:
+            st.error(f'Could not read file: {e}')
+
+    if st.session_state.ri_raw_df is None:
+        st.stop()
+
+    df_raw = st.session_state.ri_raw_df
+    st.caption(f'**{len(df_raw):,}** rows loaded.')
+    st.dataframe(df_raw.head(5), hide_index=True, use_container_width=True)
+
+    # ── 2 · Column mapping ─────────────────────────────────────────────────────
+
+    st.divider()
+    st.subheader('2 · Map columns')
+
+    cols     = df_raw.columns.tolist()
+    none_opt = '— none —'
+    col_opts = [none_opt] + cols
+
+
+    def _sel(field: str, label: str, required: bool = False) -> str | None:
+        detected = _detect_col(cols, field)
+        idx      = col_opts.index(detected) if detected in col_opts else 0
+        val      = st.selectbox(
+            label + (' *' if required else ''),
+            col_opts,
+            index=idx,
+            key=f'ri_map_{field}',
+        )
+        return val if val != none_opt else None
+
+
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        m_email = _sel('email',      'Email',      required=True)
+        m_url   = _sel('resume_url', 'Resume URL', required=True)
+    with mc2:
+        m_first = _sel('firstName', 'First name')
+        m_last  = _sel('lastName',  'Last name')
+    with mc3:
+        m_phone = _sel('phone',   'Phone')
+        m_comp  = _sel('company', 'Company')
+
+    if not m_email:
+        st.warning('Email column is required.')
+        st.stop()
+    if not m_url:
+        st.warning('Resume URL column is required.')
+        st.stop()
+
+    # Invalidate downstream state when key columns change
+    if (st.session_state.ri_email_col is not None and (
+            st.session_state.ri_email_col != m_email
+            or st.session_state.ri_url_col != m_url)):
+        st.session_state.ri_mapped_rows   = None
+        st.session_state.ri_deduped_rows  = None
+        st.session_state.ri_processed_rows = None
+
+
+    def _build_mapped_rows() -> list[dict]:
+        def _pick(col: str | None, row: pd.Series) -> str:
+            return str(row[col]).strip() if col and col in row.index else ''
+
+        rows = []
+        for _, row in df_raw.iterrows():
+            email = _pick(m_email, row).lower()
+            url   = _pick(m_url,   row)
+            if not email or not url:
+                continue
+            rows.append({
+                'email':      email,
+                'resume_url': url,
+                'firstName':  _pick(m_first, row),
+                'lastName':   _pick(m_last,  row),
+                'phone':      _pick(m_phone, row),
+                'company':    _pick(m_comp,  row),
+            })
+        return rows
+
+
+    # ── 3 · Deduplicate ────────────────────────────────────────────────────────
+
+    st.divider()
+    st.subheader('3 · Deduplicate')
+
+    if st.button('🔍 Check for duplicates', key='ri_dedup_btn'):
+        with st.spinner('Checking GCS for existing emails…'):
+            try:
+                mapped = _build_mapped_rows()
+                client  = _get_storage_client()
+                existing = _load_existing_emails(client)
+                new_rows = [r for r in mapped if r['email'] not in existing]
+                st.session_state.ri_mapped_rows   = mapped
+                st.session_state.ri_deduped_rows  = new_rows
+                st.session_state.ri_email_col     = m_email
+                st.session_state.ri_url_col       = m_url
+                st.session_state.ri_processed_rows = None
+                st.rerun()
+            except Exception as e:
+                st.error(f'Dedup check failed: {e}')
+
+    if st.session_state.ri_deduped_rows is None:
+        mapped_preview = _build_mapped_rows()
+        st.caption(f'**{len(mapped_preview):,}** rows with email + URL. Click to check for duplicates.')
+        st.stop()
+
+    deduped = st.session_state.ri_deduped_rows
+    n_all   = len(st.session_state.ri_mapped_rows or [])
+    n_exist = n_all - len(deduped)
+
+    dm1, dm2, dm3 = st.columns(3)
+    dm1.metric('Valid rows',     f'{n_all:,}')
+    dm2.metric('Already stored', f'{n_exist:,}')
+    dm3.metric('New to import',  f'{len(deduped):,}')
+
+    if not deduped:
+        st.success('All contacts already stored — nothing to import.')
+        st.stop()
+
+    # ── 4 · Fetch + Summarise ──────────────────────────────────────────────────
+
+    st.divider()
+    st.subheader('4 · Fetch resumes & generate expertise summaries')
+
+    hs_token = st.secrets.get('hubspot_api_key', None)
+
+    if st.session_state.ri_processed_rows is None:
+        if st.button('▶ Fetch & summarise', type='primary'):
+            oai_key = st.secrets['openai_api_key']
+
+            prog_fetch = st.progress(0, text='Fetching resumes…')
+            fetched    = _run_fetch_and_extract(deduped, hs_token, prog_fetch)
+            prog_fetch.empty()
+
+            statuses: dict[str, int] = {}
+            for r in fetched:
+                ft = r.get('file_type', 'unknown')
+                statuses[ft] = statuses.get(ft, 0) + 1
+            st.write('**Fetch results:**', statuses)
+
+            # Show a sample of failure reasons to diagnose auth/URL issues
+            failed_rows = [r for r in fetched if r.get('file_type') == 'fetch_failed']
+            if failed_rows:
+                with st.expander(f'Failure diagnostics (sample of {min(5, len(failed_rows))})'):
+                    for r in failed_rows[:5]:
+                        st.markdown(f'**URL:** `{r.get("resume_url", "")[:120]}`')
+                        st.markdown(f'**Reason:** `{r.get("fetch_error", "unknown")}`')
+                        st.divider()
+
+            ok_rows = [r for r in fetched
+                       if len(str(r.get('resume_text', '')).strip()) >= _MIN_TEXT_LEN]
+            failed  = len(fetched) - len(ok_rows)
+            if failed:
+                st.warning(f'{failed} resume(s) could not be fetched or had no extractable text.')
+            if not ok_rows:
+                st.error('No resume text extracted — check URLs and try again.')
+                st.stop()
+
+            with st.expander(f'Preview extracted text ({len(ok_rows)} resumes) — verify before summarising'):
+                for r in ok_rows[:5]:
+                    name = f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or r.get('email', '?')
+                    st.markdown(f'**{name}** (`{r.get("file_type")}`)')
+                    st.text(str(r.get('resume_text', ''))[:600])
+                    st.divider()
+                if len(ok_rows) > 5:
+                    st.caption(f'Showing 5 of {len(ok_rows)}.')
+
+            prog_sum   = st.progress(0, text='Summarising…')
+            summarised = _run_summarization(ok_rows, oai_key, prog_sum)
+            prog_sum.empty()
+
+            st.session_state.ri_processed_rows = summarised
+            st.rerun()
+        st.stop()  # wait for the button click before rendering steps 5+
+    else:
+        summarised = st.session_state.ri_processed_rows
+
+    proc_df = pd.DataFrame(summarised)
+    preview_cols = [c for c in ['email', 'firstName', 'lastName', 'file_type', 'expertise_summary']
+                    if c in proc_df.columns]
+    st.dataframe(proc_df[preview_cols].head(20), use_container_width=True, hide_index=True)
+    if len(proc_df) > 20:
+        st.caption(f'Showing 20 of {len(proc_df)} rows.')
+
+    # ── 5 · Embed & save ───────────────────────────────────────────────────────
+
+    st.divider()
+    st.subheader('5 · Embed & save to GCS')
+
+    if st.button('▶ Embed & save', type='primary'):
+        oai_key  = st.secrets['openai_api_key']
+        tp       = TextProcessor(api_key=oai_key)
+        embed_df = proc_df.copy()
+
+        prog = st.progress(0, text='Embedding…')
+        embeddings = []
+        total = len(embed_df)
+        for i, (_, row) in enumerate(embed_df.iterrows()):
+            text = str(row.get('expertise_summary') or '').strip()
+            embeddings.append(tp.get_embedding(text) if text else [])
+            prog.progress((i + 1) / total, text=f'Embedding… {i + 1}/{total}')
+        prog.empty()
+
+        embed_df['embeddings']   = embeddings
+        embed_df['processed_at'] = datetime.utcnow().date().isoformat()
+        embed_df['uuid']         = [str(uuid.uuid4()) for _ in range(len(embed_df))]
+        embed_df = embed_df.drop(columns=['resume_text'], errors='ignore')
+
+        ordered_cols = [c for c in [
+            'uuid', 'email', 'firstName', 'lastName', 'phone', 'company',
+            'resume_url', 'file_type', 'expertise_summary', 'embeddings', 'processed_at',
+        ] if c in embed_df.columns]
+        out_df = embed_df[ordered_cols]
+
+        date_str  = datetime.utcnow().strftime('%Y-%m-%d')
+        hex_str   = secrets.token_hex(3)
+        blob_path = f'{_RESUMES_PREFIX}resumes_{date_str}_{hex_str}.parquet'
+
+        try:
+            client = _get_storage_client()
+            buf    = io.BytesIO()
+            out_df.to_parquet(buf, index=False)
+            buf.seek(0)
+            blob = client.bucket(_BUCKET).blob(blob_path)
+            blob.upload_from_file(buf, content_type='application/octet-stream')
+            st.success(f'Saved {len(out_df):,} resumes → `{blob_path}`')
+            for _k in ('ri_raw_df', 'ri_mapped_rows', 'ri_deduped_rows', 'ri_processed_rows',
+                       'ri_email_col', 'ri_url_col'):
+                st.session_state[_k] = None
+        except Exception as e:
+            st.error(f'GCS upload failed: {e}')

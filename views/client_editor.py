@@ -90,7 +90,7 @@ def _render_delete_report() -> None:
 
 # ── Page ───────────────────────────────────────────────────────────────────
 
-st.title('✏️ Client Editor')
+st.title('✏️ Client Records')
 st.caption(
     'Update the company summary for a client and re-embed it. '
     'The change is applied to every contact row of that company and '

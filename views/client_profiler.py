@@ -206,7 +206,7 @@ if 'cp_build_nonce' not in st.session_state:
 
 # ── Page ───────────────────────────────────────────────────────────────────
 
-st.title('🧩 Client Profiles')
+st.title('🧩 Capability Profiles')
 st.caption(
     'Split each client into independently searchable aspects — built from the '
     'website summary, Drive documents, and Deep Research already on their rows — '
@@ -1026,3 +1026,13 @@ if st.button(
     for _k in ('cp_del_keys', 'cp_del_confirm'):
         st.session_state.pop(_k, None)
     st.rerun()
+
+
+# ── Next step ──────────────────────────────────────────────────────────────
+# Renders only when the page runs to completion; the guards above st.stop()
+# on every path where there is nothing to hand on to.
+
+st.divider()
+st.caption('Next step')
+st.page_link('views/aspect_match.py', label='Aspect Match', icon='🎯')
+st.caption('Score these profiles against grant topics, per capability or per market.')
