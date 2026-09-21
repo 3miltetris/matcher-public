@@ -342,7 +342,7 @@ opt_l, opt_r = st.columns([2, 3])
 
 with opt_l:
     target_aspects = st.slider(
-        'Target aspects per client', ap.MIN_ASPECTS, ap.MAX_ASPECTS, 4,
+        'Target aspects per client', ap.MIN_ASPECTS, ap.MAX_ASPECTS, 8,
         help='Claude aims for this many and may return one fewer or a couple more '
              'depending on how much distinct material a client has.',
     )

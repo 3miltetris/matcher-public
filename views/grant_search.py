@@ -50,6 +50,10 @@ _TOPICS_PREFIX = 'data/all-topics/processed/'
 # them up by accident. Searching them here is opt-in, per search.
 _AWARDS_PREFIX = 'data/all-topics/awards/'
 
+# Agency folders that exist in the store but are off by default — niche sources
+# the team opts into rather than searches every time.
+_DEFAULT_OFF_AGENCIES = {'DEFENSE PATENT HOLIDAY', 'TECHCONNECT'}
+
 # Search modes
 _MODE_DESC    = '📝 Technology description'
 _MODE_PROFILE = '🧬 Capability profile'
@@ -464,7 +468,9 @@ if qs2.button('Deselect all', key='gs_agency_none'):
 cols = st.columns(min(len(agencies), 6))
 selected = [
     agency for i, agency in enumerate(agencies)
-    if cols[i % len(cols)].checkbox(agency, value=True, key=f'gs_agency_{agency}')
+    if cols[i % len(cols)].checkbox(
+        agency, value=agency not in _DEFAULT_OFF_AGENCIES, key=f'gs_agency_{agency}'
+    )
 ]
 
 _award_sources = _list_award_sources()
@@ -750,7 +756,7 @@ else:
         with st.expander('Profile options', expanded=False):
             p1, p2, p3 = st.columns(3)
             target_aspects = p1.slider(
-                'Target aspects', ap.MIN_ASPECTS, ap.MAX_ASPECTS, 4, key='gs_notes_aspects',
+                'Target aspects', ap.MIN_ASPECTS, ap.MAX_ASPECTS, 8, key='gs_notes_aspects',
                 help='The prompt aims for this ±2, and returns fewer rather than '
                      'padding when the material does not support more.',
             )
@@ -767,7 +773,7 @@ else:
                      'DoD relationship or an active pursuit of one.',
             )
             assess_unexplored = q2.checkbox(
-                'Assess unexplored markets', value=False, key='gs_notes_unexplored',
+                'Assess unexplored markets', value=True, key='gs_notes_unexplored',
                 help='A second Claude call inferring markets the company does NOT serve '
                      'but could extend into. Roughly doubles build time.',
             )
