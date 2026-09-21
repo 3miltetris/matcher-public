@@ -360,6 +360,31 @@ SOURCES: list[dict] = [
 SOURCE_KEYS   = [s['key'] for s in SOURCES]
 SOURCE_LABELS = {s['key']: s['label'] for s in SOURCES}
 
+# Material that does not come off a client row at all: text a user pastes into
+# the Grant Search view to profile a company we hold no records for. It is not
+# in SOURCES because nothing can extract it from a contact row - it only ever
+# arrives as a caller-supplied block - but it is embedded, fingerprinted and
+# stored exactly like any other source, so a profile built from it is a normal
+# profile and `sources_used` says honestly where it came from.
+NOTES_SOURCE_KEY   = 'notes'
+NOTES_SOURCE_LABEL = 'Pasted notes and source material'
+NOTES_CAP          = 24000
+
+EXTRA_SOURCE_LABELS = {NOTES_SOURCE_KEY: NOTES_SOURCE_LABEL}
+
+
+def source_label(key: str) -> str:
+    """Display label for any source key, client-row or caller-supplied."""
+    return SOURCE_LABELS.get(key) or EXTRA_SOURCE_LABELS.get(key) or str(key)
+
+
+def notes_source_texts(notes: str) -> dict[str, str]:
+    """The {source_key: text} mapping for pasted material, ready for
+    build_aspect_user_message() and source_fingerprint()."""
+    text = _s(notes)
+    return {NOTES_SOURCE_KEY: _cap(text, NOTES_CAP)} if text else {}
+
+
 
 def assemble_source_texts(row, keys: list[str] | None = None) -> dict[str, str]:
     """{source_key: capped source text} for every source with material.
@@ -502,6 +527,12 @@ def build_aspect_user_message(company: dict, source_texts: dict[str, str]) -> st
     for key in SOURCE_KEYS:
         if key in source_texts:
             parts.append(f'=== SOURCE: {SOURCE_LABELS[key]} ===\n{source_texts[key]}')
+    # Anything the caller supplied that is not one of the client-row sources -
+    # pasted notes, today. Kept out of the loop above so client material always
+    # leads, in the fixed SOURCES order.
+    for key, text in source_texts.items():
+        if key not in SOURCE_LABELS and _s(text):
+            parts.append(f'=== SOURCE: {source_label(key)} ===\n{text}')
     return '\n\n'.join(parts)
 
 

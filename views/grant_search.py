@@ -2,11 +2,32 @@
 Grant Search
 ------------
 Cosine-similarity search across grant topics stored in GCS.
-Select agencies, apply keyword filters, describe your technology, and find matching grants.
+
+Select agencies, apply keyword filters, then search one of two ways:
+
+  Technology description — embed a paragraph and rank topics against it.
+  Capability profile     — score ONE company's multi-aspect profile against the
+                           selected topics, exactly as Bulk Aspect Match does
+                           for the whole directory.
+
+The profile can come from the client store (data/client-profiles/profiles.parquet)
+or be built here and now from pasted notes — a call, a deck, a capability
+statement, anything the team has about a company we may hold no records for.
+A profile built from notes is a normal profile: same prompt, same aspect and
+market structure, same embeddings, and it can be saved into the client profile
+store so Client Profiles, Bulk Aspect Match and HubSpot Import all see it.
+
+This replaces the old "multi-aspect search", which decomposed the query text
+into 2-4 required dimensions and demanded every one of them clear the
+threshold. That answered a different question — it narrowed one description —
+whereas a company's aspects are alternative capabilities, any one of which
+matching is a real hit. The scoring here is the shared implementation in
+src/modules/aspect_matching.py, so a single-company search and a directory-wide
+run rank the same pair identically.
 """
 
 import io
-import json
+import traceback
 from datetime import date, datetime, timedelta
 
 import anthropic
@@ -16,8 +37,9 @@ import streamlit as st
 from google.cloud import storage
 from google.oauth2 import service_account
 
+import src.modules.aspect_matching as am
+import src.modules.aspect_profile as ap
 from src.modules.Embedding.text_embedder import TextProcessor
-from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 from src.modules.grant_utils import normalize_grant_columns
 
 # ── GCS ────────────────────────────────────────────────────────────────────
@@ -27,6 +49,23 @@ _TOPICS_PREFIX = 'data/all-topics/processed/'
 # Past awards live outside processed/ so nothing enumerating agencies can pick
 # them up by accident. Searching them here is opt-in, per search.
 _AWARDS_PREFIX = 'data/all-topics/awards/'
+
+# Search modes
+_MODE_DESC    = '📝 Technology description'
+_MODE_PROFILE = '🧬 Capability profile'
+
+# Where a capability profile comes from
+_SRC_CLIENT = '👤 Existing client profile'
+_SRC_NOTES  = '📋 Paste notes or source material'
+
+# Match scope within one profile
+_SCOPE_ALL    = 'All aspects (whole company)'
+_SCOPE_MARKET = 'By market'
+
+# Enough pasted text to be worth a Claude call. Below this the model has
+# nothing to split into aspects and will pad, which is the one failure mode
+# the aspect prompt is written to avoid.
+_MIN_NOTES_CHARS = 200
 
 
 def _get_storage_client() -> storage.Client:
@@ -160,151 +199,233 @@ def _similarity_search(df: pd.DataFrame, query_embedding: list[float], threshold
     )
 
 
-def _decompose_query(query_text: str, anth_client: anthropic.Anthropic) -> list[str]:
-    system = (
-        'You are a scientific query analyzer for a government grant matching system.\n'
-        'Decompose the technology description into 2–4 distinct required dimensions.\n'
-        'Each dimension must be an independent necessary condition for a grant to be relevant.\n'
-        'If the query is single-dimensional, return exactly one item.\n'
-        'Rules:\n'
-        '- Each dimension must be independently searchable (not a restatement of another)\n'
-        '- Keep each concise (5–15 words)\n'
-        '- Return ONLY a JSON array of strings, no other text\n\n'
-        'Example:\n'
-        'Query: "gene therapy delivery platform for long-term diabetes remission"\n'
-        'Output: ["gene therapy viral vector delivery platform", '
-        '"diabetes treatment metabolic disease insulin remission"]'
-    )
-    try:
-        response = anth_client.messages.create(
-            model='claude-haiku-4-5-20251001',
-            max_tokens=200,
+# ── Building a profile from pasted notes ───────────────────────────────────
+
+def _claude_json(anth: anthropic.Anthropic, model: str, system: str, user_msg: str, parse):
+    """One Claude call with one strict-JSON retry, parsed by `parse`.
+
+    Same contract as client_profile_job._claude_json — a truncated response is
+    a hard error rather than a half-parsed profile. No temperature: the
+    anthropic 1.x SDK removed it, and passing it raises a local TypeError."""
+    last_err = None
+    for attempt in range(2):
+        content = user_msg if attempt == 0 else (
+            user_msg + '\n\nYour previous response was not valid JSON. '
+                       'Return ONLY the valid JSON object.'
+        )
+        resp = anth.messages.create(
+            model=model,
+            max_tokens=6000,
             system=system,
-            messages=[{'role': 'user', 'content': f'Query: "{query_text}"'}],
+            messages=[{'role': 'user', 'content': content}],
         )
-        raw = response.content[0].text.strip()
-        # Strip markdown code fences if Claude adds them
-        if raw.startswith('```'):
-            raw = raw.split('```')[1]
-            if raw.startswith('json'):
-                raw = raw[4:]
-            raw = raw.strip()
-        parsed = json.loads(raw)
-        if (
-            isinstance(parsed, list)
-            and 1 <= len(parsed) <= 4
-            and all(isinstance(a, str) and a.strip() for a in parsed)
-        ):
-            return [a.strip() for a in parsed]
-        st.warning(
-            f'Aspect decomposition returned unexpected format — running standard search. '
-            f'(Response: `{raw[:200]}`)'
-        )
-    except anthropic.APIError as e:
-        st.warning(f'Claude API error during decomposition — running standard search. ({e})')
-    except json.JSONDecodeError as e:
-        st.warning(
-            f'Could not parse Claude response as JSON — running standard search. '
-            f'(Error: {e}; Raw: `{raw[:200]}`)'
-        )
-    except Exception as e:
-        st.warning(f'Aspect decomposition failed — running standard search. ({type(e).__name__}: {e})')
-    return [query_text]
-
-
-def _embed_aspects(aspects: list[str], tp: TextProcessor) -> list[list[float]]:
-    return [tp.get_embedding(a) for a in aspects]
-
-
-def _multi_aspect_search(
-    df: pd.DataFrame,
-    aspect_embeddings: list[list[float]],
-    threshold: float,
-) -> pd.DataFrame:
-    result = df.copy()
-    aspect_cols = []
-    for i, emb in enumerate(aspect_embeddings):
-        vec = np.array(emb)
-        col = f'aspect_{i + 1}_score'
-        aspect_cols.append(col)
-
-        def score(e, v=vec):
-            try:
-                return float(np.dot(np.array(e), v))
-            except Exception:
-                return 0.0
-
-        result[col] = result['embeddings'].apply(score)
-
-    result['min_aspect_score'] = result[aspect_cols].min(axis=1)
-    mask = result[aspect_cols].ge(threshold).all(axis=1)
-    return (
-        result[mask]
-        .sort_values('min_aspect_score', ascending=False)
-        .reset_index(drop=True)
-    )
-
-
-def _llm_rerank(
-    results: pd.DataFrame,
-    query_text: str,
-    anth_client: anthropic.Anthropic,
-    top_n: int,
-    progress,
-) -> pd.DataFrame:
-    system = (
-        'You are evaluating how well a government grant topic matches a technology description.\n'
-        'Score the match from 1 to 5:\n'
-        '5 = Perfect match — all key requirements align\n'
-        '4 = Strong match — most requirements align, minor gaps\n'
-        '3 = Moderate match — some alignment, notable gaps\n'
-        '2 = Weak match — superficial connection only\n'
-        '1 = No match\n\n'
-        'Also provide a one-sentence rationale.\n'
-        'Return ONLY valid JSON: {"score": <integer 1-5>, "rationale": "<one sentence>"}'
-    )
-    subset = results.head(top_n).copy()
-    total = len(subset)
-    scores = []
-    rationales = []
-    for i, (_, row) in enumerate(subset.iterrows()):
-        grant_text = row.get('grant_summary', '')
+        if resp.stop_reason == 'max_tokens':
+            raise ValueError('Claude hit the output token limit')
         try:
-            resp = anth_client.messages.create(
-                model='claude-haiku-4-5-20251001',
-                max_tokens=150,
-                system=system,
-                messages=[{
-                    'role': 'user',
-                    'content': f'Technology: {query_text}\n\nGrant: {grant_text}',
-                }],
-            )
-            parsed = json.loads(resp.content[0].text.strip())
-            scores.append(int(parsed.get('score', 3)))
-            rationales.append(str(parsed.get('rationale', '')))
-        except Exception:
-            scores.append(3)
-            rationales.append('(scoring unavailable)')
-        progress.progress((i + 1) / total)
+            return parse(resp.content[0].text)
+        except ValueError as e:
+            last_err = e
+    raise ValueError(f'invalid response twice: {last_err}')
 
-    subset['llm_score'] = scores
-    subset['llm_rationale'] = rationales
-    return (
-        subset[subset['llm_score'] >= 2]
-        .sort_values(['llm_score', 'min_aspect_score'], ascending=[False, False])
-        .reset_index(drop=True)
+
+def _build_profile_from_notes(
+    *,
+    company_name: str,
+    website: str,
+    state: str,
+    notes: str,
+    target_aspects: int,
+    max_markets: int,
+    assess_defense: bool,
+    assess_unexplored: bool,
+    max_unexplored: int,
+    model: str,
+) -> tuple[dict, list[str]]:
+    """(profile record, warnings). Mirrors client_profile_job's per-client build
+    so a profile made here is indistinguishable from one the job wrote — same
+    prompt, same merges, same normalisation, same record shape."""
+    warnings: list[str] = []
+    texts = ap.notes_source_texts(notes)
+    if not texts:
+        raise ValueError('nothing to profile')
+
+    anth = anthropic.Anthropic(api_key=st.secrets['anthropic_api_key'])
+    tp   = TextProcessor(api_key=st.secrets['openai_api_key'])
+
+    parsed = _claude_json(
+        anth, model,
+        ap.build_aspect_system(target_aspects, max_markets, assess_defense),
+        ap.build_aspect_user_message(
+            {'company_name': company_name, 'website': website, 'state': state}, texts
+        ),
+        ap.parse_aspect_response,
     )
+    summary = parsed['profile_summary']
+    aspects = parsed['aspects']
+    markets = parsed['markets']
+
+    vectors = [tp.get_embedding(ap.aspect_embed_text(a)) for a in aspects]
+    # Fold near-identical aspects together BEFORE market membership is re-derived,
+    # so no market is left pointing at an aspect that was merged away.
+    aspects, vectors, merges = ap.merge_similar_aspects(
+        aspects, vectors, ap.ASPECT_MERGE_THRESHOLD
+    )
+    warnings += [f'Merged near-identical aspects: {m}' for m in merges]
+
+    market_vectors = [tp.get_embedding(ap.market_embed_text(m)) for m in markets]
+    if markets:
+        aspects, markets, market_vectors = ap.merge_similar_markets(
+            aspects, markets, market_vectors, ap.MARKET_MERGE_THRESHOLD
+        )
+        by_name = {m['market']: v for m, v in zip(markets, market_vectors)}
+        aspects, markets = ap.normalize_markets(aspects, markets, max_markets)
+        market_vectors = [by_name[m['market']] for m in markets]
+
+    # Pass 2 — markets the company does NOT serve. Additive and separately
+    # guarded: a failure here must never discard the pass-1 work above, which
+    # cost a Claude call and every embedding.
+    unexplored, unexplored_vectors = [], []
+    if assess_unexplored:
+        try:
+            unexplored = _claude_json(
+                anth, model,
+                ap.build_unexplored_system(max_unexplored),
+                ap.build_unexplored_user_message(
+                    {'company_name': company_name, 'website': website, 'state': state},
+                    summary, aspects, markets,
+                    # stated_intentions() reads notable_updates off client rows;
+                    # pasted notes have no such structure, so there are none.
+                    [],
+                ),
+                lambda raw: ap.parse_unexplored_response(
+                    raw, markets, aspects, max_unexplored
+                ),
+            )
+            unexplored_vectors = [
+                tp.get_embedding(ap.market_embed_text(m)) for m in unexplored
+            ]
+        except Exception as e:
+            unexplored, unexplored_vectors = [], []
+            warnings.append(
+                f'Unexplored-market pass failed ({type(e).__name__}: {e}) — the '
+                'profile is complete apart from its unexplored markets.'
+            )
+
+    record = ap.build_profile_record(
+        company_key     = ap.company_key(
+            {'company_name': company_name, 'companyWebsite': website}
+        ),
+        company_name    = company_name,
+        website         = website,
+        profile_summary = summary,
+        aspects         = aspects,
+        vectors         = vectors,
+        sources_used    = list(texts.keys()),
+        # Over the pasted material only — it is all this profile was built from,
+        # which is exactly what a later staleness check should compare against.
+        fingerprint     = ap.source_fingerprint(texts),
+        model           = model,
+        markets         = markets,
+        market_vectors  = market_vectors,
+        unexplored         = unexplored,
+        unexplored_vectors = unexplored_vectors,
+        dod_assessment  = parsed['dod_assessment'],
+    )
+    return record, warnings
 
 
-def _clear_aspect_widgets(n: int) -> None:
-    """Remove stale aspect widget keys so they reinitialise from value= on next render."""
-    for j in range(n + 5):
-        st.session_state.pop(f'gs_asp_{j}', None)
+# ── Profile display ────────────────────────────────────────────────────────
+
+def _profile_row(record) -> pd.Series:
+    """One profile as a row the shared matcher can read. A record built here and
+    a row loaded from profiles.parquet are the same shape, so both paths below
+    converge on this."""
+    return record if isinstance(record, pd.Series) else pd.Series(record)
+
+
+def _render_profile(prof: pd.Series) -> None:
+    aspects    = ap.profile_aspects(prof)
+    markets    = ap.profile_markets(prof)
+    unexplored = ap.profile_unexplored(prof)
+
+    if str(prof.get('profile_summary') or '').strip():
+        st.markdown(f'**{prof.get("company_name") or "—"}** — {prof["profile_summary"]}')
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric('Aspects', len(aspects))
+    c2.metric('Markets', len(markets))
+    c3.metric('Unexplored markets', len(unexplored))
+
+    with st.expander(f'Aspects ({len(aspects)})', expanded=False):
+        if aspects:
+            st.dataframe(
+                pd.DataFrame([{
+                    'Label':    a.get('label', ''),
+                    'Kind':     a.get('kind', ''),
+                    'Markets':  ', '.join(a.get('markets') or []) if isinstance(a.get('markets'), list)
+                                else str(a.get('markets') or ''),
+                    'Text':     a.get('text', ''),
+                    'Keywords': a.get('keywords', ''),
+                } for a in aspects]),
+                width='stretch', hide_index=True,
+            )
+        else:
+            st.caption('No aspects — this profile cannot be matched.')
+
+    if markets:
+        with st.expander(f'Markets ({len(markets)})', expanded=False):
+            st.dataframe(
+                pd.DataFrame([{
+                    'Tier':      ap.tier_ordinal(ap.market_tier_rank(m)),
+                    'Market':    m.get('market', ''),
+                    'Subtitle':  m.get('subtitle', ''),
+                    'Narrative': m.get('narrative', ''),
+                } for m in markets]),
+                width='stretch', hide_index=True,
+            )
+    if unexplored:
+        with st.expander(f'Unexplored markets ({len(unexplored)})', expanded=False):
+            st.caption(
+                'Markets this company does **not** serve, inferred from its aspects. '
+                'Matched by a different question — "could they plausibly extend into '
+                'this?" — and every result row says which kind it came from.'
+            )
+            st.dataframe(
+                pd.DataFrame([{
+                    'Tier':      ap.tier_ordinal(ap.market_tier_rank(m)),
+                    'Market':    m.get('market', ''),
+                    'Subtitle':  m.get('subtitle', ''),
+                    'Narrative': m.get('narrative', ''),
+                    'Gap':       m.get('rationale', ''),
+                } for m in unexplored]),
+                width='stretch', hide_index=True,
+            )
+    if str(prof.get('dod_assessment') or '').strip():
+        st.caption(f'**Defense assessment:** {prof["dod_assessment"]}')
+
+
+def _unit_options(prof: pd.Series) -> dict[str, am.Unit]:
+    """{display label: Unit} for every market of one profile, confirmed and
+    unexplored. The kind travels with the index because it selects which flat
+    embedding block the index points into."""
+    out: dict[str, am.Unit] = {}
+    for kind, market, i in am.unit_markets(prof, [am.ROW_CONFIRMED, am.ROW_UNEXPLORED]):
+        label = ap.market_label(market)
+        if kind == am.ROW_UNEXPLORED:
+            label += ' · unexplored'
+        out[label] = am.Unit(prof, market, i, kind)
+    return out
 
 
 # ── Session state ──────────────────────────────────────────────────────────
 
-for _k in ['gs_topics_df', 'gs_results_df', 'gs_aspects', 'gs_search_mode', 'gs_results_aspects']:
+for _k in [
+    'gs_topics_df', 'gs_results_df',        # description-mode search
+    'gs_profiles',                           # the client profile store
+    'gs_profile', 'gs_profile_origin',       # the profile being matched
+    'gs_profile_warnings', 'gs_profile_saved',
+    'gs_match_results', 'gs_match_meta',     # profile-mode search
+]:
     if _k not in st.session_state:
         st.session_state[_k] = None
 if 'gs_filters' not in st.session_state:
@@ -314,7 +435,10 @@ if 'gs_filters' not in st.session_state:
 # ── Page ───────────────────────────────────────────────────────────────────
 
 st.title('🔍 Grant Search')
-st.caption('Search grant topics by cosine similarity to your technology description.')
+st.caption(
+    'Search grant topics by cosine similarity — against a description you type, '
+    'or against one company’s capability profile.'
+)
 
 # ── Section 1 · Agency selection ───────────────────────────────────────────
 
@@ -366,12 +490,10 @@ if st.button('Load Topics', type='primary', disabled=not selected):
     if df.empty:
         st.warning('No topics found for the selected agencies.')
     else:
-        st.session_state.gs_topics_df = normalize_grant_columns(df)
-        st.session_state.gs_results_df = None
-        st.session_state.gs_aspects = None
-        st.session_state.gs_search_mode = None
-        st.session_state.gs_results_aspects = None
-        _clear_aspect_widgets(10)
+        st.session_state.gs_topics_df     = normalize_grant_columns(df)
+        st.session_state.gs_results_df    = None
+        st.session_state.gs_match_results = None
+        st.session_state.gs_match_meta    = None
         _n_awards = int((df.get('record_kind') == 'award').sum()) if 'record_kind' in df.columns else 0
         st.success(
             f'Loaded **{len(df) - _n_awards:,}** open topics'
@@ -455,204 +577,529 @@ st.dataframe(
     hide_index=True,
 )
 
-# ── Section 3 · Similarity search ──────────────────────────────────────────
+# ── Section 3 · Search ─────────────────────────────────────────────────────
 
 st.divider()
-st.subheader('3 · Technology search')
+st.subheader('3 · Search')
 
-# ── Mode and options ────────────────────────────────────────────────────────
+search_mode = st.radio(
+    'Search by', [_MODE_DESC, _MODE_PROFILE],
+    horizontal=True, key='gs_search_mode',
+    help=(
+        'A description is embedded as one vector and ranked directly. A '
+        'capability profile splits one company into several independently '
+        'embedded aspects, so a topic that matches any one capability is found '
+        '— which a single blended vector averages away.'
+    ),
+)
 
-mode_col, thresh_col = st.columns([3, 1])
-with mode_col:
-    multi_aspect = st.checkbox(
-        'Multi-aspect search (recommended for complex queries)',
-        value=True,
-        help=(
-            'Decomposes your description into independent required dimensions. '
-            'A grant must score above the threshold on ALL dimensions — '
-            'prevents partial-match results where only one topic area matches.'
-        ),
+# ═══ Mode A · Technology description ═══════════════════════════════════════
+
+if search_mode == _MODE_DESC:
+    threshold = st.slider('Similarity threshold', 0.0, 1.0, 0.75, 0.01, key='gs_desc_threshold')
+
+    tech_text = st.text_area(
+        'Technology description',
+        height=120,
+        key='gs_tech_text',
+        placeholder='Describe the technology or capability you want to match against grant topics…',
     )
 
-with thresh_col:
-    threshold = st.slider('Similarity threshold', 0.0, 1.0, 0.75, 0.01)
-
-llm_rerank = False
-rerank_top_n = 20
-if multi_aspect:
-    rr_col, rn_col = st.columns([3, 1])
-    with rr_col:
-        llm_rerank = st.checkbox(
-            'LLM re-ranking (slower, more accurate — top results only)',
-            value=False,
-            help='After aspect filtering, Claude scores each surviving grant 1–5 for relevance.',
-        )
-    if llm_rerank:
-        with rn_col:
-            rerank_top_n = st.number_input('Re-rank top N', min_value=5, max_value=50, value=20)
-
-# Clear stale results when mode changes
-current_mode = 'multi' if multi_aspect else 'single'
-if st.session_state.gs_search_mode is not None and st.session_state.gs_search_mode != current_mode:
-    st.session_state.gs_results_df = None
-    st.session_state.gs_aspects = None
-    st.session_state.gs_results_aspects = None
-    _clear_aspect_widgets(10)
-st.session_state.gs_search_mode = current_mode
-
-# ── Query input ────────────────────────────────────────────────────────────
-
-tech_text = st.text_area(
-    'Technology description',
-    height=120,
-    placeholder='Describe the technology or capability you want to match against grant topics…',
-)
-
-query_too_short = len(tech_text.strip().split()) < 5
-
-# ── Phase 1: Decompose (multi-aspect only) ─────────────────────────────────
-
-if multi_aspect and not query_too_short:
-    if st.button('Decompose query into aspects', disabled=not tech_text.strip()):
-        with st.spinner('Identifying key aspects with Claude…'):
-            anth_client = anthropic.Anthropic(api_key=st.secrets['anthropic_api_key'])
-            aspects = _decompose_query(tech_text.strip(), anth_client)
-        _clear_aspect_widgets(10)
-        st.session_state.gs_aspects = aspects
-        st.session_state.gs_results_df = None
-        st.session_state.gs_results_aspects = None
-
-    if st.session_state.gs_aspects is not None:
-        st.markdown('**Edit aspects before searching** — each must score above threshold independently:')
-
-        current_aspects = st.session_state.gs_aspects
-        edited_aspects = []
-        for i, asp in enumerate(current_aspects):
-            a_col, btn_col = st.columns([10, 1])
-            val = a_col.text_input(
-                f'Aspect {i + 1}',
-                value=asp,
-                key=f'gs_asp_{i}',
-            )
-            edited_aspects.append(val)
-            if btn_col.button('✕', key=f'gs_asp_rm_{i}', disabled=len(current_aspects) == 1):
-                # Read all widget states (including aspects not yet rendered in this pass)
-                all_vals = [
-                    st.session_state.get(f'gs_asp_{j}', current_aspects[j])
-                    for j in range(len(current_aspects))
-                ]
-                _clear_aspect_widgets(len(current_aspects))
-                st.session_state.gs_aspects = [v for j, v in enumerate(all_vals) if j != i]
-                st.rerun()
-
-        # Sync edits back (only updates; no auto-removal of empties)
-        st.session_state.gs_aspects = edited_aspects
-
-        if st.button('+ Add aspect'):
-            _clear_aspect_widgets(len(edited_aspects))
-            st.session_state.gs_aspects = edited_aspects + ['']
-            st.rerun()
-
-elif multi_aspect and query_too_short:
-    st.info('Query is too short for aspect decomposition — will run standard single-aspect search.')
-
-# ── Phase 2: Search ────────────────────────────────────────────────────────
-
-aspects_filled = (
-    st.session_state.gs_aspects is not None
-    and all(a.strip() for a in st.session_state.gs_aspects)
-    and len(st.session_state.gs_aspects) > 0
-)
-aspects_ready = not multi_aspect or query_too_short or aspects_filled
-search_disabled = not tech_text.strip() or not aspects_ready
-
-if st.button('🔍 Search', type='primary', disabled=search_disabled):
-    tp = TextProcessor(api_key=st.secrets['openai_api_key'])
-
-    if multi_aspect and not query_too_short and aspects_filled:
-        aspects_to_use = st.session_state.gs_aspects
-        with st.spinner(f'Embedding {len(aspects_to_use)} aspect(s)…'):
-            aspect_embeddings = _embed_aspects(aspects_to_use, tp)
-        with st.spinner('Scoring topics against all aspects…'):
-            results = _multi_aspect_search(filtered, aspect_embeddings, threshold)
-
-        if llm_rerank and not results.empty:
-            anth_client = anthropic.Anthropic(api_key=st.secrets['anthropic_api_key'])
-            prog = st.progress(0, text='LLM re-ranking…')
-            results = _llm_rerank(results, tech_text.strip(), anth_client, rerank_top_n, prog)
-            prog.empty()
-
-        st.session_state.gs_results_df = results
-        st.session_state.gs_results_aspects = aspects_to_use
-    else:
+    if st.button('🔍 Search', type='primary', disabled=not tech_text.strip()):
+        tp = TextProcessor(api_key=st.secrets['openai_api_key'])
         with st.spinner('Generating embedding…'):
             query_embedding = tp.get_embedding(tech_text.strip())
         with st.spinner('Scoring topics…'):
-            results = _similarity_search(filtered, query_embedding, threshold)
-        st.session_state.gs_results_df = results
-        st.session_state.gs_results_aspects = None
+            st.session_state.gs_results_df = _similarity_search(
+                filtered, query_embedding, threshold
+            )
 
-# ── Results ────────────────────────────────────────────────────────────────
+    if st.session_state.gs_results_df is not None:
+        results = st.session_state.gs_results_df
+        if results.empty:
+            st.warning(
+                f'No topics above **{threshold}** similarity threshold. Try lowering it, '
+                'or search by capability profile instead — a profile scores each '
+                'capability separately rather than blending them into one vector.'
+            )
+        else:
+            st.success(f'**{len(results):,}** topics matched.')
 
-if st.session_state.gs_results_df is not None:
-    results = st.session_state.gs_results_df
-    used_aspects = st.session_state.gs_results_aspects
+            primary_cols = ['similarity_score']
+            # Surface award/solicitation up front rather than leaving it buried among
+            # the trailing columns — a past award read as an open opportunity is the
+            # one mistake this whole separation exists to prevent.
+            if 'record_kind' in results.columns and (results['record_kind'] == 'award').any():
+                primary_cols = ['record_kind'] + primary_cols
+            other_cols  = [c for c in results.columns
+                           if c not in primary_cols and c != 'embeddings']
+            result_cols = primary_cols + other_cols
 
-    if results.empty:
+            col_cfg: dict = {
+                'similarity_score': st.column_config.NumberColumn('Score', format='%.4f'),
+            }
+            if 'record_kind' in result_cols:
+                col_cfg['record_kind'] = st.column_config.TextColumn('Kind', width='small')
+
+            st.dataframe(
+                results[result_cols],
+                width='stretch', hide_index=True, column_config=col_cfg,
+            )
+            st.download_button(
+                '⬇ Download CSV',
+                results[result_cols].to_csv(index=False).encode('utf-8'),
+                file_name=f'grant_search_{datetime.now():%Y-%m-%d_%H-%M-%S}.csv',
+                mime='text/csv',
+            )
+
+# ═══ Mode B · Capability profile ═══════════════════════════════════════════
+
+else:
+    profile_source = st.radio(
+        'Profile source', [_SRC_CLIENT, _SRC_NOTES],
+        horizontal=True, key='gs_profile_source',
+    )
+
+    # ── 3a · Pick or build the profile ─────────────────────────────────────
+
+    if profile_source == _SRC_CLIENT:
+        st.markdown('**Select a client capability profile**')
+
+        load_col, refresh_col = st.columns([4, 1])
+        if st.session_state.gs_profiles is None:
+            with st.spinner('Loading client profiles…'):
+                try:
+                    st.session_state.gs_profiles = ap.load_profiles(_get_storage_client())
+                except Exception as e:
+                    st.error(f'Could not load {ap.PROFILES_BLOB}: {e}')
+                    st.session_state.gs_profiles = ap.empty_profiles_df()
+        if refresh_col.button('↻ Reload', key='gs_profiles_reload'):
+            st.session_state.gs_profiles = None
+            st.rerun()
+
+        profiles: pd.DataFrame = st.session_state.gs_profiles
+        if profiles.empty:
+            st.info(
+                'No client profiles yet. Build them in **Capability Profiles**, or '
+                'paste notes above to profile a company ad hoc.'
+            )
+        else:
+            query = load_col.text_input(
+                'Search clients', key='gs_profile_query',
+                placeholder='Type part of a company name, website or market…',
+            ).strip().lower()
+
+            haystack = (
+                profiles['company_name'].fillna('').astype(str) + ' ' +
+                profiles['companyWebsite'].fillna('').astype(str) + ' ' +
+                profiles['market_labels'].fillna('').astype(str) + ' ' +
+                profiles['aspect_labels'].fillna('').astype(str)
+            ).str.lower()
+            matches = profiles[haystack.str.contains(query, na=False)] if query else profiles
+
+            if matches.empty:
+                st.warning(f'No profile matches “{query}”.')
+            else:
+                labels = {
+                    f'{r["company_name"]} — {int(r["n_aspects"] or 0)} aspects, '
+                    f'{int(r["n_markets"] or 0)} markets': r['company_key']
+                    for _, r in matches.iterrows()
+                }
+                st.caption(f'**{len(matches):,}** of {len(profiles):,} profiles match.')
+                picked_label = st.selectbox(
+                    'Client', list(labels), key='gs_profile_pick',
+                )
+                picked_key = labels[picked_label]
+                row = profiles[profiles['company_key'] == picked_key]
+                if not row.empty:
+                    chosen = row.iloc[0]
+                    # Switching client clears any results ranked against the old one.
+                    prev = st.session_state.gs_profile
+                    if prev is None or str(_profile_row(prev).get('company_key')) != str(picked_key) \
+                            or st.session_state.gs_profile_origin != 'client':
+                        st.session_state.gs_match_results = None
+                        st.session_state.gs_match_meta    = None
+                    st.session_state.gs_profile          = chosen
+                    st.session_state.gs_profile_origin   = 'client'
+                    st.session_state.gs_profile_warnings = None
+                    st.session_state.gs_profile_saved    = True
+
+    else:  # paste notes
+        st.markdown('**Build a capability profile from your own notes**')
+        st.caption(
+            'Paste anything describing what the company does — call notes, a '
+            'capability statement, a deck, website copy. Claude splits it into '
+            'independently searchable aspects and the markets they serve, exactly '
+            'as the Capability Profiles job does for a client. Everything is '
+            'grounded in what you paste; nothing is invented.'
+        )
+
+        n1, n2, n3 = st.columns([2, 2, 1])
+        notes_name    = n1.text_input('Company name', key='gs_notes_name',
+                                      placeholder='Acme Robotics')
+        notes_website = n2.text_input('Website', key='gs_notes_site',
+                                      placeholder='https://acme.com')
+        notes_state   = n3.text_input('State', key='gs_notes_state', placeholder='TX')
+
+        notes = st.text_area(
+            'Notes / source material', height=260, key='gs_notes_text',
+            placeholder='Paste notes, a capability statement, meeting notes, product '
+                        'descriptions…',
+        )
+
+        with st.expander('Profile options', expanded=False):
+            p1, p2, p3 = st.columns(3)
+            target_aspects = p1.slider(
+                'Target aspects', ap.MIN_ASPECTS, ap.MAX_ASPECTS, 4, key='gs_notes_aspects',
+                help='The prompt aims for this ±2, and returns fewer rather than '
+                     'padding when the material does not support more.',
+            )
+            max_markets = p2.slider(
+                'Max markets', 1, ap.MAX_MARKETS, 4, key='gs_notes_markets',
+                help='Defense does not count towards this cap.',
+            )
+            model = p3.selectbox('Model', ap.ASPECT_MODELS, index=0, key='gs_notes_model')
+
+            q1, q2 = st.columns(2)
+            assess_defense = q1.checkbox(
+                'Assess Defense market', value=True, key='gs_notes_defense',
+                help='Adds a Defense market only when the material evidences an actual '
+                     'DoD relationship or an active pursuit of one.',
+            )
+            assess_unexplored = q2.checkbox(
+                'Assess unexplored markets', value=False, key='gs_notes_unexplored',
+                help='A second Claude call inferring markets the company does NOT serve '
+                     'but could extend into. Roughly doubles build time.',
+            )
+            max_unexplored = st.slider(
+                'Max unexplored markets', 1, ap.MAX_UNEXPLORED, ap.MAX_UNEXPLORED,
+                key='gs_notes_max_unexplored', disabled=not assess_unexplored,
+            )
+
+        notes_ready = len(notes.strip()) >= _MIN_NOTES_CHARS
+        if notes.strip() and not notes_ready:
+            st.caption(
+                f'{len(notes.strip())}/{_MIN_NOTES_CHARS} characters — paste a bit more '
+                'before building; too little material makes the model pad.'
+            )
+
+        if st.button('🧬 Build capability profile', type='primary', disabled=not notes_ready):
+            try:
+                with st.spinner('Claude is reading the material and splitting it into aspects…'):
+                    record, warns = _build_profile_from_notes(
+                        company_name      = notes_name.strip() or 'Untitled company',
+                        website           = notes_website.strip(),
+                        state             = notes_state.strip(),
+                        notes             = notes,
+                        target_aspects    = int(target_aspects),
+                        max_markets       = int(max_markets),
+                        assess_defense    = bool(assess_defense),
+                        assess_unexplored = bool(assess_unexplored),
+                        max_unexplored    = int(max_unexplored),
+                        model             = model,
+                    )
+                st.session_state.gs_profile          = record
+                st.session_state.gs_profile_origin   = 'notes'
+                st.session_state.gs_profile_warnings = warns
+                st.session_state.gs_profile_saved    = False
+                st.session_state.gs_match_results    = None
+                st.session_state.gs_match_meta       = None
+                st.rerun()
+            except Exception as e:
+                st.error(f'Profile build failed: {e}')
+                st.code(traceback.format_exc())
+
+    # ── The profile in hand ────────────────────────────────────────────────
+
+    if st.session_state.gs_profile is None:
+        st.info('Pick a client profile or build one from notes to search with.')
+        st.stop()
+
+    prof = _profile_row(st.session_state.gs_profile)
+    from_notes = st.session_state.gs_profile_origin == 'notes'
+
+    st.divider()
+    st.markdown(
+        '#### Capability profile'
+        + (' · built from pasted notes' if from_notes else ' · from the client store')
+    )
+    _render_profile(prof)
+
+    for warn in (st.session_state.gs_profile_warnings or []):
+        st.warning(warn)
+
+    # ── Save an ad-hoc profile into the client store ───────────────────────
+
+    if from_notes:
+        with st.expander(
+            '💾 Save as a client capability profile',
+            expanded=not st.session_state.gs_profile_saved,
+        ):
+            st.caption(
+                'Writes this profile into `data/client-profiles/profiles.parquet`, the '
+                'same store the Capability Profiles view edits and Bulk Aspect Match '
+                'and HubSpot Import read. It does **not** create client contact rows — '
+                'import those separately if this company becomes a client.'
+            )
+            s1, s2 = st.columns(2)
+            save_name = s1.text_input(
+                'Company name', value=str(prof.get('company_name') or ''),
+                key='gs_save_name',
+            ).strip()
+            save_site = s2.text_input(
+                'Website', value=str(prof.get('companyWebsite') or ''),
+                key='gs_save_site',
+            ).strip()
+
+            save_key = ap.company_key(
+                {'company_name': save_name, 'companyWebsite': save_site}
+            )
+            if st.session_state.gs_profiles is None:
+                try:
+                    st.session_state.gs_profiles = ap.load_profiles(_get_storage_client())
+                except Exception:
+                    st.session_state.gs_profiles = ap.empty_profiles_df()
+            existing = st.session_state.gs_profiles
+            collides = (
+                not existing.empty
+                and 'company_key' in existing.columns
+                and (existing['company_key'] == save_key).any()
+            )
+            if collides:
+                st.warning(
+                    f'**{save_name}** already has a profile — saving replaces it, '
+                    'including any aspects edited by hand in Capability Profiles.'
+                )
+
+            if not (save_name and save_site):
+                st.caption(
+                    'Both a name and a website are needed: together they form the '
+                    '`company_key` every other view joins profiles on.'
+                )
+            if st.button(
+                '💾 Save profile', key='gs_save_profile',
+                disabled=not (save_name and save_site),
+            ):
+                try:
+                    record = dict(prof)
+                    record['company_key']    = save_key
+                    record['company_name']   = save_name
+                    record['companyWebsite'] = save_site
+                    record['built_at']       = date.today().isoformat()
+                    gcs    = _get_storage_client()
+                    # Re-read rather than trusting the session copy: another
+                    # session may have written a profile since this page loaded.
+                    latest = ap.load_profiles(gcs)
+                    merged = ap.upsert_profiles(latest, [record])
+                    ap.save_profiles(gcs, merged)
+                    st.session_state.gs_profiles      = merged
+                    st.session_state.gs_profile       = pd.Series(record)
+                    st.session_state.gs_profile_saved = True
+                    st.success(
+                        f'Saved — **{save_name}** now has a capability profile with '
+                        f'{int(record["n_aspects"] or 0)} aspect(s) and '
+                        f'{int(record["n_markets"] or 0)} market(s).'
+                    )
+                except Exception as e:
+                    st.error(f'Save failed: {e}')
+                    st.code(traceback.format_exc())
+
+    # ── 3b · Match settings ────────────────────────────────────────────────
+
+    st.divider()
+    st.markdown('#### Match this profile against the filtered topics')
+
+    scope = st.radio(
+        'Scope', [_SCOPE_ALL, _SCOPE_MARKET], horizontal=True, key='gs_match_scope',
+        help=(
+            'Whole company scores every aspect at once. By market scores each market '
+            'on its own — its earmarked aspects plus the market narrative — so a '
+            'defense story is ranked on its own terms instead of averaged in.'
+        ),
+    )
+
+    unit_options = _unit_options(prof)
+    units: list[am.Unit] = []
+    if scope == _SCOPE_ALL:
+        units = [am.Unit(prof, None, -1, '')]
+    elif not unit_options:
         st.warning(
-            f'No topics above **{threshold}** similarity threshold.'
-            + (' Try lowering the threshold, simplifying your query, or editing the aspects.' if used_aspects else '')
+            'This profile has no markets — rebuild it in Capability Profiles, or '
+            'search the whole company instead.'
         )
     else:
-        st.success(f'**{len(results):,}** topics matched.')
-
-        if used_aspects:
-            with st.expander(f'Aspects used in search ({len(used_aspects)})', expanded=False):
-                for i, asp in enumerate(used_aspects, 1):
-                    st.markdown(f'**Aspect {i}:** {asp}')
-
-        aspect_score_cols = [c for c in results.columns if c.startswith('aspect_') and c.endswith('_score')]
-        if used_aspects and aspect_score_cols:
-            primary_cols = ['min_aspect_score'] + aspect_score_cols
-        else:
-            primary_cols = ['similarity_score']
-
-        if 'llm_score' in results.columns:
-            primary_cols = ['llm_score', 'llm_rationale'] + primary_cols
-
-        # Surface award/solicitation up front rather than leaving it buried among the
-        # trailing columns — a past award read as an open opportunity is the one
-        # mistake this whole separation exists to prevent.
-        if 'record_kind' in results.columns and (results['record_kind'] == 'award').any():
-            primary_cols = ['record_kind'] + primary_cols
-
-        other_cols = [
-            c for c in results.columns
-            if c not in primary_cols and c != 'embeddings'
-        ]
-        result_cols = primary_cols + other_cols
-
-        col_cfg: dict = {}
-        if 'record_kind' in result_cols:
-            col_cfg['record_kind'] = st.column_config.TextColumn('Kind', width='small')
-        if 'similarity_score' in result_cols:
-            col_cfg['similarity_score'] = st.column_config.NumberColumn('Score', format='%.4f')
-        if 'min_aspect_score' in result_cols:
-            col_cfg['min_aspect_score'] = st.column_config.NumberColumn('Min Aspect Score', format='%.4f')
-        if 'llm_score' in result_cols:
-            col_cfg['llm_score'] = st.column_config.NumberColumn('LLM Score', format='%d')
-        if 'llm_rationale' in result_cols:
-            col_cfg['llm_rationale'] = st.column_config.TextColumn('Rationale')
-        if used_aspects:
-            for i, asp in enumerate(used_aspects, 1):
-                col_key = f'aspect_{i}_score'
-                if col_key in result_cols:
-                    label = f'A{i}: {asp[:25]}…' if len(asp) > 25 else f'A{i}: {asp}'
-                    col_cfg[col_key] = st.column_config.NumberColumn(label, format='%.4f')
-
-        st.dataframe(
-            results[result_cols],
-            width='stretch',
-            hide_index=True,
-            column_config=col_cfg,
+        picked = st.multiselect(
+            'Markets', list(unit_options), default=list(unit_options),
+            key='gs_match_markets',
         )
+        units = [unit_options[p] for p in picked]
+
+    n_aspects = int(prof.get('n_aspects') or 0)
+    o1, o2, o3 = st.columns(3)
+    threshold = o1.slider('Aspect similarity threshold', 0.60, 0.95, 0.78, 0.01,
+                          key='gs_match_threshold')
+    min_hits  = o2.number_input(
+        'Aspects that must clear it', min_value=1, max_value=max(1, n_aspects),
+        value=1, step=1, key='gs_match_min_hits',
+        help='1 = any single capability matching is enough (recommended — the '
+             'company’s aspects are different capabilities, not requirements of one '
+             'query). The market narrative does not count towards it.',
+    )
+    top_k = o3.number_input(
+        'Top topics per market' if scope == _SCOPE_MARKET else 'Top topics',
+        min_value=1, max_value=200, value=25, step=5, key='gs_match_top_k',
+    )
+
+    r1, r2, r3 = st.columns(3)
+    do_rerank    = r1.checkbox('LLM re-rank', value=True, key='gs_match_rerank')
+    rerank_model = r2.selectbox('Re-rank model', am.RERANK_MODELS, index=0,
+                                disabled=not do_rerank, key='gs_match_rerank_model')
+    min_llm      = r3.number_input('Keep LLM score ≥', min_value=1, max_value=5, value=3,
+                                   step=1, disabled=not do_rerank, key='gs_match_min_llm')
+
+    if do_rerank and units:
+        st.caption(
+            f'Up to **{len(units) * int(top_k):,}** re-rank calls '
+            f'({len(units)} unit{"s" if len(units) != 1 else ""} × top {int(top_k)}), '
+            f'{am.CONCURRENCY} at a time. Identical pairs are scored once and shared.'
+        )
+
+    run = st.button(
+        '🎯 Match profile', type='primary',
+        disabled=not units or filtered.empty,
+    )
+
+    # ── Run ────────────────────────────────────────────────────────────────
+
+    if run:
+        # st.stop() raises, so it must not be used inside this handler — every
+        # failure path reports and falls through to the results section.
+        try:
+            with st.spinner('Preparing topic vectors…'):
+                topic_matrix, topic_meta = am.stack_topic_embeddings(filtered)
+
+            if topic_matrix.shape[0] == 0:
+                st.error('None of the filtered topics carry a usable embedding.')
+            else:
+                if len(topic_meta) < len(filtered):
+                    st.warning(
+                        f'{len(filtered) - len(topic_meta):,} topic(s) skipped — '
+                        'missing or malformed embedding.'
+                    )
+
+                prog = st.progress(0.0, text='Scoring…')
+                candidates, skipped = am.match_units(
+                    units, topic_matrix, topic_meta,
+                    float(threshold), int(min_hits), int(top_k),
+                    lambda frac, text: prog.progress(frac, text=text),
+                )
+                prog.empty()
+                del topic_matrix
+
+                for msg in skipped:
+                    st.warning(msg)
+
+                unscored, failures, reranked = 0, {}, False
+                results = candidates
+                if not candidates.empty and do_rerank:
+                    rr_prog = st.progress(0.0, text='LLM re-ranking…')
+                    results = am.run_rerank(
+                        candidates, st.secrets['anthropic_api_key'], rerank_model,
+                        lambda done, total: rr_prog.progress(
+                            done / total, text=f'LLM re-ranking {done}/{total}…'
+                        ),
+                    )
+                    rr_prog.empty()
+                    unscored = int((results['llm_score'] == 0).sum())
+                    # A pair scores 0 only when the call failed or the answer was
+                    # unparseable. Without this, a re-ranker outage looks exactly
+                    # like "nothing matched".
+                    failures = (
+                        results.loc[results['llm_score'] == 0, 'llm_rationale']
+                        .astype(str).value_counts().head(5).to_dict()
+                    )
+                    reranked = True
+                    results  = results[results['llm_score'] >= int(min_llm)]
+                    results  = results.sort_values(
+                        ['llm_score', 'aspect_score'], ascending=[False, False]
+                    )
+                elif not candidates.empty:
+                    results = candidates.sort_values('aspect_score', ascending=False)
+
+                st.session_state.gs_match_results = results.reset_index(drop=True)
+                st.session_state.gs_match_meta = {
+                    'client':     str(prof.get('company_name') or ''),
+                    'threshold':  float(threshold),
+                    'min_hits':   int(min_hits),
+                    'top_k':      int(top_k),
+                    'units':      len(units),
+                    'scope':      scope,
+                    'topics':     len(topic_meta),
+                    'candidates': len(candidates),
+                    'reranked':   reranked,
+                    'unscored':   unscored,
+                    'failures':   failures,
+                    'min_llm':    int(min_llm) if reranked else None,
+                }
+        except Exception as e:
+            st.error(f'Match failed: {e}')
+            st.code(traceback.format_exc())
+
+    # ── Results ────────────────────────────────────────────────────────────
+
+    if st.session_state.gs_match_results is not None:
+        results = st.session_state.gs_match_results
+        meta    = st.session_state.gs_match_meta or {}
+
+        if results.empty:
+            # Two very different causes, and they need different fixes: nothing
+            # cleared the similarity threshold, or the re-ranker scored/failed
+            # everything below the minimum. An unscored pair is stored as 0,
+            # which is below every selectable minimum, so a re-ranker outage
+            # silently filters away an entire run.
+            st.warning(
+                f'No topics cleared {meta.get("threshold")} on at least '
+                f'{meta.get("min_hits")} aspect(s) across '
+                f'{meta.get("topics", 0):,} topics.'
+                if not meta.get('candidates')
+                else f'Similarity scoring found {meta.get("candidates"):,} candidate(s), '
+                     f'but none scored {meta.get("min_llm")} or above — they were '
+                     'dropped during re-ranking, not by the similarity threshold.'
+            )
+            if meta.get('unscored'):
+                st.error(
+                    f'{meta["unscored"]:,} pair(s) could not be scored at all and were '
+                    'stored as 0, which is below every usable minimum.'
+                )
+                for reason, count in (meta.get('failures') or {}).items():
+                    st.caption(f'· {count}× {reason}')
+        else:
+            st.success(
+                f'**{len(results):,}** topic(s) for **{meta.get("client", "")}** '
+                f'from {meta.get("candidates", 0):,} candidate(s) across '
+                f'{meta.get("units", 0)} unit(s).'
+            )
+            if meta.get('unscored'):
+                st.warning(
+                    f'{meta["unscored"]:,} pair(s) could not be scored and were '
+                    'excluded — not the same as scoring low.'
+                )
+
+            display = am.display_frame(results)
+            st.dataframe(
+                display, width='stretch', hide_index=True,
+                column_config={
+                    'aspect_score': st.column_config.NumberColumn('Aspect score', format='%.4f'),
+                    'llm_score':    st.column_config.NumberColumn('LLM score', format='%d'),
+                    'market_kind':  st.column_config.TextColumn('Kind', width='small'),
+                },
+            )
+            st.download_button(
+                '⬇ Download CSV',
+                display.to_csv(index=False).encode('utf-8'),
+                file_name=(
+                    f'aspect_search_{meta.get("client", "profile").replace(" ", "_")}'
+                    f'_{datetime.now():%Y-%m-%d_%H-%M-%S}.csv'
+                ),
+                mime='text/csv',
+            )

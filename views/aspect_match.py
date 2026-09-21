@@ -36,23 +36,18 @@ is in flight. Results are held in session state, downloadable as CSV, and
 written to aspect-match-results/{run_id}/results.csv in GCS.
 """
 
-import asyncio
 import io
-import json
-import random
-import re
 import traceback
 import warnings
-from collections import namedtuple
 from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from anthropic import AsyncAnthropic
 from google.cloud import storage
 from google.oauth2 import service_account
 
+import src.modules.aspect_matching as am
 import src.modules.aspect_profile as ap
 from src.modules.grant_utils import normalize_grant_columns
 
@@ -62,9 +57,7 @@ _BUCKET         = ap.BUCKET
 _TOPICS_PREFIX  = 'data/all-topics/processed/'
 _RESULTS_PREFIX = 'aspect-match-results/'
 
-_RERANK_MODELS = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6']
-_CONCURRENCY   = 15
-_MAX_RETRIES   = 5
+_RERANK_MODELS = am.RERANK_MODELS
 _CONFIRM_PAIRS = 2500   # above this many re-rank calls, require a confirmation
 
 # Match modes
@@ -83,24 +76,14 @@ _CATEGORY_ALL    = 'All categories'
 # Stored on every result row, and what the re-rank prompt selection keys off.
 # There is no separate 'Defense only' scope any more: category='Defense' already
 # did that, and the old scope existed only to bypass the category filter.
-_ROW_CONFIRMED  = 'confirmed'
-_ROW_UNEXPLORED = 'unexplored'
+_ROW_CONFIRMED  = am.ROW_CONFIRMED
+_ROW_UNEXPLORED = am.ROW_UNEXPLORED
 _KIND_ROWS      = {
     _KIND_CONFIRMED:  [_ROW_CONFIRMED],
     _KIND_UNEXPLORED: [_ROW_UNEXPLORED],
     _KIND_BOTH:       [_ROW_CONFIRMED, _ROW_UNEXPLORED],
 }
 
-# One scoring subject: a whole company (market None, kind ''), or one market of
-# one company. `mi` indexes that market's narrative vector inside the profile's
-# flat market_embeddings / unexplored_embeddings block.
-_Unit = namedtuple('_Unit', 'prof market mi kind')
-
-# Topic columns carried into the results, when present.
-_TOPIC_COLS = [
-    'topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'close_date',
-    'open_date', 'funding_amount', 'grant_summary', 'source',
-]
 
 
 # ── GCS ────────────────────────────────────────────────────────────────────
@@ -202,459 +185,24 @@ def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
     return df[mask]
 
 
-# ── Scoring ────────────────────────────────────────────────────────────────
+# ── Scoring + re-rank ──────────────────────────────────────────────────────────────────────
 
-def _stack_topic_embeddings(df: pd.DataFrame) -> tuple[np.ndarray, pd.DataFrame]:
-    """(T, dim) float32 matrix + the topic rows it corresponds to. Rows with a
-    missing or wrong-length vector are dropped."""
-    keep, vecs = [], []
-    for idx, emb in df['embeddings'].items():
-        if isinstance(emb, (list, np.ndarray)) and len(emb) == ap.EMBED_DIM:
-            keep.append(idx)
-            vecs.append(np.asarray(emb, dtype=np.float32))
-    if not vecs:
-        return np.zeros((0, ap.EMBED_DIM), dtype=np.float32), df.iloc[0:0]
-    meta = df.loc[keep].drop(columns=['embeddings'], errors='ignore').reset_index(drop=True)
-    return np.vstack(vecs), meta
-
-
-def _unit_markets(prof, kinds: list[str]) -> list[tuple[str, dict, int]]:
-    """(kind, market, index-into-its-vector-block) for one profile, restricted
-    to the requested kinds. The index is positional within the kind's own flat
-    embedding block, which is why the kind has to travel with it."""
-    out: list[tuple[str, dict, int]] = []
-    if _ROW_CONFIRMED in kinds:
-        out += [(_ROW_CONFIRMED, m, i)
-                for i, m in enumerate(ap.profile_markets(prof))]
-    if _ROW_UNEXPLORED in kinds:
-        out += [(_ROW_UNEXPLORED, m, i)
-                for i, m in enumerate(ap.profile_unexplored(prof))]
-    return out
-
-
-def _market_counts(selected: pd.DataFrame, kinds: list[str]) -> dict[str, int]:
-    """Canonical market name → how many of the selected clients have it, across
-    the requested kinds."""
-    counts: dict[str, int] = {}
-    for _, prof in selected.iterrows():
-        names = {str(m.get('market') or '') for _k, m, _i in _unit_markets(prof, kinds)}
-        for name in names:
-            if name:
-                counts[name] = counts.get(name, 0) + 1
-    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
-
-
-def _tier_counts(selected: pd.DataFrame, kinds: list[str]) -> dict[int, int]:
-    """Tier rank → how many markets of the selected clients sit at it. Drives
-    the tier picker, so it only ever offers ranks that exist."""
-    counts: dict[int, int] = {}
-    for _, prof in selected.iterrows():
-        for _k, market, _i in _unit_markets(prof, kinds):
-            rank = ap.market_tier_rank(market)
-            counts[rank] = counts.get(rank, 0) + 1
-    return dict(sorted(counts.items()))
-
-
-def _plan_units(
-    selected: pd.DataFrame,
-    by_market: bool,
-    kinds: list[str],
-    tiers: set[int],
-    category: str,
-) -> tuple[list[_Unit], list[str]]:
-    """One _Unit per scoring subject.
-
-    Whole-company mode gives one unit per client (market None). Market mode
-    gives one unit per (client, kind, market) surviving the tier and category
-    filters — each is scored, capped and re-ranked as if it were its own
-    company. Cheap enough to call on every rerun for the run-size estimate.
-
-    An empty `tiers` means every tier, matching how _CATEGORY_ALL behaves — a
-    deselect-everything state would otherwise silently plan zero units."""
-    plan: list[_Unit] = []
-    skipped: list[str] = []
-
-    for _, prof in selected.iterrows():
-        if not by_market:
-            plan.append(_Unit(prof, None, -1, ''))
-            continue
-
-        if _ROW_CONFIRMED in kinds and not ap.profile_markets(prof):
-            skipped.append(
-                f'{prof["company_name"]}: profile has no markets — rebuild it in '
-                'Client Profiles to match it by market'
-            )
-        if _ROW_UNEXPLORED in kinds and not ap.profile_unexplored(prof):
-            skipped.append(
-                f'{prof["company_name"]}: profile has no unexplored markets — '
-                'rebuild it in Client Profiles with "Assess unexplored markets" on'
-            )
-
-        for kind, market, i in _unit_markets(prof, kinds):
-            name = str(market.get('market') or '')
-            if tiers and ap.market_tier_rank(market) not in tiers:
-                continue
-            if category != _CATEGORY_ALL and name != category:
-                continue
-            plan.append(_Unit(prof, market, i, kind))
-
-    return plan, skipped
-
-
-def _match_units(
-    plan: list[_Unit],
-    topic_matrix: np.ndarray,
-    topic_meta: pd.DataFrame,
-    threshold: float,
-    min_hits: int,
-    top_k: int,
-    progress=None,
-) -> tuple[pd.DataFrame, list[str]]:
-    """Candidate (unit, topic) rows: a topic qualifies for a unit when at least
-    `min_hits` of the unit's *aspect* vectors clear `threshold`; the top `top_k`
-    per unit by best score are kept. A confirmed market unit carries its
-    earmarked aspect vectors plus the market narrative vector, which for Defense
-    is the only place the DoD framing exists.
-
-    An unexplored market unit carries its narrative vector and nothing else.
-    Scoring the confirmed aspect vectors under it would mostly return the topics
-    its confirmed markets already returned, and _rerank_groups would then share
-    one score between two different framings of the same (client, topic, aspect)
-    pair — written from whichever framing happened to come first."""
-    meta_cols = [c for c in _TOPIC_COLS if c in topic_meta.columns]
-    # Materialised once — .iloc[ti] per candidate builds a Series per row and
-    # dominates the loop on large runs.
-    meta_records = topic_meta[meta_cols].to_dict('records')
-    rows: list[dict] = []
-    skipped: list[str] = []
-    total = len(plan)
-
-    # A client appears once per market, so unpack its stored vectors once.
-    aspect_cache: dict[str, tuple] = {}
-    market_cache: dict[str, np.ndarray] = {}
-    unexp_cache:  dict[str, np.ndarray] = {}
-
-    for n, (prof, market, mi, kind) in enumerate(plan, 1):
-        client = str(prof['company_name'])
-        label  = f'{client} · {market["market"]}' if market else client
-        if kind == _ROW_UNEXPLORED:
-            label += ' (unexplored)'
-        if progress is not None:
-            progress.progress(n / total, text=f'Scoring {label} ({n}/{total})')
-
-        key = str(prof['company_key'])
-        if key not in aspect_cache:
-            aspect_cache[key] = (ap.profile_aspects(prof), ap.unpack_embeddings(prof))
-        aspects, matrix = aspect_cache[key]
-
-        if matrix.shape[0] == 0 or len(aspects) != matrix.shape[0]:
-            skipped.append(f'{client}: profile has no usable aspect vectors — rebuild it')
-            continue
-
-        if market is None:
-            unit_aspects, unit_matrix = aspects, matrix
-            n_aspect_vecs = unit_matrix.shape[0]
-        elif kind == _ROW_UNEXPLORED:
-            # Narrative-only by design (see the docstring). The narrative is the
-            # whole hypothesis, so it is also the only thing worth scoring.
-            if key not in unexp_cache:
-                unexp_cache[key] = ap.unpack_unexplored_embeddings(prof)
-            unexp_vectors = unexp_cache[key]
-            if not 0 <= mi < unexp_vectors.shape[0]:
-                skipped.append(
-                    f'{label}: unexplored market has no narrative vector — '
-                    'rebuild the profile'
-                )
-                continue
-            unit_aspects = [{
-                'label': f'Market: {market.get("market")}',
-                'kind':  'market',
-                'text':  str(market.get('narrative') or ''),
-            }]
-            unit_matrix   = unexp_vectors[mi][None, :]
-            n_aspect_vecs = 0
-        else:
-            idx          = ap.market_aspect_indices(aspects, str(market.get('market')))
-            unit_aspects = [aspects[i] for i in idx]
-            unit_matrix  = matrix[idx] if idx else matrix[:0]
-
-            if key not in market_cache:
-                market_cache[key] = ap.unpack_market_embeddings(prof)
-            market_vectors = market_cache[key]
-            n_aspect_vecs = unit_matrix.shape[0]
-            if 0 <= mi < market_vectors.shape[0]:
-                unit_aspects = unit_aspects + [{
-                    'label': f'Market: {market.get("market")}',
-                    'kind':  'market',
-                    'text':  str(market.get('narrative') or ''),
-                }]
-                unit_matrix = np.vstack([unit_matrix, market_vectors[mi][None, :]])
-
-            if unit_matrix.shape[0] == 0:
-                skipped.append(
-                    f'{label}: market has no aspect or narrative vectors — rebuild the profile'
-                )
-                continue
-
-        scores  = unit_matrix @ topic_matrix.T     # (n_vectors, T)
-        best_i  = scores.argmax(axis=0)
-        best    = scores.max(axis=0)
-        cleared = scores >= threshold
-        # min_hits counts capabilities. The market narrative is one more way of
-        # describing the same market, not an extra capability, so it stays out
-        # of the count - unless it is all the unit has, which is the case for a
-        # market no aspect was earmarked to.
-        hits    = (cleared[:n_aspect_vecs] if n_aspect_vecs else cleared).sum(axis=0)
-        # A unit with no aspect vectors at all — an unexplored market, or a
-        # confirmed market no aspect was earmarked to — is scored on its
-        # narrative alone, so there is at most one hit to count. Applying a
-        # min_hits above 1 would drop every such unit without saying why.
-        effective_hits = min_hits if n_aspect_vecs else 1
-
-        qualified = np.where((best >= threshold) & (hits >= effective_hits))[0]
-        if qualified.size == 0:
-            continue
-        order = qualified[np.argsort(best[qualified])[::-1][:top_k]]
-
-        # The confirmed capabilities an unexplored market says it would draw on.
-        # Not scored — this is the evidence the re-ranker judges the extension
-        # against, so a hypothesis can't be scored on its own optimism.
-        linked_text = ''
-        if kind == _ROW_UNEXPLORED:
-            linked_text = '\n\n'.join(
-                f"{aspects[i].get('label', '')}: {aspects[i].get('text', '')}"
-                for i in ap.unexplored_aspect_indices(aspects, market)
-            )
-
-        for ti in order:
-            ai     = int(best_i[ti])
-            aspect = unit_aspects[ai]
-            row = {
-                'client':           client,
-                'client_website':   prof['companyWebsite'],
-                'market':           str(market.get('market')) if market else '',
-                'market_kind':      kind or _ROW_CONFIRMED,
-                'market_tier':      ap.tier_ordinal(ap.market_tier_rank(market)) if market else '',
-                'market_subtitle':  str(market.get('subtitle') or '') if market else '',
-                'market_rationale': str(market.get('rationale') or '') if market else '',
-                'aspect_label':     aspect.get('label', ''),
-                'aspect_kind':      aspect.get('kind', ''),
-                'aspect_score':     round(float(best[ti]), 4),
-                'aspects_hit':      int(hits[ti]),
-                'aspects_total':    n_aspect_vecs or len(unit_aspects),
-                'aspect_scores':    json.dumps({
-                    unit_aspects[j].get('label', f'aspect_{j + 1}'): round(float(scores[j, ti]), 4)
-                    for j in range(len(unit_aspects))
-                }),
-                '_company_key':     prof['company_key'],
-                '_aspect_text':     aspect.get('text', ''),
-                '_linked_aspects':  linked_text,
-                '_profile_summary': prof['profile_summary'],
-            }
-            row.update(meta_records[int(ti)])
-            rows.append(row)
-
-    return pd.DataFrame(rows), skipped
-
-
-# ── LLM re-rank ────────────────────────────────────────────────────────────
-
-_RERANK_SYSTEM = (
-    'You are screening a federal grant topic against one specific capability of a '
-    'company that a proposal-writing firm represents.\n'
-    'Score the fit from 1 to 5:\n'
-    '5 = the company could propose to this topic directly with the capability described\n'
-    '4 = strong fit with minor gaps\n'
-    '3 = plausible fit, but notable gaps or adaptation needed\n'
-    '2 = superficial or keyword-level overlap only\n'
-    '1 = no fit\n\n'
-    'Judge only the capability as described — never assume capabilities that are not stated.\n'
-    'Return ONLY valid JSON: {"score": <integer 1-5>, "rationale": "<one sentence>"}'
-)
-
-
-# The confirmed prompt above asks "could they propose to this TODAY", and
-# rightly answers 1 or 2 for anything speculative. Pointing it at an unexplored
-# market — a hypothesis by construction — would score the entire kind below any
-# selectable minimum, and an unscored/low-scored run shows an empty table with
-# no error at all. So unexplored units get their own question, and their own
-# scale, judged against the capabilities the client demonstrably has.
-_RERANK_UNEXPLORED_SYSTEM = (
-    'You are screening a federal grant topic against a market a company does NOT '
-    'currently serve, but which a capability analysis suggests it could extend into.\n'
-    'You are given the market hypothesis, the gap that analysis says remains, and the '
-    'capabilities the company demonstrably has today.\n'
-    'Score from 1 to 5 how plausibly this company could pursue this topic by extending '
-    'those existing capabilities:\n'
-    '5 = a clear extension of a stated capability — adaptation only, no new science\n'
-    '4 = a strong extension with one identifiable gap to close\n'
-    '3 = plausible, but a real capability, qualification or certification gap stands in the way\n'
-    '2 = would require capabilities the company has not demonstrated\n'
-    '1 = unrelated to anything the company can do\n\n'
-    'Judge the extension ONLY against the listed capabilities — never assume capabilities '
-    'that are not stated, and never credit the hypothesis for being ambitious.\n'
-    'Return ONLY valid JSON: {"score": <integer 1-5>, "rationale": "<one sentence>"}'
-)
-
-
-def _rerank_user_message(row: dict) -> str:
-    if row.get('market_kind') == _ROW_UNEXPLORED:
-        subtitle = str(row.get('market_subtitle') or '')
-        return (
-            f"Company: {row.get('client', '')}\n"
-            f"Company profile: {str(row.get('_profile_summary') or '')[:1500]}\n\n"
-            f"Market the company does NOT currently serve — {row.get('market', '')}"
-            f"{(': ' + subtitle) if subtitle else ''}\n"
-            f"{str(row.get('_aspect_text') or '')[:2000]}\n\n"
-            f"Gap the analysis says remains: "
-            f"{str(row.get('market_rationale') or 'not stated')[:800]}\n\n"
-            f"Capabilities the company demonstrably has today:\n"
-            f"{str(row.get('_linked_aspects') or '(none recorded)')[:3000]}\n\n"
-            f"Grant topic: {row.get('title', '')}\n"
-            f"Agency: {row.get('agency', '') or row.get('broad_agency', '')}\n"
-            f"Topic description:\n{str(row.get('grant_summary') or '')[:6000]}"
-        )
-    return (
-        f"Company: {row.get('client', '')}\n"
-        f"Company profile: {str(row.get('_profile_summary') or '')[:1500]}\n\n"
-        f"Matched capability — {row.get('aspect_label', '')}:\n"
-        f"{str(row.get('_aspect_text') or '')[:2000]}\n\n"
-        f"Grant topic: {row.get('title', '')}\n"
-        f"Agency: {row.get('agency', '') or row.get('broad_agency', '')}\n"
-        f"Topic description:\n{str(row.get('grant_summary') or '')[:6000]}"
-    )
-
-
-def _parse_rerank(text: str) -> tuple[int | None, str]:
-    cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', (text or '').strip())
-    start, end = cleaned.find('{'), cleaned.rfind('}')
-    if start != -1 and end > start:
-        try:
-            obj = json.loads(cleaned[start:end + 1])
-            score = int(float(obj.get('score')))
-            return max(1, min(5, score)), str(obj.get('rationale') or '')[:400]
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-    # Tolerate a stray sentence around the JSON rather than losing the score
-    m = re.search(r'"?score"?\s*[:=]\s*([1-5])', cleaned)
-    if m:
-        r = re.search(r'"?rationale"?\s*[:=]\s*"([^"]*)"', cleaned)
-        return int(m.group(1)), (r.group(1)[:400] if r else '')
-    return None, '(unparseable response)'
-
-
-async def _rerank_async(
-    rows: list[tuple[int, dict]], api_key: str, model: str, on_done
-) -> list[tuple[int, int | None, str]]:
-    sem = asyncio.Semaphore(_CONCURRENCY)
-
-    async with AsyncAnthropic(api_key=api_key) as client:
-        async def one(idx: int, row: dict) -> tuple[int, int | None, str]:
-            async with sem:
-                for attempt in range(_MAX_RETRIES):
-                    try:
-                        resp = await client.messages.create(
-                            model=model,
-                            max_tokens=250,
-                            # No temperature: the anthropic 1.x SDK removed the
-                            # parameter, and it is rejected outright by the newer
-                            # models. Determinism comes from the strict JSON
-                            # contract in the system prompt instead.
-                            system=(
-                                _RERANK_UNEXPLORED_SYSTEM
-                                if row.get('market_kind') == _ROW_UNEXPLORED
-                                else _RERANK_SYSTEM
-                            ),
-                            messages=[{'role': 'user', 'content': _rerank_user_message(row)}],
-                        )
-                        score, rationale = _parse_rerank(resp.content[0].text)
-                        return idx, score, rationale
-                    except Exception as e:
-                        err = str(e)
-                        retryable = any(
-                            x in err for x in
-                            ('429', '529', 'overloaded', 'rate_limit', 'rate limit', 'timeout')
-                        )
-                        if retryable and attempt < _MAX_RETRIES - 1:
-                            await asyncio.sleep((2 ** attempt) + random.random())
-                            continue
-                        return idx, None, f'(scoring failed: {type(e).__name__})'
-                return idx, None, '(scoring failed: retries exhausted)'
-
-        tasks   = [asyncio.create_task(one(i, r)) for i, r in rows]
-        results = []
-        for fut in asyncio.as_completed(tasks):
-            results.append(await fut)
-            on_done(len(results))
-        return results
-
-
-def _rerank_groups(candidates: pd.DataFrame) -> list[list[int]]:
-    """Row indices grouped by (client, topic, matched aspect, market kind).
-
-    In market mode the same aspect can win the same topic under two markets.
-    The re-rank prompt carries no market context, so those rows would get
-    identical answers — score the pair once and share it.
-
-    The kind IS part of the key: confirmed and unexplored rows are scored by
-    different prompts answering different questions, so sharing one score
-    across them would stamp a hypothesis score onto a confirmed row."""
-    groups: dict[tuple, list[int]] = {}
-    for idx, row in candidates.iterrows():
-        key = (
-            str(row.get('_company_key') or ''),
-            # Agency included: one topic_number can belong to two agencies, and
-            # blank-numbered rows fall back to titles that repeat across them.
-            # Without it two different topics would share one score, written
-            # from only the first row's grant_summary.
-            str(row.get('broad_agency') or ''),
-            str(row.get('agency') or ''),
-            str(row.get('topic_number') or row.get('title') or ''),
-            str(row.get('aspect_label') or ''),
-            str(row.get('market_kind') or ''),
-        )
-        groups.setdefault(key, []).append(int(idx))
-    return list(groups.values())
-
-
-def _run_rerank(candidates: pd.DataFrame, api_key: str, model: str) -> pd.DataFrame:
-    groups = _rerank_groups(candidates)
-    rows   = [(n, candidates.loc[g[0]].to_dict()) for n, g in enumerate(groups)]
-    total  = len(rows)
-    prog   = st.progress(0.0, text=f'LLM re-ranking 0/{total}…')
-
-    def on_done(done: int) -> None:
-        prog.progress(done / total, text=f'LLM re-ranking {done}/{total}…')
-
-    results = asyncio.run(_rerank_async(rows, api_key, model, on_done))
-    prog.empty()
-
-    out = candidates.copy()
-    out['llm_score']     = 0
-    out['llm_rationale'] = ''
-    for n, score, rationale in results:
-        for idx in groups[n]:
-            # 0 keeps unscored pairs visible but below any usable minimum
-            out.at[idx, 'llm_score']     = int(score) if score is not None else 0
-            out.at[idx, 'llm_rationale'] = rationale
-    return out
+# These live in src/modules/aspect_matching.py so the Grant Search view can run
+# the same single-company match without a second implementation of the pieces
+# that are easy to get subtly wrong (min_hits counting, the confirmed vs
+# unexplored re-rank prompt split, re-rank dedup). Aliased rather than called
+# through `am.` so the page body below reads exactly as it did.
+_stack_topic_embeddings = am.stack_topic_embeddings
+_unit_markets           = am.unit_markets
+_market_counts          = am.market_counts
+_tier_counts            = am.tier_counts
+_plan_units             = am.plan_units
+_match_units            = am.match_units
+_run_rerank             = am.run_rerank
+_display_frame          = am.display_frame
 
 
 # ── Results output ─────────────────────────────────────────────────────────
-
-_DISPLAY_FIRST = [
-    'client', 'market', 'market_kind', 'market_tier', 'aspect_label', 'aspect_score',
-    'aspects_hit', 'aspects_total',
-    'llm_score', 'llm_rationale', 'topic_number', 'title', 'agency', 'broad_agency',
-]
-
-
-def _display_frame(df: pd.DataFrame) -> pd.DataFrame:
-    internal = [c for c in df.columns if c.startswith('_')]
-    first    = [c for c in _DISPLAY_FIRST if c in df.columns]
-    rest     = [c for c in df.columns if c not in first and c not in internal]
-    return df[first + rest]
-
 
 def _save_results(client: storage.Client, run_id: str, df: pd.DataFrame) -> str:
     path = f'{_RESULTS_PREFIX}{run_id}/results.csv'
@@ -981,7 +529,7 @@ if do_rerank:
         f'Up to **{max_pairs:,}** re-rank calls '
         f'({len(plan)} {"market unit" if by_market else "client"}'
         f'{"s" if len(plan) != 1 else ""} × top {int(top_k)}), '
-        f'{_CONCURRENCY} at a time.'
+        f'{am.CONCURRENCY} at a time.'
         + (' Identical (client, topic, aspect) pairs are scored once and shared '
            'across markets, so the real count is usually lower.' if by_market else '')
     )
@@ -1023,7 +571,8 @@ if run:
         prog = st.progress(0.0, text='Scoring…')
         candidates, skipped = _match_units(
             plan, topic_matrix, topic_meta,
-            float(threshold), int(min_hits), int(top_k), prog,
+            float(threshold), int(min_hits), int(top_k),
+            lambda frac, text: prog.progress(frac, text=text),
         )
         prog.empty()
         del topic_matrix
@@ -1046,7 +595,14 @@ if run:
             failures: dict[str, int] = {}
             results  = candidates
             if do_rerank:
-                results  = _run_rerank(candidates, st.secrets['anthropic_api_key'], rerank_model)
+                rr_prog  = st.progress(0.0, text='LLM re-ranking…')
+                results  = _run_rerank(
+                    candidates, st.secrets['anthropic_api_key'], rerank_model,
+                    lambda done, total: rr_prog.progress(
+                        done / total, text=f'LLM re-ranking {done}/{total}…'
+                    ),
+                )
+                rr_prog.empty()
                 unscored = int((results['llm_score'] == 0).sum())
                 # A pair scores 0 only when the call failed or the answer was
                 # unparseable — the reason is the one thing worth surfacing when
