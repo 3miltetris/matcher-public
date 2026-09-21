@@ -43,6 +43,10 @@ MAX_RETRIES   = 5
 ROW_CONFIRMED  = 'confirmed'
 ROW_UNEXPLORED = 'unexplored'
 
+# The "no category filter" sentinel for plan_units. It lives here rather than in
+# the view because plan_units compares against it; the view aliases this name.
+CATEGORY_ALL = 'All categories'
+
 # One scoring subject: a whole company (market None, kind ''), or one market of
 # one company. `mi` indexes that market's narrative vector inside the profile's
 # flat market_embeddings / unexplored_embeddings block.
@@ -138,7 +142,7 @@ def plan_units(
     filters — each is scored, capped and re-ranked as if it were its own
     company. Cheap enough to call on every rerun for the run-size estimate.
 
-    An empty `tiers` means every tier, matching how _CATEGORY_ALL behaves — a
+    An empty `tiers` means every tier, matching how CATEGORY_ALL behaves — a
     deselect-everything state would otherwise silently plan zero units."""
     plan: list[Unit] = []
     skipped: list[str] = []
@@ -163,7 +167,7 @@ def plan_units(
             name = str(market.get('market') or '')
             if tiers and ap.market_tier_rank(market) not in tiers:
                 continue
-            if category != _CATEGORY_ALL and name != category:
+            if category != CATEGORY_ALL and name != category:
                 continue
             plan.append(Unit(prof, market, i, kind))
 

@@ -71,7 +71,7 @@ _KIND_CONFIRMED  = 'Confirmed markets'
 _KIND_UNEXPLORED = 'Unexplored markets'
 _KIND_BOTH       = 'Both'
 _KINDS           = [_KIND_CONFIRMED, _KIND_UNEXPLORED, _KIND_BOTH]
-_CATEGORY_ALL    = 'All categories'
+_CATEGORY_ALL    = am.CATEGORY_ALL
 
 # Stored on every result row, and what the re-rank prompt selection keys off.
 # There is no separate 'Defense only' scope any more: category='Defense' already
@@ -198,6 +198,7 @@ _market_counts          = am.market_counts
 _tier_counts            = am.tier_counts
 _plan_units             = am.plan_units
 _match_units            = am.match_units
+_rerank_groups          = am.rerank_groups
 _run_rerank             = am.run_rerank
 _display_frame          = am.display_frame
 

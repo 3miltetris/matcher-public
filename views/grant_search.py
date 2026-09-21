@@ -934,6 +934,15 @@ else:
             'search the whole company instead.'
         )
     else:
+        # The option list changes whenever a different profile is picked (or a
+        # notes profile is rebuilt). A keyed multiselect keeps its stored value
+        # over `default`, and Streamlit drops stored values that are no longer
+        # options — so a profile switch would leave this empty and grey out the
+        # Match button with nothing said. Re-seed it when the options change.
+        opt_sig = tuple(unit_options)
+        if st.session_state.get('gs_match_markets_sig') != opt_sig:
+            st.session_state.gs_match_markets_sig = opt_sig
+            st.session_state.gs_match_markets     = list(unit_options)
         picked = st.multiselect(
             'Markets', list(unit_options), default=list(unit_options),
             key='gs_match_markets',
