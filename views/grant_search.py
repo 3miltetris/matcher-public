@@ -163,10 +163,14 @@ def _filter_is_active(f: dict) -> bool:
 def _filter_mask(df: pd.DataFrame, f: dict) -> pd.Series:
     if f.get('type') == 'date_range':
         d_from, d_to = f['date_from'], f['date_to']
+        keep_undated = bool(f.get('include_undated'))
 
         def _in_range(v) -> bool:
             d = _parse_date_str(v)
-            return d is not None and d_from <= d <= d_to
+            if d is None:
+                # Blank, 'Rolling', 'TBD', or an unparseable date string.
+                return keep_undated
+            return d_from <= d <= d_to
 
         return df[f['column']].map(_in_range)
     return df[f['column']].astype(str).str.lower().str.contains(
@@ -557,6 +561,14 @@ for i, f in enumerate(st.session_state.gs_filters):
         elif isinstance(picked, tuple) and len(picked) == 1:
             # Mid-selection: only the start date is chosen so far.
             f['date_from'], f['date_to'] = picked[0], None
+        f['include_undated'] = val_input.checkbox(
+            'Include rows with no date',
+            value=bool(f.get('include_undated')),
+            key=f'gs_und_{i}',
+            help='Also keep rows whose date cell is blank or unreadable '
+                 "(e.g. 'Rolling', 'TBD', 'Continuous'), which a date range "
+                 'would otherwise drop.',
+        )
     else:
         f['keyword'] = val_input.text_input(
             'Keyword', value=f.get('keyword', ''),

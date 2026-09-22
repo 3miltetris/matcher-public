@@ -101,10 +101,14 @@ def _filter_mask(df: pd.DataFrame, f: dict) -> pd.Series:
     if f.get('type') == 'date_range':
         d_from = date.fromisoformat(f['date_from'])
         d_to   = date.fromisoformat(f['date_to'])
+        keep_undated = bool(f.get('include_undated'))
 
         def _in_range(v) -> bool:
             d = _parse_date_str(v)
-            return d is not None and d_from <= d <= d_to
+            if d is None:
+                # Blank, 'Rolling', 'TBD', or an unparseable date string.
+                return keep_undated
+            return d_from <= d <= d_to
 
         return df[f['column']].map(_in_range)
     return df[f['column']].astype(str).str.lower().str.contains(
