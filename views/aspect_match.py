@@ -258,7 +258,10 @@ pool_keys = uc.pool_scope_selector(
          'store, so a client run is unaffected by anything in the prospect pool.',
 )
 
-if st.session_state.am_profiles is None:
+# .get(), not attribute access: pool_scope_selector *removes* the keys it
+# clears, and the init block above has already run this script pass, so a
+# cleared key is absent rather than None.
+if st.session_state.get('am_profiles') is None:
     with st.spinner('Loading capability profiles…'):
         try:
             loaded = [ap.load_profiles(gcs, pool=p) for p in pool_keys]
@@ -330,7 +333,10 @@ edited = st.data_editor(
         'labels':   st.column_config.TextColumn('Aspect labels', width='large'),
         'built_at': st.column_config.TextColumn('Built'),
     },
-    key=f'am_client_picker_{st.session_state.am_pick_nonce}',
+    # The pool scope is part of the key: data_editor stores its edits by ROW
+    # INDEX, so without it, rows unticked under Clients would silently untick
+    # whatever sits at those indexes in the prospect list.
+    key=f'am_client_picker_{"-".join(pool_keys)}_{st.session_state.am_pick_nonce}',
 )
 
 selected = profiles.loc[edited.index[edited['use'].fillna(False).to_numpy(dtype=bool)]]
@@ -685,9 +691,9 @@ if run:
 
 # ── Section 4 · Results ────────────────────────────────────────────────────
 
-if st.session_state.am_results is not None:
+if st.session_state.get('am_results') is not None:
     results = st.session_state.am_results
-    meta    = st.session_state.am_run_meta or {}
+    meta    = st.session_state.get('am_run_meta') or {}
 
     st.divider()
     st.subheader('4 · Results')

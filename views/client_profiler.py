@@ -297,14 +297,17 @@ with col_reload:
         st.session_state.cp_profiles = None
         st.rerun()
 
-if st.session_state.cp_frames is None:
+# .get(), not attribute access: pool_selector *removes* the keys it clears,
+# and the init block above has already run this script pass, so a cleared key
+# is absent rather than None.
+if st.session_state.get('cp_frames') is None:
     with st.spinner(f'Loading {_NOUN}s from GCS…'):
         frames, load_errors = _load_pool_frames(pool)
     st.session_state.cp_frames = frames
     for err in load_errors:
         st.warning(err)
 
-if st.session_state.cp_profiles is None:
+if st.session_state.get('cp_profiles') is None:
     with st.spinner('Loading profile store…'):
         try:
             st.session_state.cp_profiles = ap.load_profiles(
@@ -477,7 +480,10 @@ if not view.empty:
             'unexplored': st.column_config.TextColumn('Unexplored', width='medium'),
             'built_at': st.column_config.TextColumn('Built'),
         },
-        key=f'cp_dir_editor_{st.session_state.cp_build_nonce}_{show}_{search.strip().lower()}',
+        # The pool is part of the key for the same reason the filter and the
+        # search are: data_editor stores its edits by ROW INDEX, so a stale
+        # key would re-apply them to a different list of companies.
+        key=f'cp_dir_editor_{pool}_{st.session_state.cp_build_nonce}_{show}_{search.strip().lower()}',
     )
 
     selected_keys = view.loc[
@@ -537,7 +543,7 @@ if not no_material.empty:
               'on them first.'
         )
 
-if st.session_state.cp_build_summary:
+if st.session_state.get('cp_build_summary'):
     summary = st.session_state.cp_build_summary
     if summary['built']:
         st.success(

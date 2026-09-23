@@ -232,7 +232,12 @@ def company_names(frames: dict[str, pd.DataFrame]) -> dict[str, str]:
 
 def combined_frame(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Every row of a pool in one frame, with `_blob` naming the file it came
-    from and `_key` the company key. Empty frame when the pool has no files."""
+    from and `_key` the company key. Empty frame when the pool has no files.
+
+    The empty frame still carries `_blob` and `_key`: callers guard on whether
+    they loaded any *files*, not on whether any of them had rows, so a single
+    zero-row parquet in the pool would otherwise reach a `groupby('_key')` with
+    no such column and take the whole page down with a KeyError."""
     parts = []
     for blob_name, df in frames.items():
         if df is None or df.empty:
@@ -241,7 +246,7 @@ def combined_frame(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
         part['_blob'] = blob_name
         parts.append(part)
     if not parts:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=['_blob', '_key'])
     combined = pd.concat(parts, ignore_index=True)
     combined['_key'] = combined.apply(company_key, axis=1)
     return combined

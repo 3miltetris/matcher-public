@@ -82,6 +82,12 @@ def pool_selector(
     selection changes — before the view reads them further down the script — so
     switching pool can never leave one pool's companies on screen under the
     other pool's heading.
+
+    A cleared key is REMOVED, not set to None (that is what also resets a
+    widget bound to it), and a view's `if _k not in st.session_state` init
+    block has already run by the time the radio is drawn. Every later read of
+    a cleared key must therefore go through `st.session_state.get(k)` —
+    attribute access raises AttributeError on the first pool switch.
     """
     return _pool_radio(
         state_key, list(pools or pl.POOL_KEYS), label, help, horizontal, clears
@@ -105,6 +111,9 @@ def pool_scope_selector(
     and prospects together is meaningful. The write-side views deliberately do
     not offer this: an edit, a build or a delete has to land in exactly one
     store.
+
+    `clears` behaves exactly as in pool_selector above — read that note before
+    adding a key, a cleared key is removed and must be read with `.get()`.
     """
     choice = _pool_radio(
         state_key, list(pl.POOL_KEYS) + [POOL_SCOPE_BOTH],
