@@ -19,6 +19,8 @@ import pandas as pd
 from anthropic import Anthropic, AsyncAnthropic, RateLimitError, InternalServerError
 from openai import OpenAI, AsyncOpenAI
 
+import src.modules.anthropic_utils as au
+
 # ---------------------------------------------------------------------------
 # Shared prompt builders
 # ---------------------------------------------------------------------------
@@ -88,7 +90,7 @@ def analyze_matches_anthropic(
             messages=[{'role': 'user', 'content': text}],
         )
 
-        result = message.content[0].text
+        result = au.response_text(message)
         matches.at[index, 'good_match'] = result
 
         if 'yes' in result.lower():
@@ -161,7 +163,7 @@ def analyze_matches_dual(
             system=system,
             messages=[{'role': 'user', 'content': text}],
         )
-        anth_result = anth_msg.content[0].text
+        anth_result = au.response_text(anth_msg)
 
         if 'yes' in anth_result.lower():
             print(f'[{index}] Anthropic said yes — confirming with OpenAI...')
@@ -229,7 +231,7 @@ async def analyze_matches_async(
                     messages=[{'role': 'user', 'content': text}],
                 )
 
-                result = message.content[0].text
+                result = au.response_text(message)
                 matches.at[index, 'good_match'] = result
 
                 if 'yes' in result.lower():
@@ -355,7 +357,7 @@ async def analyze_pivot_async(
                     system=PIVOT_CHECK_SYSTEM,
                     messages=[{'role': 'user', 'content': text}],
                 )
-                result = message.content[0].text
+                result = au.response_text(message)
                 matches.at[index, 'pivot_possible'] = result
                 remaining = len(no_rows) - list(no_rows.index).index(index) - 1
                 print(f'  [{index}] pivot={result}  |  {remaining} remaining')
@@ -416,7 +418,7 @@ async def generate_pivot_notes(
                     system=PIVOT_NOTE_SYSTEM,
                     messages=[{'role': 'user', 'content': text}],
                 )
-                note = message.content[0].text
+                note = au.response_text(message)
                 matches.at[index, 'pivot_note'] = note
                 print(f'  [{index}] {note[:80]}...')
                 return

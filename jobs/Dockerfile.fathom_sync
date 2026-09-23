@@ -13,6 +13,7 @@ COPY jobs/fathom_sync_job.py jobs/fathom_sync_job.py
 # BucketManager — all stdlib/pandas, nothing added to requirements.
 COPY src/__init__.py src/__init__.py
 COPY src/modules/__init__.py src/modules/__init__.py
+COPY src/modules/anthropic_utils.py src/modules/anthropic_utils.py
 COPY src/modules/fathom_client.py src/modules/fathom_client.py
 COPY src/modules/pools.py src/modules/pools.py
 COPY src/modules/aspect_profile.py src/modules/aspect_profile.py

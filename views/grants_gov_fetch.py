@@ -24,6 +24,7 @@ from google.cloud import storage
 
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
+import src.modules.anthropic_utils as au
 import src.modules.ui_common as uc
 
 # ── GCS ────────────────────────────────────────────────────────────────────
@@ -265,7 +266,7 @@ def _screen_one(title: str, desc: str, anth_key: str) -> dict:
         system=_SCREEN_SYSTEM,
         messages=[{'role': 'user', 'content': user_msg}],
     )
-    raw = resp.content[0].text.strip()
+    raw = au.response_text(resp)
     if raw.startswith('```'):
         raw = raw.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
     return json.loads(raw)
@@ -323,7 +324,7 @@ def _summarize_one(title: str, desc: str, anth_key: str) -> str:
         system=_SUMMARY_SYSTEM,
         messages=[{'role': 'user', 'content': user_msg}],
     )
-    return resp.content[0].text.strip()
+    return au.response_text(resp)
 
 
 def _summarize_all(titles: list[str], descs: list[str], anth_key: str) -> list[str]:

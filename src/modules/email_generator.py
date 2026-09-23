@@ -7,6 +7,8 @@ import time
 from anthropic import Anthropic, AsyncAnthropic, InternalServerError
 from openai import AsyncOpenAI, OpenAI
 
+import src.modules.anthropic_utils as au
+
 
 # ── Default system prompt templates (use {word_limit} as a placeholder) ───────
 
@@ -160,7 +162,7 @@ def generate_subject_line(
                 system=system,
                 messages=[{"role": "user", "content": text}],
             )
-            result = _sanitize_subject(message.content[0].text, agency)
+            result = _sanitize_subject(au.response_text(message), agency)
             _subject_line_cache[cache_key] = result
             print(f"  [generate_subject_line] Anthropic fallback succeeded.")
             return result
@@ -199,7 +201,7 @@ def generate_body(
         system=system,
         messages=[{"role": "user", "content": [{"type": "text", "text": text}]}],
     )
-    return message.content[0].text
+    return au.response_text(message)
 
 
 def generate_tech_summary(
@@ -222,7 +224,7 @@ def generate_tech_summary(
         system=system,
         messages=[{"role": "user", "content": [{"type": "text", "text": text}]}],
     )
-    return message.content[0].text
+    return au.response_text(message)
 
 
 async def async_generate_subject_line(
@@ -270,7 +272,7 @@ async def async_generate_subject_line(
                 system=system,
                 messages=[{"role": "user", "content": text}],
             )
-            result = _sanitize_subject(message.content[0].text, agency)
+            result = _sanitize_subject(au.response_text(message), agency)
             _subject_line_cache[cache_key] = result
             return result
         except Exception as e:
@@ -298,7 +300,7 @@ async def async_josiah_copy(
                 system=system,
                 messages=[{"role": "user", "content": [{"type": "text", "text": f"Company: {company_summary}\nGrant: {grant_summary}"}]}],
             )
-            return message.content[0].text
+            return au.response_text(message)
         except Exception as e:
             err = str(e)
             if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):
@@ -324,7 +326,7 @@ async def async_custom_prompt(
                 system=system,
                 messages=[{'role': 'user', 'content': [{'type': 'text', 'text': text}]}],
             )
-            return message.content[0].text
+            return au.response_text(message)
         except Exception as e:
             err = str(e)
             if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):
@@ -368,4 +370,4 @@ def josiah_copy(
         system=system,
         messages=[{"role": "user", "content": [{"type": "text", "text": text}]}],
     )
-    return message.content[0].text
+    return au.response_text(message)

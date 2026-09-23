@@ -77,6 +77,8 @@ from bs4 import BeautifulSoup
 from google.cloud import storage
 from openai import OpenAI
 
+import src.modules.anthropic_utils as au
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 _BUCKET           = 'cc-matcher-bucket-jeg-v1'
@@ -600,7 +602,7 @@ async def _screen_all(df: pd.DataFrame, anth_key: str,
                                 f"NAICS Descriptor: {naics[i]}"
                             )}],
                         )
-                        raw = resp.content[0].text.strip()
+                        raw = au.response_text(resp)
                         if raw.startswith('```'):
                             raw = raw.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
                         results[i] = json.loads(raw)
@@ -650,7 +652,7 @@ async def _summarize_all(titles: list[str], descs: list[str], anth_key: str,
                                 f"Title: {titles[i]}\n\nDescription:\n{descs[i][:5000]}"
                             )}],
                         )
-                        results[i] = resp.content[0].text.strip()
+                        results[i] = au.response_text(resp)
                         break
                     except Exception as e:
                         err = str(e)
@@ -1021,7 +1023,7 @@ def _revision_diff(anth: Anthropic, old_summary: str, old_desc: str, new_text: s
             system=_REVISION_SYSTEM,
             messages=[{'role': 'user', 'content': user_msg}],
         )
-        raw = resp.content[0].text.strip()
+        raw = au.response_text(resp)
         if raw.startswith('```'):
             raw = raw.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
         return json.loads(raw)
@@ -1050,7 +1052,7 @@ def _summarize_sync(anth: Anthropic, title: str, text: str) -> str:
             system=_SUMMARY_SYSTEM,
             messages=[{'role': 'user', 'content': f"Title: {title}\n\nDescription:\n{text[:10000]}"}],
         )
-        return resp.content[0].text.strip()
+        return au.response_text(resp)
     except Exception:
         return ''
 

@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 from anthropic import AsyncAnthropic
 
+import src.modules.anthropic_utils as au
 import src.modules.aspect_profile as ap
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -446,7 +447,7 @@ async def rerank_async(
                             ),
                             messages=[{'role': 'user', 'content': rerank_user_message(row)}],
                         )
-                        score, rationale = parse_rerank(resp.content[0].text)
+                        score, rationale = parse_rerank(au.response_text(resp))
                         return idx, score, rationale
                     except Exception as e:
                         err = str(e)

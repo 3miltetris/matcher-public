@@ -13,6 +13,7 @@ COPY jobs/client_profile_job.py jobs/client_profile_job.py
 # contacts are read and which profile store is written — keep all five.
 COPY src/__init__.py src/__init__.py
 COPY src/modules/__init__.py src/modules/__init__.py
+COPY src/modules/anthropic_utils.py src/modules/anthropic_utils.py
 COPY src/modules/aspect_profile.py src/modules/aspect_profile.py
 COPY src/modules/pools.py src/modules/pools.py
 COPY src/modules/finance_research.py src/modules/finance_research.py

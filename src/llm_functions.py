@@ -5,6 +5,8 @@ import openai
 import asyncio
 from anthropic import Anthropic, RateLimitError, AsyncAnthropic, InternalServerError
 
+import src.modules.anthropic_utils as au
+
 
 ######### LOAD KEYS & CLIENTS #########
 keys_path = '/content/drive/MyDrive/keys'
@@ -63,9 +65,9 @@ class InsightGrant:
                         ]
                     )
 
-                    matches.at[index, 'good_match'] = message.content[0].text
+                    matches.at[index, 'good_match'] = au.response_text(message)
 
-                    print('Complete:', index, message.content[0].text, f'{len(matches) - index} matches remaining')
+                    print('Complete:', index, au.response_text(message, default=''), f'{len(matches) - index} matches remaining')
                     return  # Success, exit the retry loop
 
                 except (RateLimitError, InternalServerError) as e:

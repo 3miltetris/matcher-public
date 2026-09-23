@@ -18,6 +18,7 @@ from google.cloud import storage
 
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
+import src.modules.anthropic_utils as au
 import src.modules.ui_common as uc
 
 # ── GCS ────────────────────────────────────────────────────────────────────
@@ -103,7 +104,7 @@ def _extract_topics(text: str, anth_key: str) -> list[dict]:
             'is too large to process in one pass. Try splitting it into smaller '
             'sections (e.g. one agency or one batch of topics at a time).'
         )
-    raw = final.content[0].text.strip()
+    raw = au.response_text(final)
     # Strip markdown code fences if Claude wrapped the output anyway
     if raw.startswith('```'):
         raw = raw.split('\n', 1)[-1]

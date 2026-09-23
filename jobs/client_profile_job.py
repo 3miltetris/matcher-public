@@ -74,6 +74,7 @@ from anthropic import Anthropic
 from google.cloud import storage
 from openai import OpenAI
 
+import src.modules.anthropic_utils as au
 import src.modules.aspect_profile as ap
 import src.modules.pools as pl
 
@@ -140,32 +141,6 @@ def _get_embedding(text: str, oai: OpenAI, encoding: tiktoken.Encoding) -> list[
 
 # ── Claude ─────────────────────────────────────────────────────────────────────
 
-def _response_text(resp) -> str:
-    """The text of a Claude response, as a ValueError when there is none.
-
-    `resp.content[0].text` is wrong twice over. An **empty** content list makes
-    it raise IndexError — which is not a ValueError, so the retry below never
-    ran and the company was reported as "list index out of range" with no hint
-    of the cause (observed on a real build, twice). And indexing block 0
-    assumes the first block is text, which stops being true the moment a
-    response leads with a non-text block.
-
-    So: join every text block, and turn "nothing came back" into a ValueError
-    carrying `stop_reason`, which is the field that actually explains it
-    (`refusal`, `pause_turn`, …)."""
-    blocks = getattr(resp, 'content', None) or []
-    text = ''.join(
-        getattr(b, 'text', '') for b in blocks
-        if getattr(b, 'type', '') == 'text'
-    ).strip()
-    if not text:
-        raise ValueError(
-            f'Claude returned no text (stop_reason={getattr(resp, "stop_reason", None)}, '
-            f'{len(blocks)} content block(s))'
-        )
-    return text
-
-
 def _fallback_model(model: str) -> str | None:
     """The other supported aspect model, for the refusal path below."""
     others = [m for m in ap.ASPECT_MODELS if m != model]
@@ -216,7 +191,7 @@ def _claude_json(anth: Anthropic, model: str, system: str, user_msg: str, parse)
                 refused  = True
                 break          # retrying the same model cannot change a refusal
             try:
-                return parse(_response_text(resp)), current
+                return parse(au.response_text(resp)), current
             except ValueError as e:
                 last_err = e
         if not refused:

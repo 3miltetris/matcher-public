@@ -33,6 +33,7 @@ from google.cloud import storage
 from openai import AsyncOpenAI
 
 # ── src modules are on the path because the Dockerfile sets PYTHONPATH ────────
+import src.modules.anthropic_utils as au
 from src.modules.email_generator import (
     async_generate_subject_line, async_josiah_copy, async_custom_prompt, clean_agency,
 )
@@ -197,7 +198,16 @@ async def _validate_rows(
                             ),
                         }],
                     )
-                    return idx, msg.content[0].text.strip().lower()
+                    answer = au.response_text(msg, default='')
+                    if not answer:
+                        # One refused pair must not abort the whole run: this
+                        # gather has no return_exceptions, and 'no' is already
+                        # the defined outcome for a pair that cannot be scored
+                        # (see the retries-exhausted return below).
+                        print(f'  WARN validation got no text for row {idx} '
+                              f'(stop_reason={getattr(msg, "stop_reason", None)}) '
+                              f'- treating as "no"', flush=True)
+                    return idx, answer.strip().lower()
                 except Exception as e:
                     err = str(e)
                     if any(x in err for x in ('529', '429', 'overloaded', 'rate_limit', 'rate limit')):

@@ -64,6 +64,7 @@ import pandas as pd
 from anthropic import Anthropic
 from google.cloud import storage
 
+import src.modules.anthropic_utils as au
 from src.modules import fathom_client as fc
 import src.modules.pools as pl
 
@@ -267,7 +268,7 @@ def _claude_json(anth: Anthropic, model: str, system: str, user_payload: dict) -
         if final.stop_reason == 'max_tokens':
             raise ValueError('Claude hit the output token limit')
         try:
-            return _extract_json(final.content[0].text)
+            return _extract_json(au.response_text(final))
         except (ValueError, json.JSONDecodeError) as e:
             last_err = e
     raise ValueError(f'Claude returned invalid JSON twice: {last_err}')
