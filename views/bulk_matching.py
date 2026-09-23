@@ -25,6 +25,7 @@ import streamlit as st
 from google.cloud import run_v2, storage
 from google.oauth2 import service_account
 
+import src.modules.pools as pl
 from src.modules.email_generator import DEFAULT_SUBJECT_SYSTEM, DEFAULT_JOSIAH_SYSTEM
 from src.modules.grant_utils import normalize_grant_columns
 
@@ -311,11 +312,22 @@ if not contact_sources:
     st.stop()
 
 src_cols = st.columns(min(len(contact_sources), 6))
+# Every source is pre-checked EXCEPT the prospect pool. Prospects are a curated
+# target list that gets its own per-capability treatment in Aspect Match, and
+# folding them into every bulk run by default would quietly change what this
+# page has always meant. Tick it to include them.
 selected_sources = [
     src
     for i, src in enumerate(contact_sources)
-    if src_cols[i % len(src_cols)].checkbox(src, value=True, key=f'bm_src_{src}')
+    if src_cols[i % len(src_cols)].checkbox(
+        src, value=(src != pl.PROSPECTS), key=f'bm_src_{src}'
+    )
 ]
+if pl.PROSPECTS in contact_sources and pl.PROSPECTS not in selected_sources:
+    st.caption(
+        f'`{pl.PROSPECTS}` is the targeted-prospect pool and is off by default '
+        '— tick it to score prospects here as well as in Aspect Match.'
+    )
 
 # ── Section 2 · Grant topics ──────────────────────────────────────────────────
 

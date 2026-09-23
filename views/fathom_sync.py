@@ -30,12 +30,12 @@ import streamlit as st
 from google.cloud import storage
 
 from src.modules import fathom_client as fc
+import src.modules.pools as pl
 import src.modules.ui_common as uc
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
 _BUCKET          = 'cc-matcher-bucket-jeg-v1'
-_CLIENTS_PREFIX  = 'data/all-contacts/clients/'
 _CFG_PREFIX      = 'fathom-configs/'
 _STATUS_PREFIX   = 'fathom-jobs/'
 _ASSIGN_BLOB     = 'fathom-configs/assignments.json'
@@ -79,24 +79,26 @@ def _fathom_key() -> str:
     return str(st.secrets.get('fathom_api_key') or '').strip()
 
 
-def _load_client_frames() -> tuple[dict[str, pd.DataFrame], list[str]]:
+def _load_pool_frames() -> tuple[dict[str, pd.DataFrame], dict[str, str], list[str]]:
+    """({blob_name: frame}, {blob_name: pool}, errors) across BOTH pools.
+
+    Meetings are attributed by external invitee domain, which may belong to a
+    client or to a targeted prospect; the sweep is one pass either way. So this
+    page never scopes attribution by pool — it only labels and filters what it
+    shows. The job resolves both pools for the same reason."""
     client = _get_storage_client()
-    frames: dict[str, pd.DataFrame] = {}
-    errors: list[str] = []
-    for blob in client.list_blobs(_BUCKET, prefix=_CLIENTS_PREFIX):
-        if not blob.name.endswith('.parquet'):
-            continue
-        try:
-            frames[blob.name] = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-        except Exception as e:
-            errors.append(f'{blob.name}: {e}')
-    return frames, errors
+    frames:  dict[str, pd.DataFrame] = {}
+    pool_of: dict[str, str] = {}
+    errors:  list[str] = []
+    for pool_key in pl.POOL_KEYS:
+        pool_frames, errs = pl.load_frames(client, pool_key)
+        frames.update(pool_frames)
+        pool_of.update({blob: pool_key for blob in pool_frames})
+        errors.extend(errs)
+    return frames, pool_of, errors
 
 
-def _company_key(row: pd.Series) -> str:
-    name    = str(row.get('company_name') or '').strip()
-    website = str(row.get('companyWebsite') or '').strip()
-    return f'{name}||{website}'
+_company_key = pl.company_key
 
 
 def _empty_assignments() -> dict:
@@ -256,27 +258,39 @@ def render():
     api_key    = _fathom_key()
 
     if st.session_state.get('fs_frames') is None:
-        with st.spinner('Loading clients from GCS…'):
-            frames, load_errors = _load_client_frames()
-        st.session_state.fs_frames = frames
+        with st.spinner('Loading clients and prospects from GCS…'):
+            frames, pool_of, load_errors = _load_pool_frames()
+        st.session_state.fs_frames  = frames
+        st.session_state.fs_pool_of = pool_of
         for err in load_errors:
             st.warning(err)
 
-    frames = st.session_state.fs_frames
+    frames  = st.session_state.fs_frames
+    pool_of = st.session_state.get('fs_pool_of') or {}
 
-    client_labels:  dict[str, str] = {}   # client_key → display label
-    client_domains: dict[str, str] = {}   # client_key → own website domain
+    client_labels:  dict[str, str] = {}   # company_key → display label
+    client_domains: dict[str, str] = {}   # company_key → own website domain
+    client_pool:    dict[str, str] = {}   # company_key → which pool it is in
     if frames:
-        combined = pd.concat(frames.values(), ignore_index=True)
-        combined['_key'] = combined.apply(_company_key, axis=1)
+        combined = pl.combined_frame(frames)
         for key, grp in combined.groupby('_key', sort=False):
             name    = str(grp.iloc[0].get('company_name') or '').strip()
             website = str(grp.iloc[0].get('companyWebsite') or '').strip()
-            client_labels[key]  = f"{name or '—'}  ·  {website or 'no website'}"
+            # A company sits in exactly one pool; if a data error ever put it in
+            # both, the first blob wins here and the duplicate is visible in
+            # Company Records rather than silently averaged over.
+            pkey = pool_of.get(str(grp.iloc[0].get('_blob') or ''), pl.CLIENTS)
+            client_pool[key]    = pkey
+            client_labels[key]  = (f"{pl.pool(pkey)['icon']} {name or '—'}  ·  "
+                                   f"{website or 'no website'}")
             client_domains[key] = fc.bare_domain(website)
 
     if not client_labels:
-        st.warning('No client companies found in `data/all-contacts/clients/`.')
+        st.warning(
+            'No companies found in '
+            + ' or '.join(f'`{pl.contacts_prefix(k)}`' for k in pl.POOL_KEYS)
+            + '.'
+        )
         st.stop()
 
     # domain → client_key, own website first, manual assignments winning. Same

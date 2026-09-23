@@ -74,10 +74,10 @@ pages = {
         st.Page("views/grant_search.py", title="Grant Search", icon="🔍",
                 url_path="grant_search"),
     ],
-    "Clients": [
+    "Clients & prospects": [
         st.Page("views/contact_importer.py", title="Import Contacts", icon="👤",
                 url_path="contact_importer"),
-        st.Page("views/client_editor.py", title="Client Records", icon="✏️",
+        st.Page("views/client_editor.py", title="Company Records", icon="✏️",
                 url_path="client_editor"),
         st.Page("views/finance_researcher.py", title="Deep Research", icon="🧪",
                 url_path="finance_researcher"),

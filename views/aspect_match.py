@@ -49,6 +49,8 @@ from google.oauth2 import service_account
 
 import src.modules.aspect_matching as am
 import src.modules.aspect_profile as ap
+import src.modules.pools as pl
+import src.modules.ui_common as uc
 from src.modules.grant_utils import normalize_grant_columns
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -236,31 +238,50 @@ if 'am_pick_nonce' not in st.session_state:
 
 st.title('🎯 Aspect Match')
 st.caption(
-    'Score every client aspect against every selected grant topic, keep the '
+    'Score every company aspect against every selected grant topic, keep the '
     'topics that clear the threshold, then have Claude re-rank the survivors.'
 )
 
 gcs = _get_storage_client()
 
+# ── Section 1 · Companies ──────────────────────────────────────────────────
+
+st.subheader('1 · Select companies')
+
+# Read-only view, so "Both" is offered: a run across clients and prospects is a
+# real question ("who could bid on this?"). Every result row carries its pool,
+# so a prospect hit is never read as a client one.
+pool_keys = uc.pool_scope_selector(
+    'am_pools',
+    clears=('am_profiles', 'am_results', 'am_run_meta'),
+    help='Which profile store(s) to score. Prospect profiles live in their own '
+         'store, so a client run is unaffected by anything in the prospect pool.',
+)
+
 if st.session_state.am_profiles is None:
-    with st.spinner('Loading client profiles…'):
+    with st.spinner('Loading capability profiles…'):
         try:
-            st.session_state.am_profiles = ap.load_profiles(gcs)
+            loaded = [ap.load_profiles(gcs, pool=p) for p in pool_keys]
+            st.session_state.am_profiles = (
+                pd.concat([f for f in loaded if not f.empty], ignore_index=True)
+                if any(not f.empty for f in loaded) else loaded[0]
+            )
         except Exception as e:
-            st.error(f'Could not load {ap.PROFILES_BLOB}: {e}')
+            st.error(
+                'Could not load '
+                + ', '.join(ap.profiles_blob(p) for p in pool_keys) + f': {e}'
+            )
             st.stop()
 
 profiles: pd.DataFrame = st.session_state.am_profiles
 
 if profiles.empty:
     st.warning(
-        'No client profiles found. Build them in the **Client Profiles** view first.'
+        'No capability profiles in '
+        + ' or '.join(pl.label(p) for p in pool_keys)
+        + '. Build them in the **Capability Profiles** view first.'
     )
     st.stop()
-
-# ── Section 1 · Clients ────────────────────────────────────────────────────
-
-st.subheader('1 · Select clients')
 
 head_l, head_r = st.columns([1, 5])
 with head_l:
@@ -269,8 +290,8 @@ with head_l:
         st.rerun()
 with head_r:
     st.info(
-        f'{len(profiles):,} profiled client'
-        f'{"s" if len(profiles) != 1 else ""} · '
+        f'{len(profiles):,} profiled compan'
+        f'{"ies" if len(profiles) != 1 else "y"} · '
         f'{int(pd.to_numeric(profiles["n_aspects"], errors="coerce").fillna(0).sum()):,} aspects total'
     )
 
@@ -287,6 +308,9 @@ if qs2.button('Deselect all', key='am_pick_none_btn'):
 picker = pd.DataFrame({
     'use':      st.session_state.am_pick_all,
     'client':   profiles['company_name'].fillna('—').astype(str),
+    'pool':     profiles.get(
+        'pool', pd.Series(pl.CLIENTS, index=profiles.index)
+    ).fillna(pl.CLIENTS).astype(str).map(pl.display),
     'aspects':  pd.to_numeric(profiles['n_aspects'], errors='coerce').fillna(0).astype(int),
     'labels':   profiles['aspect_labels'].fillna('').astype(str),
     'built_at': profiles['built_at'].fillna('').astype(str),
@@ -297,10 +321,11 @@ edited = st.data_editor(
     hide_index=True,
     use_container_width=True,
     height=min(400, 60 + 36 * len(picker)),
-    disabled=['client', 'aspects', 'labels', 'built_at'],
+    disabled=['client', 'pool', 'aspects', 'labels', 'built_at'],
     column_config={
         'use':      st.column_config.CheckboxColumn('Use'),
-        'client':   st.column_config.TextColumn('Client'),
+        'client':   st.column_config.TextColumn('Company'),
+        'pool':     st.column_config.TextColumn('Pool'),
         'aspects':  st.column_config.NumberColumn('Aspects', format='%d'),
         'labels':   st.column_config.TextColumn('Aspect labels', width='large'),
         'built_at': st.column_config.TextColumn('Built'),
@@ -310,7 +335,7 @@ edited = st.data_editor(
 
 selected = profiles.loc[edited.index[edited['use'].fillna(False).to_numpy(dtype=bool)]]
 if selected.empty:
-    st.warning('Select at least one client.')
+    st.warning('Select at least one company.')
 
 max_aspects = int(pd.to_numeric(selected['n_aspects'], errors='coerce').fillna(0).max()) if not selected.empty else 1
 

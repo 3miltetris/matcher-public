@@ -43,6 +43,8 @@ from google.cloud import storage
 from google.oauth2 import service_account
 
 import src.modules.aspect_profile as ap
+import src.modules.pools as pl
+import src.modules.ui_common as uc
 import src.modules.finance_research as fr
 
 _BUCKET          = 'cc-matcher-bucket-jeg-v1'
@@ -307,8 +309,10 @@ def _load_fin_run(client: storage.Client, run_id: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
-    """data/client-profiles/profiles.parquet → one flat import row per company.
+def _load_profile_rows(
+    client: storage.Client, pools: list[str] | None = None
+) -> pd.DataFrame:
+    """The selected pools' profile stores → one flat import row per company.
 
     The aspects and markets live in the profile row as JSON arrays; HubSpot
     needs flat columns, so each company gets rolled-up fields (labels,
@@ -319,9 +323,13 @@ def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
     profiles written before ranks existed carry 'primary'/'secondary' strings and
     are coerced by ap.market_tier_rank(), so old rows still export.
     """
-    profiles = ap.load_profiles(client)
-    if profiles.empty:
+    frames = [
+        ap.load_profiles(client, pool=p) for p in (pools or [ap.DEFAULT_POOL])
+    ]
+    frames = [f for f in frames if not f.empty]
+    if not frames:
         return pd.DataFrame()
+    profiles = pd.concat(frames, ignore_index=True)
 
     rows = []
     for _, p in profiles.iterrows():
@@ -337,6 +345,9 @@ def _load_profile_rows(client: storage.Client) -> pd.DataFrame:
             'sources_used':     str(p.get('sources_used') or ''),
             'profile_model':    str(p.get('model') or ''),
             'profile_built_at': str(p.get('built_at') or ''),
+            # Which directory the company came from. Carried so a prospect
+            # pushed to HubSpot is identifiable as one in the CRM.
+            'pool':             pl.label(p.get('pool')),
         }
         for i, a in enumerate(aspects, start=1):
             label = str(a.get('label') or '')
@@ -920,18 +931,26 @@ elif mode == 'Financial research run':
         st.stop()
     run_id = st.selectbox('Select a completed run', runs)
 else:
-    run_id = f'client_profiles_{date.today().isoformat()}'
+    profile_pools = uc.pool_scope_selector(
+        'hs_profile_pools', label='Profile store',
+        clears=('hs_df',),
+        help='Clients, targeted prospects, or both. Every imported row carries '
+             'a `pool` column so the two stay distinguishable in HubSpot.',
+    )
+    run_id = ('client_profiles_' + '_'.join(profile_pools) + '_'
+              + date.today().isoformat())
     st.caption(
         'Imports the multi-aspect capability profiles stored in '
-        f'`{ap.PROFILES_BLOB}` — one HubSpot company per profiled client, '
-        'built in the **Client Profiles** view.'
+        + ' and '.join(f'`{ap.profiles_blob(p)}`' for p in profile_pools)
+        + ' — one HubSpot company per profiled company, built in the '
+          '**Capability Profiles** view.'
     )
 
 if st.session_state.hs_run_id != run_id:
     st.session_state.hs_df     = None
     st.session_state.hs_run_id = run_id
 
-_load_label = ('Load client profiles' if mode == 'Client profiles'
+_load_label = ('Load capability profiles' if mode == 'Client profiles'
                else 'Load run data')
 if st.button(_load_label, type='primary'):
     with st.spinner('Loading data…'):
@@ -940,11 +959,11 @@ if st.button(_load_label, type='primary'):
         elif mode == 'Financial research run':
             df = _load_fin_run(gcs, run_id)
         else:
-            df = _load_profile_rows(gcs)
+            df = _load_profile_rows(gcs, profile_pools)
     st.session_state.hs_df = df if not df.empty else None
     if df.empty:
         st.warning('No importable data found.'
-                   + (' Build profiles in the Client Profiles view first.'
+                   + (' Build profiles in the Capability Profiles view first.'
                       if mode == 'Client profiles' else ''))
 
 df: pd.DataFrame | None = st.session_state.hs_df

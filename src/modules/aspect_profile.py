@@ -46,6 +46,50 @@ CLIENTS_PREFIX  = 'data/all-contacts/clients/'
 PROFILES_PREFIX = 'data/client-profiles/'
 PROFILES_BLOB   = f'{PROFILES_PREFIX}profiles.parquet'
 
+# ── Pools ──────────────────────────────────────────────────────────────────
+# The same profile schema is built for two directories of companies — the
+# clients we work for and the prospects we are targeting — and each gets its
+# OWN blob rather than one store with a `pool` column. Reason: every consumer
+# here (Aspect Match, Grant Search, HubSpot Import, the directory) enumerates
+# the store it loads, so a shared store makes filtering something each reader
+# must remember, and the reader that forgets silently mixes prospects into
+# client work. That is the same trap documented for data/all-topics/awards/.
+#
+# `pool` is a plain keyword defaulting to 'clients' everywhere, so every
+# pre-pool call site keeps its exact previous behaviour. The full pool
+# registry (contact prefixes, labels, what may feed each one) lives in
+# src/modules/pools.py, which imports this module for the blob names — not
+# the other way round, or the two would be circular.
+POOL_CLIENTS   = 'clients'
+POOL_PROSPECTS = 'prospects'
+DEFAULT_POOL   = POOL_CLIENTS
+
+PROFILE_BLOBS = {
+    POOL_CLIENTS:   PROFILES_BLOB,
+    POOL_PROSPECTS: f'{PROFILES_PREFIX}prospect_profiles.parquet',
+}
+
+
+def profiles_blob(pool: str = DEFAULT_POOL) -> str:
+    """The profile store blob for a pool.
+
+    An unknown *string* falls back to the client store rather than raising — a
+    stale session value must not take a page down, and the caller is always one
+    of a fixed set of selectors.
+
+    A non-string is a programming error and raises, because the fallback would
+    otherwise write one pool's profiles into the other's store with no error
+    anywhere. That is not hypothetical: `with ThreadPoolExecutor(...) as pool`
+    in client_profile_job.main() shadowed the pool name, and every save in that
+    run resolved through here with an executor object as `pool`.
+    """
+    if pool is not None and not isinstance(pool, str):
+        raise TypeError(
+            f'pool must be a pool name, got {type(pool).__name__} — something '
+            'has shadowed the pool variable at the call site.'
+        )
+    return PROFILE_BLOBS.get(str(pool or ''), PROFILES_BLOB)
+
 ASPECT_MODELS = ['claude-sonnet-4-6', 'claude-haiku-4-5-20251001']
 DEFAULT_MODEL = 'claude-sonnet-4-6'
 
@@ -1388,18 +1432,33 @@ def empty_profiles_df() -> pd.DataFrame:
     return pd.DataFrame({c: pd.Series(dtype='object') for c in PROFILE_COLUMNS})
 
 
-def load_profiles(gcs_client, bucket: str = BUCKET) -> pd.DataFrame:
-    blob = gcs_client.bucket(bucket).blob(PROFILES_BLOB)
+def load_profiles(
+    gcs_client, bucket: str = BUCKET, pool: str = DEFAULT_POOL
+) -> pd.DataFrame:
+    """Every profile in one pool's store.
+
+    A `pool` column is stamped on the frame from the blob it was read out of —
+    derived at load time like `broad_agency` is from a topic folder, never
+    stored — so frames from both pools can be concatenated and still say where
+    each row came from. It is deliberately not in PROFILE_COLUMNS: save_profiles
+    drops it, and the blob stays the single source of truth for the pool.
+    """
+    blob = gcs_client.bucket(bucket).blob(profiles_blob(pool))
     if not blob.exists():
-        return empty_profiles_df()
+        df = empty_profiles_df()
+        df['pool'] = pd.Series(dtype='object')
+        return df
     df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
     for col in PROFILE_COLUMNS:
         if col not in df.columns:
             df[col] = None
+    df['pool'] = pool
     return df.reset_index(drop=True)
 
 
-def save_profiles(gcs_client, df: pd.DataFrame, bucket: str = BUCKET) -> None:
+def save_profiles(
+    gcs_client, df: pd.DataFrame, bucket: str = BUCKET, pool: str = DEFAULT_POOL
+) -> None:
     out = df.copy()
     for col in PROFILE_COLUMNS:
         if col not in out.columns:
@@ -1408,11 +1467,16 @@ def save_profiles(gcs_client, df: pd.DataFrame, bucket: str = BUCKET) -> None:
     # Written as plain ints so they survive the round-trip as ints, not floats
     for col in ('n_aspects', 'embedding_dim', 'n_markets', 'n_unexplored'):
         out[col] = out[col].fillna(0).astype('int64')
-    BucketManager(bucket, client=gcs_client).upload_file(PROFILES_BLOB, out)
+    BucketManager(bucket, client=gcs_client).upload_file(profiles_blob(pool), out)
 
 
-def upsert_profiles(existing: pd.DataFrame, records: list[dict]) -> pd.DataFrame:
-    """Replace any existing rows for the records' company keys, append the rest."""
+def upsert_profiles(
+    existing: pd.DataFrame, records: list[dict], pool: str | None = None
+) -> pd.DataFrame:
+    """Replace any existing rows for the records' company keys, append the rest.
+
+    `pool` stamps the incoming records so a frame loaded by load_profiles keeps
+    its pool column populated for every row; it is not written to the blob."""
     if not records:
         return existing
     keys = {r['company_key'] for r in records}
@@ -1421,7 +1485,10 @@ def upsert_profiles(existing: pd.DataFrame, records: list[dict]) -> pd.DataFrame
         if not existing.empty and 'company_key' in existing.columns
         else empty_profiles_df()
     )
-    merged = pd.concat([kept, pd.DataFrame(records)], ignore_index=True)
+    incoming = pd.DataFrame(records)
+    if pool is not None or 'pool' in kept.columns:
+        incoming['pool'] = pool if pool is not None else DEFAULT_POOL
+    merged = pd.concat([kept, incoming], ignore_index=True)
     return merged.sort_values(
         'company_name', key=lambda s: s.fillna('').astype(str).str.lower()
     ).reset_index(drop=True)

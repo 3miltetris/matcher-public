@@ -60,7 +60,7 @@ TOPIC_COLS = [
 
 # Result columns worth seeing first, in this order.
 DISPLAY_FIRST = [
-    'client', 'market', 'market_kind', 'market_tier', 'aspect_label', 'aspect_score',
+    'client', 'pool', 'market', 'market_kind', 'market_tier', 'aspect_label', 'aspect_score',
     'aspects_hit', 'aspects_total',
     'llm_score', 'llm_rationale', 'topic_number', 'title', 'agency', 'broad_agency',
 ]
@@ -306,6 +306,10 @@ def match_units(
             aspect = unit_aspects[ai]
             row = {
                 'client':           client,
+                # Which pool the profile came from (aspect_profile.load_profiles
+                # stamps it). A run over both pools must never let a prospect
+                # row read as a client one; '' for pre-pool callers.
+                'pool':             str(prof.get('pool') or ''),
                 'client_website':   prof['companyWebsite'],
                 'market':           str(market.get('market')) if market else '',
                 'market_kind':      kind or ROW_CONFIRMED,

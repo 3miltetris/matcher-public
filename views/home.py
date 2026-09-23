@@ -14,6 +14,7 @@ repo caches by hand everywhere; there is no st.cache_data in views/).
 import streamlit as st
 
 import src.modules.aspect_profile as ap
+import src.modules.pools as pl
 import src.modules.ui_common as uc
 
 # ── Pipeline map ───────────────────────────────────────────────────────────
@@ -27,25 +28,27 @@ _STEPS = [
         ('🔍', 'views/grant_search.py', 'Grant Search',
          'Ask which topics match a technology description, ad hoc.'),
     ]),
-    ('Clients', [
+    ('Clients & prospects', [
         ('👤', 'views/contact_importer.py', 'Import Contacts',
-         'Bring companies in from a spreadsheet or a HubSpot list, and '
-         'profile them.'),
-        ('✏️', 'views/client_editor.py', 'Client Records',
-         'Edit a client summary and re-embed it.'),
+         'Bring companies in from a spreadsheet or a HubSpot list — as leads, '
+         'or straight into the prospect pool — and profile them.'),
+        ('✏️', 'views/client_editor.py', 'Company Records',
+         'Edit a client or prospect summary, re-embed it, or promote a '
+         'prospect that signed.'),
         ('🧪', 'views/finance_researcher.py', 'Deep Research',
-         'Run OpenAI deep research on a client — financials, or technology '
-         'and R&D.'),
+         'Run OpenAI deep research on a client or prospect — financials, or '
+         'technology and R&D.'),
         ('🧩', 'views/client_profiler.py', 'Capability Profiles',
-         'Split each client into independently searchable capabilities and '
-         'the markets they serve.'),
+         'Split each client or prospect into independently searchable '
+         'capabilities and the markets they serve.'),
         ('🔄', 'views/client_sync.py', 'Client Sync',
          'Pull client material in from Google Drive and Fathom call '
          'transcripts.'),
     ]),
     ('Matching', [
         ('⚙️', 'views/bulk_matching.py', 'Bulk Matching',
-         'Score every client against every selected topic, whole-company.'),
+         'Score every contact source against every selected topic, '
+         'whole-company.'),
         ('🎯', 'views/aspect_match.py', 'Aspect Match',
          'Score per capability or per market — finds what the blended '
          'company embedding averages away.'),
@@ -72,24 +75,24 @@ def _gather_stats() -> dict:
     gcs   = uc.get_storage_client()
     stats: dict[str, object] = {}
 
-    try:
-        clients = uc.load_parquets_from_prefix(gcs, uc.CLIENTS_PREFIX)
-        if clients.empty:
-            stats['clients'] = 0
-        else:
-            stats['clients'] = int(
-                clients.apply(ap.company_key, axis=1).nunique()
+    # Both pools, counted separately — a prospect is not a client and the two
+    # numbers are read for different reasons.
+    for pool_key in pl.POOL_KEYS:
+        try:
+            rows = uc.load_parquets_from_prefix(gcs, pl.contacts_prefix(pool_key))
+            stats[pool_key] = 0 if rows.empty else int(
+                rows.apply(ap.company_key, axis=1).nunique()
             )
-    except Exception as e:
-        stats['clients'] = None
-        stats['clients_err'] = str(e)
+        except Exception as e:
+            stats[pool_key] = None
+            stats[f'{pool_key}_err'] = str(e)
 
-    try:
-        profiles = ap.load_profiles(gcs)
-        stats['profiles'] = 0 if profiles.empty else int(len(profiles))
-    except Exception as e:
-        stats['profiles'] = None
-        stats['profiles_err'] = str(e)
+        try:
+            profiles = ap.load_profiles(gcs, pool=pool_key)
+            stats[f'{pool_key}_profiles'] = 0 if profiles.empty else int(len(profiles))
+        except Exception as e:
+            stats[f'{pool_key}_profiles'] = None
+            stats[f'{pool_key}_profiles_err'] = str(e)
 
     try:
         stats['agencies'] = uc.list_prefixes(gcs, uc.TOPICS_PREFIX)
@@ -136,18 +139,26 @@ with st.expander('📊 At a glance', expanded=False):
     if stats is None:
         st.info('Not loaded yet.')
     else:
-        c1, c2, c3 = st.columns(3)
-        c1.metric('Client companies',
-                  '—' if stats['clients'] is None else f"{stats['clients']:,}")
-        c2.metric('Capability profiles',
-                  '—' if stats['profiles'] is None else f"{stats['profiles']:,}")
+        cols = st.columns(len(pl.POOL_KEYS) * 2 + 1)
+        for i, pool_key in enumerate(pl.POOL_KEYS):
+            companies = stats.get(pool_key)
+            profiles  = stats.get(f'{pool_key}_profiles')
+            cols[i * 2].metric(
+                f'{pl.label(pool_key)}',
+                '—' if companies is None else f'{companies:,}',
+            )
+            cols[i * 2 + 1].metric(
+                f'{pl.label(pool_key)} profiles',
+                '—' if profiles is None else f'{profiles:,}',
+            )
         agencies = stats['agencies']
-        c3.metric('Grant agency folders',
-                  '—' if agencies is None else f'{len(agencies):,}')
+        cols[-1].metric('Grant agency folders',
+                        '—' if agencies is None else f'{len(agencies):,}')
 
         if agencies:
             st.caption('Agency folders: ' + ' · '.join(agencies))
 
-        for key in ('clients_err', 'profiles_err', 'agencies_err'):
+        for key in [f'{k}_err' for k in pl.POOL_KEYS] + \
+                   [f'{k}_profiles_err' for k in pl.POOL_KEYS] + ['agencies_err']:
             if stats.get(key):
                 st.warning(f'{key.replace("_err", "")}: {stats[key]}')

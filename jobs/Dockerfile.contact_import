@@ -24,11 +24,17 @@ RUN playwright install chromium
 COPY jobs/contact_import_job.py jobs/contact_import_job.py
 
 # Shared research schema/prompt modules (Deep Research profiling mode) —
-# streamlit-free, stdlib-only imports, safe inside the job image
+# streamlit-free, stdlib-only imports, safe inside the job image.
+# pools.py adds the clients/prospects registry the job routes its output on;
+# it imports aspect_profile, which needs the two research modules and
+# BucketManager — keep all six COPY lines together.
 COPY src/__init__.py src/__init__.py
 COPY src/modules/__init__.py src/modules/__init__.py
 COPY src/modules/finance_research.py src/modules/finance_research.py
 COPY src/modules/tech_research.py src/modules/tech_research.py
+COPY src/modules/pools.py src/modules/pools.py
+COPY src/modules/aspect_profile.py src/modules/aspect_profile.py
+COPY src/modules/GoogleBucketManager/bucket_manager.py src/modules/GoogleBucketManager/bucket_manager.py
 
 ENV PYTHONPATH=/app
 

@@ -41,7 +41,9 @@ Config schema:
   },
   "profile_method": "scrape",            // or "deep_research"
   "research_model": "gpt-5.6-terra",     // deep_research only
-  "dedup_all_sources": false             // true = dedup vs all of data/all-contacts/
+  "dedup_all_sources": false,            // true = dedup vs all of data/all-contacts/
+  "pool":              null              // "prospects" = write into the prospect pool
+                                         //   instead of a plain lead-source folder
 }
 """
 
@@ -67,6 +69,7 @@ from google.cloud import storage
 from openai import OpenAI
 
 import src.modules.finance_research as fr
+import src.modules.pools as pl
 import src.modules.tech_research as tr
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -177,12 +180,30 @@ def _apply_col_map(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
 
 # ── Dedup ──────────────────────────────────────────────────────────────────────
 
+def _dedup_prefixes(source: str, all_sources: bool, pool: str | None) -> list[str]:
+    """Which contact prefixes an import is deduplicated against.
+
+    A pool import is checked against its own pool AND the client pool: a company
+    we already work for is not a prospect, and importing it as one would give it
+    two identities that every downstream join would then have to reconcile.
+    Plain lead-source imports keep their original scope."""
+    if all_sources:
+        return [_CONTACTS_ROOT]
+    if pool:
+        return sorted({pl.contacts_prefix(pool), pl.contacts_prefix(pl.CLIENTS)})
+    return [f'{_CONTACTS_ROOT}{source}/']
+
+
 def _load_existing_domains(
-    client: storage.Client, source: str, all_sources: bool = False
+    client: storage.Client, source: str, all_sources: bool = False,
+    pool: str | None = None,
 ) -> set[str]:
-    prefix  = _CONTACTS_ROOT if all_sources else f'{_CONTACTS_ROOT}{source}/'
     domains: set[str] = set()
-    for blob in client.list_blobs(_BUCKET, prefix=prefix):
+    blobs = [
+        b for prefix in _dedup_prefixes(source, all_sources, pool)
+        for b in client.list_blobs(_BUCKET, prefix=prefix)
+    ]
+    for blob in blobs:
         if not blob.name.endswith('.parquet'):
             continue
         try:
@@ -494,6 +515,11 @@ def main(config_blob_path: str) -> None:
     profile_method = config.get('profile_method', 'scrape')
     research_model = config.get('research_model', 'gpt-5.6-terra')
     dedup_all      = bool(config.get('dedup_all_sources', False))
+    # Destination pool (src/modules/pools.py). None = a plain lead-source
+    # folder, which is what every config written before pools existed means.
+    pool           = config.get('pool') or None
+    if pool and not pl.is_pool(pool):
+        raise ValueError(f'config named an unknown pool: {pool!r}')
 
     openai_key = _get_secret('openai-api-key')
 
@@ -516,9 +542,12 @@ def main(config_blob_path: str) -> None:
         return
 
     # ── Step 3: Dedup ──────────────────────────────────────────────────────────
-    scope = 'ALL sources' if dedup_all else f'source "{source}"'
+    scope = ('ALL sources' if dedup_all
+             else ', '.join(_dedup_prefixes(source, dedup_all, pool)))
     print(f'Loading existing domains for {scope}…', flush=True)
-    existing_domains = _load_existing_domains(gcs, source, all_sources=dedup_all)
+    existing_domains = _load_existing_domains(
+        gcs, source, all_sources=dedup_all, pool=pool
+    )
     print(f'  {len(existing_domains):,} existing domains', flush=True)
 
     mask             = mapped_df['companyWebsite'].apply(lambda u: _bare_domain(u) not in existing_domains)
@@ -581,10 +610,18 @@ def main(config_blob_path: str) -> None:
     out['scraped_at']      = today
 
     out        = out[out['embeddings'].notna()].reset_index(drop=True)
+    # A pool parquet is written in the clients column convention
+    # (company_name / summary) rather than the lead convention
+    # (companyName / company_summary), so every pool-aware view and job reads
+    # one spelling. normalize_company_columns RENAMES rather than copies, so a
+    # later edit to `summary` can never leave a stale `company_summary` behind.
+    if pool:
+        out = pl.normalize_company_columns(out)
     rows_saved = len(out)
 
     hex_suffix = _secrets.token_hex(3)
-    gcs_path   = f'{_CONTACTS_ROOT}{source}/{source}_{today}_{hex_suffix}.parquet'
+    prefix     = pl.contacts_prefix(pool) if pool else f'{_CONTACTS_ROOT}{source}/'
+    gcs_path   = f'{prefix}{source}_{today}_{hex_suffix}.parquet'
 
     buf = io.BytesIO()
     out.to_parquet(buf, index=False)
@@ -600,6 +637,7 @@ def main(config_blob_path: str) -> None:
         'rows_scraped_ok': rows_scraped_ok,
         'rows_saved':      rows_saved,
         'gcs_path':        gcs_path,
+        'pool':            pool,
         'error':           None,
         **research_extras,
     })

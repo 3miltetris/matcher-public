@@ -1,18 +1,22 @@
 """
-Client Editor
--------------
-Edit the company summary for records in data/all-contacts/clients/ and
-re-embed the new text. Multiple contact rows share one company summary,
-so an edit is applied to every row of the selected company and the
-source parquet file(s) are rewritten in place in GCS.
+Company Records
+---------------
+Edit the company summary for records in one pool (src/modules/pools.py —
+🏢 Clients or 🎯 Prospects, picked at the top of the page) and re-embed the
+new text. Multiple contact rows share one company summary, so an edit is
+applied to every row of the selected company and the source parquet file(s)
+are rewritten in place in GCS.
 
-Admins (see src/modules/access_control.py) additionally get a delete
-section for companies that are no longer clients: it removes every contact
-row of the company, its multi-aspect profile, and its Drive Sync folder
+A prospect that signs is **promoted** into the client pool from here: its
+contact rows and its capability profile move across, so nothing is re-imported
+or re-researched (src/modules/pool_transfer.py).
+
+Admins (see src/modules/access_control.py) additionally get a delete section
+for companies that should leave the pool: it removes every contact row of the
+company, its multi-aspect profile, and (clients only) its Drive Sync folder
 assignment, archiving the removed rows to data/deleted-clients/ first.
 """
 
-import io
 import traceback
 
 import numpy as np
@@ -23,13 +27,15 @@ from google.oauth2 import service_account
 
 import src.modules.access_control as ac
 import src.modules.client_delete as cd
+import src.modules.pool_transfer as ptr
+import src.modules.pools as pl
+import src.modules.ui_common as uc
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
 _BUCKET         = 'cc-matcher-bucket-jeg-v1'
-_CLIENTS_PREFIX = 'data/all-contacts/clients/'
 
 
 # ── GCS ────────────────────────────────────────────────────────────────────
@@ -41,41 +47,34 @@ def _get_storage_client() -> storage.Client:
     return storage.Client(credentials=creds)
 
 
-def _load_client_frames() -> tuple[dict[str, pd.DataFrame], list[str]]:
-    """Returns ({blob_name: df}, errors). Frames are kept per-blob so edits
-    can be written back to the exact file they came from."""
-    client = _get_storage_client()
-    blobs  = list(client.list_blobs(_BUCKET, prefix=_CLIENTS_PREFIX))
-
-    frames: dict[str, pd.DataFrame] = {}
-    errors: list[str] = []
-    for blob in blobs:
-        if not blob.name.endswith('.parquet'):
-            continue
-        try:
-            frames[blob.name] = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-        except Exception as e:
-            errors.append(f'{blob.name}: {e}')
-
-    return frames, errors
+def _load_pool_frames(pool: str) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """({blob_name: df}, errors). Frames are kept per-blob so edits can be
+    written back to the exact file they came from."""
+    return pl.load_frames(_get_storage_client(), pool)
 
 
-def _company_key(row: pd.Series) -> str:
-    name    = str(row.get('company_name') or '').strip()
-    website = str(row.get('companyWebsite') or '').strip()
-    return f'{name}||{website}'
+_company_key = pl.company_key
+_group_mask  = pl.key_mask
 
 
-def _group_mask(df: pd.DataFrame, key: str) -> pd.Series:
-    name, website = key.split('||', 1)
-    names    = df.get('company_name', pd.Series('', index=df.index)).fillna('').astype(str).str.strip()
-    websites = df.get('companyWebsite', pd.Series('', index=df.index)).fillna('').astype(str).str.strip()
-    return (names == name) & (websites == website)
+def _render_move_report() -> None:
+    """Outcome of the last promotion, rendered on the next run: the messages
+    are written just before an st.rerun() that discards them."""
+    report = st.session_state.get('ce_move_report')
+    if not report:
+        return
+    st.success('Promotion complete.')
+    st.markdown(ptr.format_report(report))
+    for err in report['errors']:
+        st.warning(err)
+    if st.button('Dismiss', key='ce_move_dismiss'):
+        st.session_state.ce_move_report = None
+        st.rerun()
 
 
 def _render_delete_report() -> None:
-    """Outcome of the last deletion. Also rendered on the 'no client files'
-    path — deleting the last client company lands there."""
+    """Outcome of the last deletion. Also rendered on the 'no files at all'
+    path — deleting the last company of a pool lands there."""
     report = st.session_state.get('ce_delete_report')
     if not report:
         return
@@ -90,24 +89,32 @@ def _render_delete_report() -> None:
 
 # ── Page ───────────────────────────────────────────────────────────────────
 
-st.title('✏️ Client Records')
+st.title('✏️ Company Records')
 st.caption(
-    'Update the company summary for a client and re-embed it. '
-    'The change is applied to every contact row of that company and '
-    'saved back to the original file in GCS.'
+    'Update the company summary and re-embed it. The change is applied to '
+    'every contact row of that company and saved back to the original file '
+    'in GCS.'
 )
+
+pool = uc.pool_selector(
+    'ce_pool',
+    clears=('ce_frames', 'ce_delete_report', 'ce_move_report'),
+    help='Clients are the companies we write proposals for. Prospects are '
+         'targets we are pursuing — promote one below when it signs.',
+)
+_NOUN = pl.noun(pool)
 
 # ── Load ───────────────────────────────────────────────────────────────────
 
 col_reload, col_count = st.columns([1, 5])
 with col_reload:
-    if st.button('↺ Reload', help='Refresh client data from GCS'):
+    if st.button('↺ Reload', help=f'Refresh {_NOUN} data from GCS'):
         st.session_state.pop('ce_frames', None)
         st.rerun()
 
 if 'ce_frames' not in st.session_state:
-    with st.spinner('Loading clients from GCS…'):
-        frames, load_errors = _load_client_frames()
+    with st.spinner(f'Loading {_NOUN}s from GCS…'):
+        frames, load_errors = _load_pool_frames(pool)
     st.session_state.ce_frames = frames
     for err in load_errors:
         st.warning(err)
@@ -115,7 +122,12 @@ if 'ce_frames' not in st.session_state:
 frames: dict[str, pd.DataFrame] = st.session_state.ce_frames
 
 if not frames:
-    st.warning(f'No parquet files found under {_CLIENTS_PREFIX} in GCS.')
+    st.warning(
+        f'No parquet files found under {pl.contacts_prefix(pool)} in GCS.'
+        + (' Import companies with the 🎯 Prospects destination in Import '
+           'Contacts to start this pool.' if pool == pl.PROSPECTS else '')
+    )
+    _render_move_report()
     _render_delete_report()
     st.stop()
 
@@ -131,7 +143,7 @@ with col_count:
 # ── Select company ─────────────────────────────────────────────────────────
 
 st.divider()
-st.subheader('Select client')
+st.subheader(f'Select {_NOUN}')
 
 combined['_key'] = combined.apply(_company_key, axis=1)
 groups = (
@@ -151,7 +163,7 @@ labels = {
     for _, row in groups.iterrows()
 }
 selected_key = st.selectbox(
-    'Client company',
+    f'{pl.label(pool).rstrip("s")} company',
     options=list(labels.keys()),
     format_func=lambda k: labels[k],
 )
@@ -243,19 +255,96 @@ if save_btn:
         f'{len(files_written)} file{"s" if len(files_written) != 1 else ""} in GCS.'
     )
 
-# ── Delete clients (admin only) ────────────────────────────────────────────
+# ── Promote prospects to clients ───────────────────────────────────────────
+# Deliberately above the delete section: that one st.stop()s for non-admins,
+# and promotion is an everyday workflow action, not a privileged one.
+
+_render_move_report()
+
+if pool == pl.PROSPECTS:
+    st.divider()
+    st.subheader('⬆️ Promote to client')
+    st.caption(
+        'Moves the company into `data/all-contacts/clients/` with everything '
+        'already on it — research, meeting digests, documents — and moves its '
+        'capability profile into the client profile store. Nothing is '
+        're-imported or re-researched. The rows are written to the client pool '
+        'before they are removed from prospects, so a failure mid-way leaves '
+        'the company in both pools rather than in neither.'
+    )
+
+    _promote_key = f'ce_promote_keys_{selected_key}'
+    if _promote_key in st.session_state:
+        st.session_state[_promote_key] = [
+            k for k in st.session_state[_promote_key] if k in labels
+        ]
+
+    promote_keys = st.multiselect(
+        'Prospects to promote',
+        options=list(labels.keys()),
+        default=[selected_key],
+        format_func=lambda k: labels[k],
+        key=_promote_key,
+    )
+    move_profile = st.checkbox(
+        'Also move their capability profile', value=True, key='ce_promote_profile',
+        help='Moves the row from prospect_profiles.parquet into '
+             'profiles.parquet, so the company appears in client-scoped Aspect '
+             'Match runs and disappears from prospect-scoped ones. Unticking '
+             'leaves the profile behind in the prospect store, where it would '
+             'no longer have contact rows.',
+    )
+
+    if promote_keys:
+        counts = cd.count_rows(frames, promote_keys)
+        st.dataframe(
+            pd.DataFrame([
+                {'prospect': labels[k].split('  (')[0], 'contact rows': counts.get(k, 0)}
+                for k in promote_keys
+            ]),
+            hide_index=True, use_container_width=True,
+        )
+
+    if st.button(
+        f'⬆️ Promote {len(promote_keys)} prospect'
+        f'{"s" if len(promote_keys) != 1 else ""} to client',
+        type='primary',
+        disabled=not promote_keys,
+    ):
+        with st.spinner('Moving…'):
+            try:
+                report = ptr.move_companies(
+                    _get_storage_client(),
+                    promote_keys,
+                    source_pool  = pl.PROSPECTS,
+                    dest_pool    = pl.CLIENTS,
+                    move_profile = move_profile,
+                    actor        = ac.current_user_email() or 'local-dev',
+                )
+            except Exception as e:
+                st.error(f'Promotion failed: {e}')
+                st.code(traceback.format_exc())
+                st.stop()
+
+        st.session_state.ce_move_report = report
+        st.session_state.pop('ce_frames', None)      # both pools changed
+        st.session_state.pop(_promote_key, None)
+        st.rerun()
+
+
+# ── Delete companies (admin only) ──────────────────────────────────────────
 
 st.divider()
-st.subheader('🗑 Delete clients')
+st.subheader(f'🗑 Delete {_NOUN}s')
 
 _render_delete_report()
 
 if not ac.is_admin():
-    ac.admin_only_notice('Deleting clients')
+    ac.admin_only_notice(f'Deleting {_NOUN}s')
     st.stop()
 
 st.caption(
-    'Removes the company from `data/all-contacts/clients/` entirely — every '
+    f'Removes the company from `{pl.contacts_prefix(pool)}` entirely — every '
     'contact row, in every file it appears in. Removed rows are backed up to '
     f'`{cd.ARCHIVE_PREFIX}` first, so a mistake can be undone by hand.'
 )
@@ -274,7 +363,7 @@ if _del_key in st.session_state:
     ]
 
 del_keys = st.multiselect(
-    'Clients to delete',
+    f'{pl.label(pool)} to delete',
     options=list(labels.keys()),
     default=[selected_key],
     format_func=lambda k: labels[k],
@@ -285,21 +374,24 @@ opt_l, opt_r = st.columns(2)
 with opt_l:
     also_profile = st.checkbox(
         'Also delete their multi-aspect profile', value=True,
-        help='Removes the row from data/client-profiles/profiles.parquet so the '
-             'client disappears from Bulk Aspect Match.',
+        help=f'Removes the row from {pl.profiles_blob(pool)} so the company '
+             'disappears from Aspect Match.',
     )
 with opt_r:
-    also_drive = st.checkbox(
-        'Also clear their Drive Sync folder assignment', value=True,
-        help='Marks the folder skipped so Drive Sync neither syncs it nor '
-             'proposes it as a new client on the next scan.',
-    )
+    # Prospects have no Drive folders — the checkbox would do nothing.
+    also_drive = False
+    if pl.supports_drive(pool):
+        also_drive = st.checkbox(
+            'Also clear their Drive Sync folder assignment', value=True,
+            help='Marks the folder skipped so Drive Sync neither syncs it nor '
+                 'proposes it as a new client on the next scan.',
+        )
 
 if del_keys:
     counts = cd.count_rows(frames, del_keys)
     st.dataframe(
         pd.DataFrame([
-            {'client': labels[k].split('  (')[0], 'contact rows': counts.get(k, 0)}
+            {_NOUN: labels[k].split('  (')[0], 'contact rows': counts.get(k, 0)}
             for k in del_keys
         ]),
         hide_index=True, use_container_width=True,
@@ -314,10 +406,10 @@ confirm = st.text_input(
 )
 
 if st.button(
-    f'🗑 Delete {len(del_keys)} client{"s" if len(del_keys) != 1 else ""} permanently',
+    f'🗑 Delete {len(del_keys)} {_NOUN}{"s" if len(del_keys) != 1 else ""} permanently',
     type='primary',
     disabled=not del_keys or confirm.strip().upper() != 'DELETE',
-    help='Select at least one client and type DELETE to enable.',
+    help=f'Select at least one {_NOUN} and type DELETE to enable.',
 ):
     with st.spinner('Deleting…'):
         try:
@@ -327,6 +419,7 @@ if st.button(
                 delete_profiles         = also_profile,
                 clear_drive_assignments = also_drive,
                 actor                   = ac.current_user_email() or 'local-dev',
+                pool                    = pool,
             )
         except Exception as e:
             st.error(f'Delete failed: {e}')
@@ -334,7 +427,7 @@ if st.button(
             st.stop()
 
     st.session_state.ce_delete_report = report
-    st.session_state.pop('ce_frames', None)      # reload clients from GCS
+    st.session_state.pop('ce_frames', None)      # reload the pool from GCS
     st.session_state.pop(_del_key, None)         # deleted keys are no longer options
     st.session_state.pop(_conf_key, None)
     st.rerun()

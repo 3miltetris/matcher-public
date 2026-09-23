@@ -1,9 +1,12 @@
 """
-Client Research
----------------
-Run OpenAI Deep Research on client companies from data/all-contacts/clients/
-and write the structured findings back onto their contact rows. Two research
-focuses share the same launch/poll/apply flow:
+Deep Research
+-------------
+Run OpenAI Deep Research on the companies of one pool (src/modules/pools.py —
+🏢 Clients or 🎯 Prospects, picked at the top of the page) and write the
+structured findings back onto their contact rows. For prospects this is the
+main way material arrives at all: a targeted company we hold nothing on but a
+website becomes profilable from one technology run. Two research focuses share
+the same launch/poll/apply flow:
 
   💰 Financials       → financial_data + financial_summary + financials_updated_at
                         (runs stored in finance-research-runs/, run IDs finres_*)
@@ -18,10 +21,11 @@ intentionally changes grant matching for those companies.
 Deep Research calls take 2-10 minutes each, so they are launched as
 background tasks via the Responses API and polled — run state persists to
 GCS at {runs_prefix}{run_id}/state.json so a refresh (or another session)
-can resume monitoring with the Resume expander.
+can resume monitoring with the Resume expander. The pool is recorded in that
+state, so a run resumed from another session applies to the pool it was
+launched for rather than whichever one the selector happens to show.
 """
 
-import io
 import json
 import re
 import time
@@ -36,14 +40,15 @@ from google.oauth2 import service_account
 from openai import OpenAI
 
 import src.modules.finance_research as fr
+import src.modules.pools as pl
 import src.modules.tech_research as tr
+import src.modules.ui_common as uc
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
 _BUCKET         = 'cc-matcher-bucket-jeg-v1'
-_CLIENTS_PREFIX = 'data/all-contacts/clients/'
 _POLL_INTERVAL  = 30   # seconds between Deep Research status checks
 
 # Everything focus-specific lives here — the rest of the view is generic.
@@ -108,36 +113,14 @@ def _get_storage_client() -> storage.Client:
     return storage.Client(credentials=creds)
 
 
-def _load_client_frames() -> tuple[dict[str, pd.DataFrame], list[str]]:
-    """Returns ({blob_name: df}, errors). Frames are kept per-blob so
-    research columns can be written back to the exact file they came from."""
-    client = _get_storage_client()
-    blobs  = list(client.list_blobs(_BUCKET, prefix=_CLIENTS_PREFIX))
-
-    frames: dict[str, pd.DataFrame] = {}
-    errors: list[str] = []
-    for blob in blobs:
-        if not blob.name.endswith('.parquet'):
-            continue
-        try:
-            frames[blob.name] = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-        except Exception as e:
-            errors.append(f'{blob.name}: {e}')
-
-    return frames, errors
+def _load_pool_frames(pool: str) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """({blob_name: df}, errors). Frames are kept per-blob so research columns
+    can be written back to the exact file they came from."""
+    return pl.load_frames(_get_storage_client(), pool)
 
 
-def _company_key(row: pd.Series) -> str:
-    name    = str(row.get('company_name') or '').strip()
-    website = str(row.get('companyWebsite') or '').strip()
-    return f'{name}||{website}'
-
-
-def _group_mask(df: pd.DataFrame, key: str) -> pd.Series:
-    name, website = key.split('||', 1)
-    names    = df.get('company_name', pd.Series('', index=df.index)).fillna('').astype(str).str.strip()
-    websites = df.get('companyWebsite', pd.Series('', index=df.index)).fillna('').astype(str).str.strip()
-    return (names == name) & (websites == website)
+_company_key = pl.company_key
+_group_mask  = pl.key_mask
 
 
 # ── Run state (GCS-checkpointed) ───────────────────────────────────────────
@@ -193,11 +176,16 @@ def _apply_to_clients(state: dict, cfg: dict, update_summary: bool = False) -> N
     """Write the focus's research columns onto every contact row of each
     researched company and rewrite the source parquets in place. With
     update_summary (technology focus only), also rewrite each company's
-    matching `summary` from the researched technology and re-embed it."""
-    completed = [c for c in state['companies'] if c.get('output')]
+    matching `summary` from the researched technology and re-embed it.
 
-    with st.spinner('Loading client files from GCS…'):
-        frames, load_errors = _load_client_frames()
+    The pool comes from the RUN, not from the selector at the top of the page:
+    a run resumed by ID in another session must write back to the pool it was
+    launched for. Runs created before pools existed carry none -> clients."""
+    completed = [c for c in state['companies'] if c.get('output')]
+    run_pool  = state.get('pool') or pl.CLIENTS
+
+    with st.spinner(f'Loading {pl.noun(run_pool)} files from GCS…'):
+        frames, load_errors = _load_pool_frames(run_pool)
     for err in load_errors:
         st.warning(err)
 
@@ -264,11 +252,13 @@ def _apply_to_clients(state: dict, cfg: dict, update_summary: bool = False) -> N
             st.stop()
 
     if missing:
-        st.warning('No client rows found for: ' + ', '.join(missing))
+        st.warning(
+            f'No {pl.noun(run_pool)} rows found for: ' + ', '.join(missing)
+        )
 
     state['applied'] = True
     _save_state(_get_storage_client(), state['run_id'], state)
-    st.session_state.pop('fr_frames', None)   # force reload of client list
+    st.session_state.pop('fr_frames', None)   # force reload of the company list
     msg = (
         f'Updated **{rows_updated}** contact row{"s" if rows_updated != 1 else ""} '
         f'across **{len(touched_blobs)}** file{"s" if len(touched_blobs) != 1 else ""} '
@@ -293,10 +283,10 @@ if 'fr_active_run' not in st.session_state:
 
 st.title('🧪 Deep Research')
 st.caption(
-    'Run OpenAI Deep Research on client companies — financial diligence or '
-    'technology/R&D profiling — then save the findings onto their client '
-    'profiles. Financial runs never modify summaries or embeddings; '
-    'technology runs can optionally rewrite the matching summary and re-embed.'
+    'Run OpenAI Deep Research on companies — financial diligence or '
+    'technology/R&D profiling — then save the findings onto their contact '
+    'rows. Financial runs never modify summaries or embeddings; technology '
+    'runs can optionally rewrite the matching summary and re-embed.'
 )
 
 # ── Active run monitor (shown above everything else while a run exists) ────
@@ -427,7 +417,7 @@ if st.session_state.fr_active_run:
 
         st.divider()
         if state.get('applied'):
-            st.info('These results have already been applied to the client profiles.')
+            st.info('These results have already been applied to the company rows.')
 
         update_summary = False
         if cfg.get('matching_summary'):
@@ -454,7 +444,7 @@ if st.session_state.fr_active_run:
         else:
             apply_help += ' Summaries and embeddings are untouched.'
 
-        if st.button('💾 Apply to client profiles', type='primary', help=apply_help):
+        if st.button('💾 Apply to company rows', type='primary', help=apply_help):
             _apply_to_clients(state, cfg, update_summary=update_summary)
     else:
         st.warning('No companies produced usable results.')
@@ -481,17 +471,26 @@ with st.expander('Resume monitoring a previous research run'):
         st.session_state.fr_active_run = resume_id.strip()
         st.rerun()
 
-# ── Load clients ───────────────────────────────────────────────────────────
+# ── Load the pool ──────────────────────────────────────────────────────────
+# Below the active-run monitor, which st.stop()s: while a run is being polled
+# the selector is irrelevant, and the run carries its own pool anyway.
+
+pool = uc.pool_selector(
+    'fr_pool', clears=('fr_frames',),
+    help='Research a client or a targeted prospect. For prospects this is '
+         'usually the first material they have.',
+)
+_NOUN = pl.noun(pool)
 
 col_reload, col_count = st.columns([1, 5])
 with col_reload:
-    if st.button('↺ Reload', help='Refresh client data from GCS'):
+    if st.button('↺ Reload', help=f'Refresh {_NOUN} data from GCS'):
         st.session_state.pop('fr_frames', None)
         st.rerun()
 
 if 'fr_frames' not in st.session_state:
-    with st.spinner('Loading clients from GCS…'):
-        frames, load_errors = _load_client_frames()
+    with st.spinner(f'Loading {_NOUN}s from GCS…'):
+        frames, load_errors = _load_pool_frames(pool)
     st.session_state.fr_frames = frames
     for err in load_errors:
         st.warning(err)
@@ -499,7 +498,11 @@ if 'fr_frames' not in st.session_state:
 frames: dict[str, pd.DataFrame] = st.session_state.fr_frames
 
 if not frames:
-    st.warning(f'No parquet files found under {_CLIENTS_PREFIX} in GCS.')
+    st.warning(
+        f'No parquet files found under {pl.contacts_prefix(pool)} in GCS.'
+        + (' Import companies with the 🎯 Prospects destination in Import '
+           'Contacts to start this pool.' if pool == pl.PROSPECTS else '')
+    )
     st.stop()
 
 combined = pd.concat(frames.values(), ignore_index=True)
@@ -522,12 +525,12 @@ groups = (
 )
 
 with col_count:
-    st.info(f'{len(groups):,} client companies loaded.')
+    st.info(f'{len(groups):,} {_NOUN} companies loaded.')
 
-# ── 1 · Select clients ─────────────────────────────────────────────────────
+# ── 1 · Select companies ───────────────────────────────────────────────────
 
 st.divider()
-st.subheader('1 · Select clients to research')
+st.subheader(f'1 · Select {_NOUN}s to research')
 
 
 def _label(row) -> str:
@@ -541,9 +544,9 @@ def _label(row) -> str:
 
 labels = {row['_key']: _label(row) for _, row in groups.iterrows()}
 
-select_all = st.checkbox('Select all clients')
+select_all = st.checkbox(f'Select all {_NOUN}s')
 selected_keys = st.multiselect(
-    'Client companies',
+    f'{pl.label(pool)} companies',
     options=list(labels.keys()),
     default=list(labels.keys()) if select_all else [],
     format_func=lambda k: labels[k],
@@ -576,7 +579,7 @@ if not _has_any.empty:
                 st.warning(f"Could not parse stored {fcfg['data_col']}: {e}")
 
 if not selected_keys:
-    st.caption('Select at least one client to continue.')
+    st.caption(f'Select at least one {_NOUN} to continue.')
     st.stop()
 
 # ── 2 · Configure & start ──────────────────────────────────────────────────
@@ -670,6 +673,9 @@ try:
     state = {
         'run_id':     run_id,
         'focus':      focus_key,
+        # Recorded so apply writes back to the pool this was launched for,
+        # whatever the selector shows when the run is resumed.
+        'pool':       pool,
         'model':      model,
         'created_at': datetime.now().isoformat(timespec='seconds'),
         'applied':    False,

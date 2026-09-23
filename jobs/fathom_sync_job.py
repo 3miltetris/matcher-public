@@ -65,11 +65,11 @@ from anthropic import Anthropic
 from google.cloud import storage
 
 from src.modules import fathom_client as fc
+import src.modules.pools as pl
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 _BUCKET          = 'cc-matcher-bucket-jeg-v1'
-_CLIENTS_PREFIX  = 'data/all-contacts/clients/'
 _CFG_PREFIX      = 'fathom-configs/'
 _STATUS_PREFIX   = 'fathom-jobs/'
 _SYNC_STATE_BLOB = 'fathom-configs/sync_state.json'
@@ -197,29 +197,31 @@ def _write_status(client: storage.Client, run_id: str, payload: dict) -> None:
     _save_json_blob(client, f'{_STATUS_PREFIX}{run_id}/status.json', payload)
 
 
-# ── Client frames (clients/ convention: company_name / summary) ────────────────
+# ── Company frames (clients/ convention: company_name / summary) ──────────────
 
 def _load_client_frames(client: storage.Client) -> dict[str, pd.DataFrame]:
+    """Every pool in one {blob_name: frame} dict.
+
+    A meeting is attributed by the external invitee's domain, and that domain
+    may belong to a client or to a targeted prospect — the sweep cannot know
+    which, and it costs one paginated pass either way, so both pools are always
+    resolved. Blob names are unique per prefix, so the merged dict still writes
+    each row back to the exact file it came from and a prospect's digest lands
+    in the prospect parquet."""
     frames: dict[str, pd.DataFrame] = {}
-    for blob in client.list_blobs(_BUCKET, prefix=_CLIENTS_PREFIX):
-        if not blob.name.endswith('.parquet'):
-            continue
-        try:
-            frames[blob.name] = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-        except Exception as e:
-            print(f'  WARN could not read {blob.name}: {e}', flush=True)
+    for pool_key in pl.POOL_KEYS:
+        pool_frames, errors = pl.load_frames(client, pool_key)
+        for err in errors:
+            print(f'  WARN could not read {err}', flush=True)
+        frames.update(pool_frames)
     return frames
 
 
-def _group_mask(df: pd.DataFrame, key: str) -> pd.Series:
-    name, website = key.split('||', 1)
-    names    = df.get('company_name', pd.Series('', index=df.index)).fillna('').astype(str).str.strip()
-    websites = df.get('companyWebsite', pd.Series('', index=df.index)).fillna('').astype(str).str.strip()
-    return (names == name) & (websites == website)
+_group_mask = pl.key_mask
 
 
 def _client_identities(frames: dict[str, pd.DataFrame]) -> dict[str, str]:
-    """client_key -> company_name for every company present in clients/."""
+    """client_key -> company_name for every company in either pool."""
     out: dict[str, str] = {}
     for df in frames.values():
         if 'company_name' not in df.columns:
@@ -400,7 +402,10 @@ def main(config_blob_path: str) -> None:
     frames     = _load_client_frames(gcs)
     identities = _client_identities(frames)
     if not identities:
-        raise RuntimeError('No client companies found in data/all-contacts/clients/')
+        raise RuntimeError(
+            'No companies found in '
+            + ' or '.join(pl.contacts_prefix(k) for k in pl.POOL_KEYS)
+        )
 
     # domain → client_key: the client's own website first, manual assignments win
     domain_map: dict[str, str] = {}

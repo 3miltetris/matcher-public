@@ -1,10 +1,11 @@
 """
 client_profile_job.py — Cloud Run Job for the Client Profiles feature.
 
-Builds multi-aspect capability profiles for client companies out of material
-that already exists on their rows in data/all-contacts/clients/ (website
-summary/scrape, Drive document extractions, Deep Research output). For each
-selected company:
+Builds multi-aspect capability profiles for the companies of one pool
+(src/modules/pools.py — clients or prospects) out of material that already
+exists on their contact rows (website summary/scrape, Drive document
+extractions, meeting digests, Deep Research output). For each selected
+company:
 
   1. Merge its contact rows into one material row (first non-empty per column)
   2. Assemble the selected source texts + fingerprint ALL available material
@@ -18,7 +19,9 @@ selected company:
   5. Claude pass 2 (optional) → unexplored markets: customer worlds the company
      does NOT serve, inferred by linking the aspects it already has. Stored in
      their own columns, so speculation is never read back as capability
-  6. Upsert the profile row into data/client-profiles/profiles.parquet
+  6. Upsert the profile row into that pool's profile store
+     (data/client-profiles/profiles.parquet for clients,
+     prospect_profiles.parquet for prospects)
 
 Aspect merging happens before market membership is re-derived, so a market can
 never end up pointing at an aspect that was folded away. Pass 2 is wrapped in
@@ -42,6 +45,7 @@ Environment variables (injected by Cloud Run from Secret Manager):
 Config schema:
 {
   "run_id":         "client_profile_2026-08-19_10-30-00",
+  "pool":           "clients",
   "company_keys":   ["Acme Robotics||https://acme.com", ...],
   "sources":        ["website", "drive", "technology"],
   "target_aspects": 4,
@@ -57,7 +61,6 @@ Config schema:
 }
 """
 
-import io
 import json
 import os
 import sys
@@ -72,11 +75,11 @@ from google.cloud import storage
 from openai import OpenAI
 
 import src.modules.aspect_profile as ap
+import src.modules.pools as pl
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 _BUCKET         = ap.BUCKET
-_CLIENTS_PREFIX = ap.CLIENTS_PREFIX
 _STATUS_PREFIX  = 'client-profile-jobs/'
 
 _TOKEN_LIMIT       = 7_500
@@ -111,16 +114,11 @@ def _write_status(client: storage.Client, run_id: str, payload: dict) -> None:
     )
 
 
-def _load_client_frames(client: storage.Client) -> list[pd.DataFrame]:
-    frames: list[pd.DataFrame] = []
-    for blob in client.list_blobs(_BUCKET, prefix=_CLIENTS_PREFIX):
-        if not blob.name.endswith('.parquet'):
-            continue
-        try:
-            frames.append(pd.read_parquet(io.BytesIO(blob.download_as_bytes())))
-        except Exception as e:
-            print(f'  WARN could not read {blob.name}: {e}', flush=True)
-    return frames
+def _load_pool_frames(client: storage.Client, pool: str) -> list[pd.DataFrame]:
+    frames, errors = pl.load_frames(client, pool)
+    for err in errors:
+        print(f'  WARN could not read {err}', flush=True)
+    return list(frames.values())
 
 
 # ── Embedding ──────────────────────────────────────────────────────────────────
@@ -179,6 +177,18 @@ def main(config_blob_path: str) -> None:
     config = json.loads(gcs.bucket(_BUCKET).blob(config_blob_path).download_as_text())
 
     run_id       = config['run_id']
+    # Which directory of companies this run profiles, and therefore which
+    # contact prefix it reads and which profile store it writes. Absent in
+    # configs written before pools existed → clients, the previous behaviour.
+    #
+    # NOT named `pool`: `with ThreadPoolExecutor(...) as pool` is the house
+    # idiom in every job in this repo (16 occurrences), and one of them lives
+    # further down THIS function. A local named `pool` there silently rebinds
+    # the name for the closures below — _status(), _save_records() — which are
+    # defined before it and called after it. That shipped once: every profile
+    # save resolved ap.profiles_blob(<ThreadPoolExecutor>) instead of a pool
+    # name, and the run died on json.dumps of the executor in the status file.
+    pool_key     = config.get('pool') or ap.DEFAULT_POOL
     wanted_keys  = list(config.get('company_keys') or [])
     sources      = list(config.get('sources') or ap.SOURCE_KEYS)
     target       = int(config.get('target_aspects', 4))
@@ -191,6 +201,9 @@ def main(config_blob_path: str) -> None:
     model        = config.get('model', ap.DEFAULT_MODEL)
     dry_run      = bool(config.get('dry_run', False))
     workers      = max(1, min(_MAX_WORKERS, int(config.get('concurrency', _DEFAULT_WORKERS))))
+
+    if not pl.is_pool(pool_key):
+        raise ValueError(f'config named an unknown pool: {pool_key!r}')
 
     sources = [s for s in sources if s in ap.SOURCE_KEYS]
     if not sources:
@@ -208,10 +221,10 @@ def main(config_blob_path: str) -> None:
     system     = ap.build_aspect_system(target, max_markets, assess_def)
     unexp_system = ap.build_unexplored_system(max_unexp) if assess_unexp else ''
 
-    print('Loading client frames…', flush=True)
-    frames = _load_client_frames(gcs)
+    print(f'Loading {pool_key} frames…', flush=True)
+    frames = _load_pool_frames(gcs, pool_key)
     if not frames:
-        raise RuntimeError(f'no parquet files under {_CLIENTS_PREFIX}')
+        raise RuntimeError(f'no parquet files under {pl.contacts_prefix(pool_key)}')
     combined = pd.concat(frames, ignore_index=True)
     combined['_key'] = combined.apply(ap.company_key, axis=1)
     del frames
@@ -241,6 +254,7 @@ def main(config_blob_path: str) -> None:
             'run_id':         run_id,
             'state':          state,
             'dry_run':        dry_run,
+            'pool':           pool_key,
             'model':          model,
             'sources':        sources,
             'target_aspects': target,
@@ -255,7 +269,7 @@ def main(config_blob_path: str) -> None:
             'warnings':       warn_notes,
             'deferred':       deferred,
             'stopped_early':  stopped_early,
-            'profiles_blob':  ap.PROFILES_BLOB,
+            'profiles_blob':  ap.profiles_blob(pool_key),
             'error':          None,
         }
 
@@ -265,8 +279,10 @@ def main(config_blob_path: str) -> None:
         run's own records always win for the companies it rebuilt."""
         if dry_run or not records:
             return
-        existing = ap.load_profiles(gcs)
-        ap.save_profiles(gcs, ap.upsert_profiles(existing, records))
+        existing = ap.load_profiles(gcs, pool=pool_key)
+        ap.save_profiles(
+            gcs, ap.upsert_profiles(existing, records, pool=pool_key), pool=pool_key
+        )
 
     def _build_one(key: str) -> dict:
         """Runs in a worker thread. Never raises — the outcome is the return."""

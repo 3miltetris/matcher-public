@@ -22,6 +22,8 @@ import streamlit as st
 from google.cloud import run_v2, storage
 from google.oauth2 import service_account
 
+import src.modules.pools as pl
+
 # ── Constants ──────────────────────────────────────────────────────────────
 
 BUCKET          = 'cc-matcher-bucket-jeg-v1'
@@ -30,6 +32,7 @@ TOPICS_PREFIX   = 'data/all-topics/processed/'
 AWARDS_PREFIX   = 'data/all-topics/awards/'
 CONTACTS_PREFIX = 'data/all-contacts/'
 CLIENTS_PREFIX  = 'data/all-contacts/clients/'
+PROSPECTS_PREFIX = pl.PROSPECTS_PREFIX
 RESUMES_PREFIX  = 'data/resumes/'
 
 _JOB_PARENT = 'projects/cc-matcher-v1/locations/us-central1/jobs/'
@@ -59,6 +62,71 @@ def get_credentials():
 
 def get_storage_client() -> storage.Client:
     return storage.Client(credentials=get_credentials())
+
+
+# ── Pool selector ──────────────────────────────────────────────────────────
+
+def pool_selector(
+    state_key: str,
+    *,
+    label: str = 'Company pool',
+    help: str | None = None,
+    pools: list[str] | None = None,
+    horizontal: bool = True,
+    clears: tuple[str, ...] = (),
+) -> str:
+    """The Clients / Prospects radio shared by every pool-aware view.
+
+    `clears` names the session-state keys holding data loaded for the previous
+    pool (cached frames, directories, selections). They are dropped the run the
+    selection changes — before the view reads them further down the script — so
+    switching pool can never leave one pool's companies on screen under the
+    other pool's heading.
+    """
+    return _pool_radio(
+        state_key, list(pools or pl.POOL_KEYS), label, help, horizontal, clears
+    )
+
+
+POOL_SCOPE_BOTH = 'both'
+
+
+def pool_scope_selector(
+    state_key: str,
+    *,
+    label: str = 'Company pool',
+    help: str | None = None,
+    horizontal: bool = True,
+    clears: tuple[str, ...] = (),
+) -> list[str]:
+    """Same selector with a "Both" option, returning a LIST of pool keys.
+
+    For the read-only views — matching and export — where running over clients
+    and prospects together is meaningful. The write-side views deliberately do
+    not offer this: an edit, a build or a delete has to land in exactly one
+    store.
+    """
+    choice = _pool_radio(
+        state_key, list(pl.POOL_KEYS) + [POOL_SCOPE_BOTH],
+        label, help, horizontal, clears,
+        fmt=lambda k: '🏢🎯 Both' if k == POOL_SCOPE_BOTH else pl.display(k),
+    )
+    return list(pl.POOL_KEYS) if choice == POOL_SCOPE_BOTH else [choice]
+
+
+def _pool_radio(state_key, options, label, help, horizontal, clears, fmt=None):
+    prev_key = f'{state_key}__prev'
+    prev = st.session_state.get(prev_key)
+
+    selected = st.radio(
+        label, options, format_func=fmt or pl.display, horizontal=horizontal,
+        key=state_key, help=help,
+    )
+    if prev is not None and selected != prev:
+        for k in clears:
+            st.session_state.pop(k, None)
+    st.session_state[prev_key] = selected
+    return selected
 
 
 # ── GCS reads ──────────────────────────────────────────────────────────────

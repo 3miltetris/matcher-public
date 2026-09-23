@@ -39,6 +39,8 @@ from google.oauth2 import service_account
 
 import src.modules.aspect_matching as am
 import src.modules.aspect_profile as ap
+import src.modules.pools as pl
+import src.modules.ui_common as uc
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.grant_utils import normalize_grant_columns
 
@@ -681,15 +683,35 @@ else:
     # ── 3a · Pick or build the profile ─────────────────────────────────────
 
     if profile_source == _SRC_CLIENT:
-        st.markdown('**Select a client capability profile**')
+        st.markdown('**Select a stored capability profile**')
+
+        # Read-only pick, so both stores can be searched at once — the profile
+        # picked carries its own pool, and nothing here writes back to it.
+        pick_pools = uc.pool_scope_selector(
+            'gs_pick_pools', label='Search which store',
+            clears=('gs_profiles',),
+            help='Clients, targeted prospects, or both.',
+        )
 
         load_col, refresh_col = st.columns([4, 1])
         if st.session_state.gs_profiles is None:
-            with st.spinner('Loading client profiles…'):
+            with st.spinner('Loading capability profiles…'):
                 try:
-                    st.session_state.gs_profiles = ap.load_profiles(_get_storage_client())
+                    _loaded = [
+                        ap.load_profiles(_get_storage_client(), pool=p)
+                        for p in pick_pools
+                    ]
+                    _loaded = [f for f in _loaded if not f.empty]
+                    st.session_state.gs_profiles = (
+                        pd.concat(_loaded, ignore_index=True) if _loaded
+                        else ap.empty_profiles_df()
+                    )
                 except Exception as e:
-                    st.error(f'Could not load {ap.PROFILES_BLOB}: {e}')
+                    st.error(
+                        'Could not load '
+                        + ', '.join(ap.profiles_blob(p) for p in pick_pools)
+                        + f': {e}'
+                    )
                     st.session_state.gs_profiles = ap.empty_profiles_df()
         if refresh_col.button('↻ Reload', key='gs_profiles_reload'):
             st.session_state.gs_profiles = None
@@ -698,12 +720,14 @@ else:
         profiles: pd.DataFrame = st.session_state.gs_profiles
         if profiles.empty:
             st.info(
-                'No client profiles yet. Build them in **Capability Profiles**, or '
-                'paste notes above to profile a company ad hoc.'
+                'No profiles in '
+                + ' or '.join(pl.label(p) for p in pick_pools)
+                + ' yet. Build them in **Capability Profiles**, or paste notes '
+                'below to profile a company ad hoc.'
             )
         else:
             query = load_col.text_input(
-                'Search clients', key='gs_profile_query',
+                'Search companies', key='gs_profile_query',
                 placeholder='Type part of a company name, website or market…',
             ).strip().lower()
 
@@ -719,13 +743,14 @@ else:
                 st.warning(f'No profile matches “{query}”.')
             else:
                 labels = {
-                    f'{r["company_name"]} — {int(r["n_aspects"] or 0)} aspects, '
+                    f'{pl.pool(r.get("pool"))["icon"]} {r["company_name"]} — '
+                    f'{int(r["n_aspects"] or 0)} aspects, '
                     f'{int(r["n_markets"] or 0)} markets': r['company_key']
                     for _, r in matches.iterrows()
                 }
                 st.caption(f'**{len(matches):,}** of {len(profiles):,} profiles match.')
                 picked_label = st.selectbox(
-                    'Client', list(labels), key='gs_profile_pick',
+                    'Company', list(labels), key='gs_profile_pick',
                 )
                 picked_key = labels[picked_label]
                 row = profiles[profiles['company_key'] == picked_key]
@@ -839,7 +864,8 @@ else:
     st.divider()
     st.markdown(
         '#### Capability profile'
-        + (' · built from pasted notes' if from_notes else ' · from the client store')
+        + (' · built from pasted notes' if from_notes
+           else f' · from the {pl.label(prof.get("pool"))} store')
     )
     _render_profile(prof)
 
@@ -850,14 +876,25 @@ else:
 
     if from_notes:
         with st.expander(
-            '💾 Save as a client capability profile',
+            '💾 Save as a capability profile',
             expanded=not st.session_state.gs_profile_saved,
         ):
+            # A single pool, not a scope: a save has to land in exactly one
+            # store. Prospects is the default — a company profiled from pasted
+            # notes is usually one we hold no records for at all.
+            save_pool = uc.pool_selector(
+                'gs_save_pool', label='Save into',
+                pools=[pl.PROSPECTS, pl.CLIENTS],
+                clears=('gs_profiles',),
+                help='Prospects for a company we are targeting; Clients only if '
+                     'we already work for it.',
+            )
             st.caption(
-                'Writes this profile into `data/client-profiles/profiles.parquet`, the '
-                'same store the Capability Profiles view edits and Bulk Aspect Match '
-                'and HubSpot Import read. It does **not** create client contact rows — '
-                'import those separately if this company becomes a client.'
+                f'Writes this profile into `{ap.profiles_blob(save_pool)}`, the '
+                'same store the Capability Profiles view edits and Aspect Match '
+                'and HubSpot Import read. It does **not** create contact rows — '
+                'import those in **Import Contacts** if you want the company in '
+                f'the {pl.label(save_pool)} pool proper.'
             )
             s1, s2 = st.columns(2)
             save_name = s1.text_input(
@@ -872,12 +909,10 @@ else:
             save_key = ap.company_key(
                 {'company_name': save_name, 'companyWebsite': save_site}
             )
-            if st.session_state.gs_profiles is None:
-                try:
-                    st.session_state.gs_profiles = ap.load_profiles(_get_storage_client())
-                except Exception:
-                    st.session_state.gs_profiles = ap.empty_profiles_df()
-            existing = st.session_state.gs_profiles
+            try:
+                existing = ap.load_profiles(_get_storage_client(), pool=save_pool)
+            except Exception:
+                existing = ap.empty_profiles_df()
             collides = (
                 not existing.empty
                 and 'company_key' in existing.columns
@@ -907,14 +942,16 @@ else:
                     gcs    = _get_storage_client()
                     # Re-read rather than trusting the session copy: another
                     # session may have written a profile since this page loaded.
-                    latest = ap.load_profiles(gcs)
-                    merged = ap.upsert_profiles(latest, [record])
-                    ap.save_profiles(gcs, merged)
-                    st.session_state.gs_profiles      = merged
+                    latest = ap.load_profiles(gcs, pool=save_pool)
+                    merged = ap.upsert_profiles(latest, [record], pool=save_pool)
+                    ap.save_profiles(gcs, merged, pool=save_pool)
+                    record['pool']                    = save_pool
+                    st.session_state.gs_profiles      = None
                     st.session_state.gs_profile       = pd.Series(record)
                     st.session_state.gs_profile_saved = True
                     st.success(
-                        f'Saved — **{save_name}** now has a capability profile with '
+                        f'Saved to {pl.display(save_pool)} — **{save_name}** now '
+                        f'has a capability profile with '
                         f'{int(record["n_aspects"] or 0)} aspect(s) and '
                         f'{int(record["n_markets"] or 0)} market(s).'
                     )

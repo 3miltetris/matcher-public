@@ -4,7 +4,13 @@ Contact Importer
 Upload a lead spreadsheet from any source, map columns to standard fields,
 deduplicate against existing GCS records, then trigger a Cloud Run job
 that scrapes company websites, summarises with GPT-3.5-turbo, embeds with
-text-embedding-ada-002, and saves to GCS under data/all-contacts/{source}/.
+text-embedding-ada-002, and saves to GCS.
+
+Rows land either in a plain lead-source folder (data/all-contacts/{source}/)
+or straight into the 🎯 prospect pool (data/all-contacts/prospects/), chosen
+by the Destination radio in step 2. A pool import is written in the clients
+column convention and is deduplicated against the prospect AND client pools,
+so a company we already work for cannot re-enter as a prospect.
 
 The Cloud Run job (contact-import-job) writes a status.json on completion
 so this view polls without holding a long Streamlit connection.
@@ -25,6 +31,7 @@ from google.cloud import run_v2, storage
 from google.oauth2 import service_account
 
 import src.modules.finance_research as fr   # Deep Research models + cost constants
+import src.modules.pools as pl
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -186,11 +193,24 @@ def _get_storage_client() -> storage.Client:
     return storage.Client(credentials=_get_credentials())
 
 
+def _dedup_prefixes(source: str, all_sources: bool, pool: str | None) -> list[str]:
+    """Which contact prefixes to check against — mirrors the same helper in
+    contact_import_job.py, which re-dedups at runtime."""
+    if all_sources:
+        return [_CONTACTS_ROOT]
+    if pool:
+        return sorted({pl.contacts_prefix(pool), pl.contacts_prefix(pl.CLIENTS)})
+    return [f'{_CONTACTS_ROOT}{source}/']
+
+
 def _load_existing_domains(
-    client: storage.Client, source: str, all_sources: bool = False
+    client: storage.Client, source: str, all_sources: bool = False,
+    pool: str | None = None,
 ) -> set[str]:
-    prefix  = _CONTACTS_ROOT if all_sources else f'{_CONTACTS_ROOT}{source}/'
-    blobs   = client.list_blobs(_BUCKET, prefix=prefix)
+    blobs = [
+        b for prefix in _dedup_prefixes(source, all_sources, pool)
+        for b in client.list_blobs(_BUCKET, prefix=prefix)
+    ]
     domains: set[str] = set()
     for blob in blobs:
         if not blob.name.endswith('.parquet'):
@@ -448,15 +468,41 @@ st.subheader('2 · Source & column mapping')
 top_l, top_r = st.columns([1, 3])
 
 with top_l:
-    src_choice = st.selectbox('Lead source', _SOURCE_OPTIONS, key='ci_src_choice')
-    if src_choice == 'custom…':
-        source = st.text_input(
-            'Custom name',
-            placeholder='e.g. linkedin, event_leads',
-            key='ci_src_custom',
-        ).strip().lower().replace(' ', '_')
+    # Where the imported rows live. A lead-source folder is raw supply for
+    # Bulk Matching; the prospect pool is a directory of companies we are
+    # actively targeting, which gets the full client treatment (Deep Research,
+    # meetings, capability profiles, Aspect Match).
+    destination = st.radio(
+        'Destination',
+        options=['source', pl.PROSPECTS],
+        format_func=lambda d: {
+            'source':     '📁 Lead source folder',
+            pl.PROSPECTS: f'{pl.display(pl.PROSPECTS)} pool',
+        }[d],
+        key='ci_destination',
+        help='Lead source folder: the usual bulk import, one folder per '
+             'source. Prospect pool: a targeted company that should get '
+             'Deep Research, meeting ingestion and a capability profile, '
+             'and can later be promoted to a client.',
+    )
+    dest_pool = pl.PROSPECTS if destination == pl.PROSPECTS else None
+
+    if dest_pool:
+        source = pl.PROSPECTS
+        st.caption(
+            f'Rows are written to `{pl.contacts_prefix(dest_pool)}` in the '
+            'clients column convention.'
+        )
     else:
-        source = src_choice
+        src_choice = st.selectbox('Lead source', _SOURCE_OPTIONS, key='ci_src_choice')
+        if src_choice == 'custom…':
+            source = st.text_input(
+                'Custom name',
+                placeholder='e.g. linkedin, event_leads',
+                key='ci_src_custom',
+            ).strip().lower().replace(' ', '_')
+        else:
+            source = src_choice
 
 cols     = df_raw.columns.tolist()
 none_opt = '— none —'
@@ -512,13 +558,19 @@ st.divider()
 st.subheader('3 · Deduplicate')
 
 dedup_all = st.checkbox(
-    'Check against **all** sources (entire contact database, not just this '
-    "source's folder)",
-    value=(input_mode == 'hubspot'),
+    'Check against **all** sources (entire contact database, not just the '
+    'destination)',
+    # Off by default for a pool import: a targeted prospect that also sits in
+    # an old apollo lead list is still a prospect, and all-source checking
+    # would silently drop it. The pool scope below already covers the two
+    # cases that matter — it is already a prospect, or already a client.
+    value=(input_mode == 'hubspot' and not dest_pool),
     key='ci_dedup_all',
     help='A HubSpot list can contain companies already imported under any '
          'source, so all-source checking is the default for HubSpot pulls. '
-         'Note: the job re-dedups at runtime using this same scope.',
+         'A prospect-pool import is checked against the prospect and client '
+         'pools by default instead. The job re-dedups at runtime using this '
+         'same scope.',
 )
 
 # Invalidate dedup if source, URL column, or scope changed since last check
@@ -552,11 +604,12 @@ if mapped_df.empty:
     st.stop()
 
 if st.button('🔍 Check for duplicates', key='ci_dedup_btn'):
-    scope_label = _CONTACTS_ROOT if dedup_all else f'{_CONTACTS_ROOT}{source}/'
+    scope_label = ', '.join(_dedup_prefixes(source, dedup_all, dest_pool))
     with st.spinner(f'Checking existing records in {scope_label}…'):
         try:
             existing = _load_existing_domains(
-                _get_storage_client(), source, all_sources=dedup_all
+                _get_storage_client(), source, all_sources=dedup_all,
+                pool=dest_pool,
             )
             mask = mapped_df['companyWebsite'].apply(
                 lambda u: _bare_domain(u) not in existing
@@ -662,6 +715,7 @@ if st.button('🚀 Start import job', type='primary', key='ci_trigger_btn',
             config = {
                 'run_id':            run_id,
                 'source':            source,
+                'pool':              dest_pool,
                 'file_ext':          file_ext,
                 'csv_blob_path':     file_blob_path,
                 'col_map':           col_map,

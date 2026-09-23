@@ -1,13 +1,15 @@
 """
-Client deletion
----------------
-Removes a company that is no longer a client from the pipeline:
+Company deletion
+----------------
+Removes a company that is no longer wanted from one pool (see
+src/modules/pools.py — clients or prospects):
 
-  * its contact rows in `data/all-contacts/clients/` (parquets rewritten in
+  * its contact rows in that pool's contacts prefix (parquets rewritten in
     place, or the blob deleted when it would be left empty),
-  * its multi-aspect profile row in `data/client-profiles/profiles.parquet`,
+  * its multi-aspect profile row in that pool's profile store,
   * its Drive Sync folder assignment(s), parked in `skipped` so the next scan
-    neither syncs the folder nor proposes it as a brand-new client.
+    neither syncs the folder nor proposes it as a brand-new client. Client
+    pool only — prospects have no Drive folders.
 
 Deletion is irreversible in GCS, so every removed row is archived to
 `data/deleted-clients/deleted_{date}_{hex6}.parquet` **before** anything is
@@ -27,6 +29,7 @@ from datetime import date, datetime, timezone
 import pandas as pd
 
 import src.modules.aspect_profile as ap
+import src.modules.pools as pl
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 
 # ── Constants ───────────────────────────────────────────────────────────────
@@ -39,17 +42,9 @@ ASSIGN_BLOB    = 'drive-sync-configs/assignments.json'
 
 # ── Row matching ────────────────────────────────────────────────────────────
 
-def key_mask(df: pd.DataFrame, key: str) -> pd.Series:
-    """Rows of a clients parquet belonging to one `name||website` company key
-    — the same identity used by aspect_profile.company_key()."""
-    name, _, website = key.partition('||')
-    names = (df.get('company_name', pd.Series('', index=df.index))
-               .fillna('').astype(str).str.strip())
-    if 'company_name' not in df.columns and 'companyName' in df.columns:
-        names = df['companyName'].fillna('').astype(str).str.strip()
-    sites = (df.get('companyWebsite', pd.Series('', index=df.index))
-               .fillna('').astype(str).str.strip())
-    return (names == name.strip()) & (sites == website.strip())
+# One definition, in the pool registry — deletion, promotion and the views all
+# have to agree on which rows are "this company".
+key_mask = pl.key_mask
 
 
 def count_rows(frames: dict[str, pd.DataFrame], keys) -> dict[str, int]:
@@ -67,6 +62,7 @@ def count_rows(frames: dict[str, pd.DataFrame], keys) -> dict[str, int]:
 def _new_report(keys: list[str]) -> dict:
     return {
         'keys':                  keys,
+        'pool':                  ap.DEFAULT_POOL,
         'rows_deleted':          0,
         'per_key':               {k: 0 for k in keys},
         'files_rewritten':       [],
@@ -88,27 +84,32 @@ def delete_clients(
     clear_drive_assignments: bool = True,
     actor: str = '',
     bucket: str = BUCKET,
+    pool: str = ap.DEFAULT_POOL,
 ) -> dict:
-    """Delete one or more client companies. Returns a report dict; per-target
-    failures are collected in `errors` rather than raised, except a failed
-    archive write, which aborts before anything is destroyed.
+    """Delete one or more companies from a pool. Returns a report dict;
+    per-target failures are collected in `errors` rather than raised, except a
+    failed archive write, which aborts before anything is destroyed.
 
     `delete_rows=False` removes only the profile (and assignment), leaving the
-    contact rows in place."""
+    contact rows in place. `pool` selects which contact prefix and which
+    profile store are touched — a prospect and a client of the same name are
+    separate companies and deleting one must never reach the other."""
     keys   = [k for k in dict.fromkeys(str(k) for k in keys) if k]
     report = _new_report(keys)
+    report['pool'] = pool
     if not keys:
-        report['errors'].append('No clients selected.')
+        report['errors'].append(f'No {pl.noun(pool)}s selected.')
         return report
 
     stamp      = datetime.now(timezone.utc).isoformat()
     bucket_obj = gcs_client.bucket(bucket)
     bm         = BucketManager(bucket, client=gcs_client)
+    prefix     = pl.contacts_prefix(pool)
 
     # ── Contact rows: plan → archive → apply ───────────────────────────────
     if delete_rows:
         plan: list[tuple[str, pd.DataFrame, pd.DataFrame]] = []   # blob, kept, removed
-        for blob in gcs_client.list_blobs(bucket, prefix=CLIENTS_PREFIX):
+        for blob in gcs_client.list_blobs(bucket, prefix=prefix):
             if not blob.name.endswith('.parquet'):
                 continue
             try:
@@ -130,7 +131,8 @@ def delete_clients(
 
         if plan:
             removed = pd.concat(
-                [r.assign(_deleted_from=b, _deleted_at=stamp, _deleted_by=actor or 'unknown')
+                [r.assign(_deleted_from=b, _deleted_at=stamp,
+                          _deleted_by=actor or 'unknown', _deleted_pool=pool)
                  for b, _, r in plan],
                 ignore_index=True,
             )
@@ -158,14 +160,12 @@ def delete_clients(
                 except Exception as e:
                     report['errors'].append(f'{blob_name}: {e}')
         else:
-            report['notes'].append(
-                'No contact rows matched in data/all-contacts/clients/.'
-            )
+            report['notes'].append(f'No contact rows matched in {prefix}.')
 
     # ── Profile store ──────────────────────────────────────────────────────
     if delete_profiles:
         try:
-            profiles = ap.load_profiles(gcs_client, bucket=bucket)
+            profiles = ap.load_profiles(gcs_client, bucket=bucket, pool=pool)
             stored   = (set(profiles['company_key'].astype(str))
                         if not profiles.empty and 'company_key' in profiles.columns else set())
             hits = [k for k in keys if k in stored]
@@ -173,13 +173,15 @@ def delete_clients(
                 merged = profiles
                 for key in hits:
                     merged = ap.delete_profile(merged, key)
-                ap.save_profiles(gcs_client, merged, bucket=bucket)
+                ap.save_profiles(gcs_client, merged, bucket=bucket, pool=pool)
                 report['profiles_deleted'] = hits
         except Exception as e:
-            report['errors'].append(f'{ap.PROFILES_BLOB}: {e}')
+            report['errors'].append(f'{ap.profiles_blob(pool)}: {e}')
 
     # ── Drive Sync assignments ─────────────────────────────────────────────
-    if clear_drive_assignments:
+    # Only the client pool has Drive folders; a prospect never had one, so
+    # there is nothing to park.
+    if clear_drive_assignments and pl.supports_drive(pool):
         try:
             blob = bucket_obj.blob(ASSIGN_BLOB)
             if blob.exists():

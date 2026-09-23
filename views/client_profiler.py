@@ -1,9 +1,9 @@
 """
-Client Profiles
----------------
-Builds multi-aspect capability profiles for the clients in
-data/all-contacts/clients/ out of material that already exists on their
-rows — the website summary/scrape, Drive document extractions written by
+Capability Profiles
+-------------------
+Builds multi-aspect capability profiles for the companies of one pool
+(src/modules/pools.py — 🏢 Clients or 🎯 Prospects, picked at the top of the
+page) out of material that already exists on their contact rows — the website summary/scrape, Drive document extractions written by
 drive-sync-job, and Deep Research output written by the Client Research
 view. Claude splits that material into a handful of distinct, independently
 searchable aspects, folds together any two that turn out to describe the same
@@ -14,11 +14,12 @@ worlds the company does NOT serve, reached by linking the aspects it already
 has. Those are hypotheses, so they are stored in their own columns and matched
 under their own kind, never mixed into the confirmed markets. Every aspect and
 every market narrative is embedded separately and the profile is stored as one
-row per company in data/client-profiles/profiles.parquet.
+row per company in that pool's profile store (profiles.parquet for clients,
+prospect_profiles.parquet for prospects).
 
-Nothing here writes to the client parquets — profiles live in their own
-store, so Client Editor / Client Research / Drive Sync can keep rewriting
-client rows without touching profiles. When a client's source material
+Nothing here writes to the contact parquets — profiles live in their own
+store, so Client Records / Client Research / Drive Sync can keep rewriting
+contact rows without touching profiles. When a company's source material
 changes, its profile is flagged ⚠️ stale (source fingerprint mismatch) and
 can be rebuilt.
 
@@ -31,12 +32,11 @@ that's one company and a handful of embeddings.
 The Bulk Aspect Match view consumes these profiles.
 
 Deleting is admin-gated (src/modules/access_control.py): section 3 bulk-deletes
-profiles for companies that are no longer clients, optionally removing their
-contact rows from data/all-contacts/clients/ as well (archived to
+profiles for companies we are done with, optionally removing their
+contact rows from the pool as well (archived to
 data/deleted-clients/ first — see src/modules/client_delete.py).
 """
 
-import io
 import json
 import time
 import traceback
@@ -50,12 +50,13 @@ from google.oauth2 import service_account
 import src.modules.access_control as ac
 import src.modules.aspect_profile as ap
 import src.modules.client_delete as cd
+import src.modules.pools as pl
+import src.modules.ui_common as uc
 from src.modules.Embedding.text_embedder import TextProcessor
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
 _BUCKET         = ap.BUCKET
-_CLIENTS_PREFIX = ap.CLIENTS_PREFIX
 _CFG_PREFIX     = 'client-profile-configs/'
 _STATUS_PREFIX  = 'client-profile-jobs/'
 _JOB_NAME       = 'projects/cc-matcher-v1/locations/us-central1/jobs/client-profile-job'
@@ -112,18 +113,8 @@ def _poll_status(client: storage.Client, run_id: str) -> dict | None:
     return json.loads(blob.download_as_text())
 
 
-def _load_client_frames() -> tuple[dict[str, pd.DataFrame], list[str]]:
-    client = _get_storage_client()
-    frames: dict[str, pd.DataFrame] = {}
-    errors: list[str] = []
-    for blob in client.list_blobs(_BUCKET, prefix=_CLIENTS_PREFIX):
-        if not blob.name.endswith('.parquet'):
-            continue
-        try:
-            frames[blob.name] = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-        except Exception as e:
-            errors.append(f'{blob.name}: {e}')
-    return frames, errors
+def _load_pool_frames(pool: str) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    return pl.load_frames(_get_storage_client(), pool)
 
 
 # ── Directory assembly ─────────────────────────────────────────────────────
@@ -208,10 +199,25 @@ if 'cp_build_nonce' not in st.session_state:
 
 st.title('🧩 Capability Profiles')
 st.caption(
-    'Split each client into independently searchable aspects — built from the '
-    'website summary, Drive documents, and Deep Research already on their rows — '
+    'Split each company into independently searchable aspects — built from the '
+    'website summary, documents, meetings and Deep Research already on their rows — '
     'and embed each aspect separately for multi-aspect grant matching.'
 )
+
+# Which directory of companies this page is working on. Everything below —
+# the material read, the profile store written, the job config, the delete
+# sections — follows this one selection. The cached frames/profiles/selection
+# are dropped when it changes so one pool's companies can never be shown
+# under the other pool's heading.
+pool = uc.pool_selector(
+    'cp_pool',
+    clears=('cp_frames', 'cp_profiles', 'cp_build_summary', 'cp_sel_key',
+            'cp_del_keys', 'cp_delete_report'),
+    help='Clients are the companies we write proposals for. Prospects are '
+         'targets we are pursuing — same profiles, same matching, separate '
+         'store.',
+)
+_NOUN = pl.noun(pool)
 
 # ── Active run polling ─────────────────────────────────────────────────────
 # Placed before the GCS loads below so a poll cycle costs one small status
@@ -286,14 +292,14 @@ with st.expander('Resume monitoring a previous build job'):
 
 col_reload, col_info = st.columns([1, 5])
 with col_reload:
-    if st.button('↺ Reload', help='Refresh clients and profiles from GCS'):
+    if st.button('↺ Reload', help=f'Refresh {_NOUN}s and profiles from GCS'):
         st.session_state.cp_frames   = None
         st.session_state.cp_profiles = None
         st.rerun()
 
 if st.session_state.cp_frames is None:
-    with st.spinner('Loading clients from GCS…'):
-        frames, load_errors = _load_client_frames()
+    with st.spinner(f'Loading {_NOUN}s from GCS…'):
+        frames, load_errors = _load_pool_frames(pool)
     st.session_state.cp_frames = frames
     for err in load_errors:
         st.warning(err)
@@ -301,16 +307,22 @@ if st.session_state.cp_frames is None:
 if st.session_state.cp_profiles is None:
     with st.spinner('Loading profile store…'):
         try:
-            st.session_state.cp_profiles = ap.load_profiles(_get_storage_client())
+            st.session_state.cp_profiles = ap.load_profiles(
+                _get_storage_client(), pool=pool
+            )
         except Exception as e:
-            st.error(f'Could not load {ap.PROFILES_BLOB}: {e}')
+            st.error(f'Could not load {ap.profiles_blob(pool)}: {e}')
             st.session_state.cp_profiles = ap.empty_profiles_df()
 
 frames: dict[str, pd.DataFrame] = st.session_state.cp_frames
 profiles: pd.DataFrame          = st.session_state.cp_profiles
 
 if not frames:
-    st.warning(f'No parquet files found under {_CLIENTS_PREFIX} in GCS.')
+    st.warning(
+        f'No parquet files found under {pl.contacts_prefix(pool)} in GCS. '
+        + ('Import companies with the 🎯 Prospects destination in Import '
+           'Contacts to start this pool.' if pool == pl.PROSPECTS else '')
+    )
     _render_delete_report()
     st.stop()
 
@@ -326,7 +338,7 @@ if st.session_state.get('cp_flash'):
 
 with col_info:
     st.info(
-        f'{len(directory):,} client companies · '
+        f'{len(directory):,} {_NOUN} companies · '
         f'{int((directory["status"] == _STATUS_CURRENT).sum()):,} current profiles · '
         f'{int((directory["status"] == _STATUS_STALE).sum()):,} stale · '
         f'{int((directory["status"] == _STATUS_NOMARKET).sum()):,} without markets · '
@@ -410,7 +422,7 @@ with opt_r:
 
 f_l, f_r = st.columns([2, 2])
 with f_l:
-    search = st.text_input('Filter clients', placeholder='name or website…')
+    search = st.text_input(f'Filter {_NOUN}s', placeholder='name or website…')
 with f_r:
     show = st.radio(
         'Show', ['Needs build (none or stale)', 'All', 'Has profile'],
@@ -429,16 +441,16 @@ if show.startswith('Needs'):
 elif show == 'Has profile':
     view = view[view['status'] != _STATUS_NONE]
 
-# Clients with no usable material can't be profiled — surface, don't offer.
+# Companies with no usable material can't be profiled — surface, don't offer.
 no_material = view[view['sources'] == '—']
 view = view[view['sources'] != '—']
 
 if no_material.empty and view.empty:
-    st.info('No clients match the current filter.')
+    st.info(f'No {_NOUN}s match the current filter.')
 elif view.empty:
     st.info(
-        f'No profilable clients match the filter — {len(no_material)} have no '
-        'website summary, Drive documents, or research data yet.'
+        f'No profilable {_NOUN}s match the filter — {len(no_material)} have no '
+        'website summary, documents, or research data yet.'
     )
 
 if not view.empty:
@@ -455,7 +467,7 @@ if not view.empty:
                   'markets', 'unexplored', 'built_at'],
         column_config={
             'build':    st.column_config.CheckboxColumn('Build', help='Build or rebuild this profile'),
-            'company':  st.column_config.TextColumn('Client'),
+            'company':  st.column_config.TextColumn(pl.label(pool).rstrip('s')),
             'website':  st.column_config.TextColumn('Website'),
             'sources':  st.column_config.TextColumn('Material available'),
             'contacts': st.column_config.NumberColumn('Contacts', format='%d'),
@@ -474,7 +486,7 @@ if not view.empty:
 
     st.caption(
         f'**{len(selected_keys)}** selected · one Claude call and up to '
-        f'{target_aspects} embeddings per client, run in the '
+        f'{target_aspects} embeddings per company, run in the '
         '`client-profile-job` Cloud Run Job — you can leave this page once it '
         'starts and resume monitoring by run ID.'
     )
@@ -488,6 +500,7 @@ if not view.empty:
         try:
             config = {
                 'run_id':         run_id,
+                'pool':           pool,
                 'company_keys':   selected_keys,
                 'sources':        include_keys,
                 'target_aspects': int(target_aspects),
@@ -512,14 +525,16 @@ if not view.empty:
             st.code(traceback.format_exc())
 
 if not no_material.empty:
-    with st.expander(f'{len(no_material)} client(s) with no profilable material'):
+    with st.expander(f'{len(no_material)} {_NOUN}(s) with no profilable material'):
         st.dataframe(
             no_material[['company', 'website', 'contacts']],
             hide_index=True, use_container_width=True,
         )
         st.caption(
-            'Give these clients a website summary (Client Editor), sync their '
-            'Drive folder (Drive Sync), or run Client Research on them first.'
+            f'Give these {_NOUN}s a website summary (Client Records), '
+            + ('sync their Drive folder (Drive Sync), ' if pl.supports_drive(pool) else '')
+            + 'ingest their meetings (Fathom Meetings), or run Deep Research '
+              'on them first.'
         )
 
 if st.session_state.cp_build_summary:
@@ -527,7 +542,7 @@ if st.session_state.cp_build_summary:
     if summary['built']:
         st.success(
             f'Built **{len(summary["built"])}** profile'
-            f'{"s" if len(summary["built"]) != 1 else ""} → `{ap.PROFILES_BLOB}`'
+            f'{"s" if len(summary["built"]) != 1 else ""} → `{ap.profiles_blob(pool)}`'
             + (f'  ·  {summary["defense"]} with a Defense market'
                if summary.get('defense') else '')
             + (f'  ·  {summary["unexplored"]} unexplored market(s) found'
@@ -538,7 +553,7 @@ if st.session_state.cp_build_summary:
         st.info('The job finished without building any profiles.')
     if summary.get('deferred'):
         st.warning(
-            f'{len(summary["deferred"])} client(s) hit the job time budget and were '
+            f'{len(summary["deferred"])} company(s) hit the job time budget and were '
             'not profiled — build them again to finish: '
             + ', '.join(summary['deferred'][:20])
             + ('…' if len(summary['deferred']) > 20 else '')
@@ -895,8 +910,8 @@ with save_col:
                                       + ' + manual edit',
                     built_at        = date.today().isoformat(),
                 )
-                merged = ap.upsert_profiles(profiles, [record])
-                ap.save_profiles(_get_storage_client(), merged)
+                merged = ap.upsert_profiles(profiles, [record], pool=pool)
+                ap.save_profiles(_get_storage_client(), merged, pool=pool)
                 st.session_state.cp_profiles = merged
                 st.session_state.cp_flash = (
                     f'Saved {len(cleaned)} aspect(s), {len(cleaned_markets)} '
@@ -915,11 +930,11 @@ with del_col:
         if st.button('🗑 Delete profile', key='cp_delete'):
             try:
                 merged = ap.delete_profile(profiles, sel_key)
-                ap.save_profiles(_get_storage_client(), merged)
+                ap.save_profiles(_get_storage_client(), merged, pool=pool)
                 st.session_state.cp_profiles = merged
                 st.session_state.cp_flash = (
                     f'Profile deleted for {prof_row["company_name"] or sel_key} — '
-                    f'the client\'s contact rows are untouched.'
+                    f'the {_NOUN}\'s contact rows are untouched.'
                 )
                 st.rerun()
             except Exception as e:
@@ -940,10 +955,11 @@ if not ac.is_admin():
     st.stop()
 
 st.caption(
-    'Bulk cleanup for companies that are no longer clients. Deleting a profile '
-    'only removes it from the profile store — the client keeps its contact rows '
-    'and can be re-profiled. Deleting the client as well removes every contact '
-    f'row from `{ap.CLIENTS_PREFIX}` (backed up to `{cd.ARCHIVE_PREFIX}` first).'
+    f'Bulk cleanup for {_NOUN}s we are done with. Deleting a profile only '
+    f'removes it from `{ap.profiles_blob(pool)}` — the {_NOUN} keeps its '
+    f'contact rows and can be re-profiled. Deleting the {_NOUN} as well removes '
+    f'every contact row from `{pl.contacts_prefix(pool)}` (backed up to '
+    f'`{cd.ARCHIVE_PREFIX}` first).'
 )
 
 del_labels = {
@@ -966,24 +982,28 @@ del_keys = st.multiselect(
 )
 
 also_client = st.checkbox(
-    'Also delete these clients from data/all-contacts/clients/',
+    f'Also delete these {_NOUN}s from {pl.contacts_prefix(pool)}',
     value=False,
     key='cp_del_rows',
     help='Removes every contact row of the company as well — use this for '
-         'companies that are no longer clients at all.',
+         'companies that should leave this pool entirely.',
 )
-also_drive = st.checkbox(
-    'Also clear their Drive Sync folder assignment', value=True,
-    key='cp_del_drive', disabled=not also_client,
-    help='Marks the folder skipped so Drive Sync neither syncs it nor proposes '
-         'it as a new client on the next scan.',
-)
+# Prospects never had a Drive folder, so there is nothing to park for them —
+# the checkbox is not rendered at all rather than shown doing nothing.
+also_drive = False
+if pl.supports_drive(pool):
+    also_drive = st.checkbox(
+        'Also clear their Drive Sync folder assignment', value=True,
+        key='cp_del_drive', disabled=not also_client,
+        help='Marks the folder skipped so Drive Sync neither syncs it nor '
+             'proposes it as a new client on the next scan.',
+    )
 
 if del_keys and also_client:
     counts = cd.count_rows(frames, del_keys)
     st.dataframe(
         pd.DataFrame([
-            {'client': str(del_labels[k]).split('  ·  ')[0],
+            {_NOUN: str(del_labels[k]).split('  ·  ')[0],
              'contact rows': counts.get(k, 0)}
             for k in del_keys
         ]),
@@ -1000,7 +1020,7 @@ confirm = st.text_input(
 
 if st.button(
     f'🗑 Delete {len(del_keys)} '
-    f'{"client(s) + profile(s)" if also_client else "profile(s)"} permanently',
+    f'{f"{_NOUN}(s) + profile(s)" if also_client else "profile(s)"} permanently',
     type='primary',
     disabled=not del_keys or confirm.strip().upper() != 'DELETE',
     help='Select at least one profile and type DELETE to enable.',
@@ -1014,6 +1034,7 @@ if st.button(
                 delete_profiles         = True,
                 clear_drive_assignments = also_client and also_drive,
                 actor                   = ac.current_user_email() or 'local-dev',
+                pool                    = pool,
             )
         except Exception as e:
             st.error(f'Delete failed: {e}')
