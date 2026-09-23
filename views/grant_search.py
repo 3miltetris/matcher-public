@@ -211,6 +211,26 @@ def _similarity_search(df: pd.DataFrame, query_embedding: list[float], threshold
 
 # ── Building a profile from pasted notes ───────────────────────────────────
 
+def _response_text(resp) -> str:
+    """The text of a Claude response, as a ValueError when there is none.
+
+    Mirrors client_profile_job._response_text — see the reasoning there: an
+    empty content list makes `resp.content[0]` raise IndexError, which is not
+    a ValueError, so the retry below is skipped and the real cause
+    (`stop_reason`) never reaches the user."""
+    blocks = getattr(resp, 'content', None) or []
+    text = ''.join(
+        getattr(b, 'text', '') for b in blocks
+        if getattr(b, 'type', '') == 'text'
+    ).strip()
+    if not text:
+        raise ValueError(
+            f'Claude returned no text (stop_reason={getattr(resp, "stop_reason", None)}, '
+            f'{len(blocks)} content block(s))'
+        )
+    return text
+
+
 def _claude_json(anth: anthropic.Anthropic, model: str, system: str, user_msg: str, parse):
     """One Claude call with one strict-JSON retry, parsed by `parse`.
 
@@ -232,7 +252,7 @@ def _claude_json(anth: anthropic.Anthropic, model: str, system: str, user_msg: s
         if resp.stop_reason == 'max_tokens':
             raise ValueError('Claude hit the output token limit')
         try:
-            return parse(resp.content[0].text)
+            return parse(_response_text(resp))
         except ValueError as e:
             last_err = e
     raise ValueError(f'invalid response twice: {last_err}')

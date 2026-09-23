@@ -1685,6 +1685,7 @@ Builds the multi-aspect client profiles of Stage 8. Everything the job needs is 
              "aspect_merges": ["Edge inference -> Onboard compute"]}],
   "errors": ["Acme Robotics: invalid response twice: ..."],
   "warnings": ["Acme Robotics: merged near-identical aspects Edge inference -> Onboard compute",
+               "Inaedis Inc.: claude-sonnet-4-6 declined to answer (refusal) - the profile was built with claude-haiku-4-5-20251001 instead",
                "Beta Systems: unexplored-market pass failed (...) - the profile was saved without unexplored markets"],
   "deferred": ["Beta Systems"],
   "stopped_early": null, "profiles_blob": "data/client-profiles/profiles.parquet",
@@ -1693,6 +1694,12 @@ Builds the multi-aspect client profiles of Stage 8. Everything the job needs is 
 ```
 
 A `running` payload is written at start and every 5 completed clients; the view renders `clients_done / clients_total` as a progress bar and resumes monitoring by run ID.
+
+**A refusal falls back to the other supported model.** Some entirely legitimate clients trip a false-positive refusal: measured on Inaedis Inc. (aerosolised thermostable vaccine powders, DoD CBD SBIR on an MVA smallpox/mpox vaccine), `claude-sonnet-4-6` returned `stop_reason='refusal'` with **zero content blocks** on the website text and on the Drive text *independently*, while `claude-haiku-4-5-20251001` built the profile normally (8 aspects, 3 markets). A refusal is deterministic for the same model and material, so the plain strict-JSON retry can only burn a second call — `_claude_json` therefore retries a refusal on the other entry in `ap.ASPECT_MODELS`, and only on a refusal (bad JSON twice is a prompt/material problem another model would not fix). The model that actually answered is stored as the profile's `model` and the swap is reported in `warnings`, so a profile never claims a model that declined it.
+
+**Two bugs this path had, both of which hid their own cause — do not reintroduce either.**
+- `resp.content[0].text` raises **IndexError** on an empty content list, and `IndexError` is not the `ValueError` the retry loop catches, so a refusal escaped on the first attempt and was reported as `list index out of range`. `_response_text()` now joins every text block and raises a `ValueError` carrying `stop_reason` — which is the only field that explains a refusal.
+- The job's pool config variable is named **`pool_key`, not `pool`**, because `with ThreadPoolExecutor(...) as pool` is the house idiom in 16 places in this repo and one of them is further down the same function. `_status()` and `_save_records()` are defined above it and called below it, so a local named `pool` silently rebound the name for both: the run died on `json.dumps` of a `ThreadPoolExecutor`, and every save in it had resolved `ap.profiles_blob(<executor>)` — which fell through to the **client** store. `ap.profiles_blob()` now raises on a non-string pool for exactly this reason; an unknown *string* still falls back, since that is a stale UI selection rather than a shadowed variable.
 
 `warnings` is deliberately separate from `errors`: an aspect merge and a failed pass 2 both leave a **saved, usable profile**, so they must not read as a build failure. The view shows them in a collapsed "build note(s)" expander. Reporting merges there is the only way to tell whether `aspect_merge_threshold` is collapsing genuinely distinct capabilities — check them before lowering it.
 

@@ -140,31 +140,89 @@ def _get_embedding(text: str, oai: OpenAI, encoding: tiktoken.Encoding) -> list[
 
 # ── Claude ─────────────────────────────────────────────────────────────────────
 
+def _response_text(resp) -> str:
+    """The text of a Claude response, as a ValueError when there is none.
+
+    `resp.content[0].text` is wrong twice over. An **empty** content list makes
+    it raise IndexError — which is not a ValueError, so the retry below never
+    ran and the company was reported as "list index out of range" with no hint
+    of the cause (observed on a real build, twice). And indexing block 0
+    assumes the first block is text, which stops being true the moment a
+    response leads with a non-text block.
+
+    So: join every text block, and turn "nothing came back" into a ValueError
+    carrying `stop_reason`, which is the field that actually explains it
+    (`refusal`, `pause_turn`, …)."""
+    blocks = getattr(resp, 'content', None) or []
+    text = ''.join(
+        getattr(b, 'text', '') for b in blocks
+        if getattr(b, 'type', '') == 'text'
+    ).strip()
+    if not text:
+        raise ValueError(
+            f'Claude returned no text (stop_reason={getattr(resp, "stop_reason", None)}, '
+            f'{len(blocks)} content block(s))'
+        )
+    return text
+
+
+def _fallback_model(model: str) -> str | None:
+    """The other supported aspect model, for the refusal path below."""
+    others = [m for m in ap.ASPECT_MODELS if m != model]
+    return others[0] if others else None
+
+
 def _claude_json(anth: Anthropic, model: str, system: str, user_msg: str, parse):
     """One Claude call with one strict-JSON retry, parsed by `parse`.
+    Returns (parsed, model_that_answered).
 
     Shared by both passes: aspect+market generation and the unexplored-market
-    pass differ only in their prompt and their parser."""
-    last_err = None
-    for attempt in range(2):
-        content = user_msg if attempt == 0 else (
-            user_msg + '\n\nYour previous response was not valid JSON. '
-                       'Return ONLY the valid JSON object.'
-        )
-        resp = anth.messages.create(
-            model=model,
-            # Aspects plus the markets block; a truncated response is a hard
-            # error below, so leave headroom rather than lose the run.
-            max_tokens=6000,
-            system=system,
-            messages=[{'role': 'user', 'content': content}],
-        )
-        if resp.stop_reason == 'max_tokens':
-            raise ValueError('Claude hit the output token limit')
-        try:
-            return parse(resp.content[0].text)
-        except ValueError as e:
-            last_err = e
+    pass differ only in their prompt and their parser.
+
+    **Refusals fall back to the other supported model.** Some entirely
+    legitimate clients trip a false-positive refusal — measured on a real
+    biopharma client whose material covers aerosolised thermostable vaccine
+    powders and a DoD CBD SBIR on an MVA smallpox/mpox vaccine: Sonnet
+    returned stop_reason='refusal' with zero content blocks on the website
+    text and on the Drive text independently, while Haiku built the profile
+    normally. A refusal is deterministic for the same model and material, so
+    the plain retry above can only burn a second call; switching model is the
+    only thing that can succeed. The caller reports the swap as a warning and
+    stores the model that actually answered, so a profile never claims to have
+    been built by a model that declined it."""
+    last_err  = None
+    fallback  = _fallback_model(model)
+    candidates = [model] + ([fallback] if fallback else [])
+
+    for current in candidates:
+        refused = False
+        for attempt in range(2):
+            content = user_msg if attempt == 0 else (
+                user_msg + '\n\nYour previous response was not valid JSON. '
+                           'Return ONLY the valid JSON object.'
+            )
+            resp = anth.messages.create(
+                model=current,
+                # Aspects plus the markets block; a truncated response is a hard
+                # error below, so leave headroom rather than lose the run.
+                max_tokens=6000,
+                system=system,
+                messages=[{'role': 'user', 'content': content}],
+            )
+            if resp.stop_reason == 'max_tokens':
+                raise ValueError('Claude hit the output token limit')
+            if resp.stop_reason == 'refusal':
+                last_err = ValueError(f'{current} declined to answer (stop_reason=refusal)')
+                refused  = True
+                break          # retrying the same model cannot change a refusal
+            try:
+                return parse(_response_text(resp)), current
+            except ValueError as e:
+                last_err = e
+        if not refused:
+            # Bad JSON twice is a prompt/material problem, not a model-policy
+            # one — another model is no more likely to parse, so stop here.
+            break
     raise ValueError(f'invalid response twice: {last_err}')
 
 
@@ -298,7 +356,7 @@ def main(config_blob_path: str) -> None:
             if not texts:
                 return {'key': key, 'name': name, 'outcome': 'error',
                         'note': 'none of the selected sources have material'}
-            parsed = _claude_json(
+            parsed, model_used = _claude_json(
                 anth, model, system,
                 ap.build_aspect_user_message({
                     'company_name': name,
@@ -344,7 +402,7 @@ def main(config_blob_path: str) -> None:
             unexplored, unexplored_vectors, unexp_err = [], [], ''
             if assess_unexp:
                 try:
-                    unexplored = _claude_json(
+                    unexplored, _unexp_model = _claude_json(
                         anth, model, unexp_system,
                         ap.build_unexplored_user_message(
                             {
@@ -378,7 +436,10 @@ def main(config_blob_path: str) -> None:
                 # Fingerprint over ALL available material, not just the sources
                 # used — any later change to any of it should read as stale.
                 fingerprint     = ap.source_fingerprint(ap.assemble_source_texts(row)),
-                model           = model,
+                # The model that actually ANSWERED, which is not always the
+                # one configured: a refusal falls back to the other supported
+                # model, and a profile must not claim a model that declined it.
+                model           = model_used,
                 markets         = markets,
                 market_vectors  = market_vectors,
                 unexplored         = unexplored,
@@ -387,7 +448,8 @@ def main(config_blob_path: str) -> None:
             )
             return {'key': key, 'name': name, 'outcome': 'built', 'record': record,
                     'merges': merges, 'near_pairs': near,
-                    'unexplored_error': unexp_err}
+                    'unexplored_error': unexp_err,
+                    'model_used': model_used}
         except Exception as e:
             traceback.print_exc()
             return {'key': key, 'name': name, 'outcome': 'error', 'note': str(e)[:300]}
@@ -424,6 +486,11 @@ def main(config_blob_path: str) -> None:
                     'aspect_merges':    res.get('merges') or [],
                     'aspect_near_pairs': res.get('near_pairs') or [],
                 })
+                if res.get('model_used') and res['model_used'] != model:
+                    warn_notes.append(
+                        f'{name}: {model} declined to answer (refusal) — the '
+                        f'profile was built with {res["model_used"]} instead'
+                    )
                 for merge in (res.get('merges') or []):
                     warn_notes.append(f'{name}: merged near-identical aspects {merge}')
                 if res.get('unexplored_error'):
