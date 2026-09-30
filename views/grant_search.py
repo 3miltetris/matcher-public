@@ -1187,7 +1187,8 @@ else:
                     'market_kind':  st.column_config.TextColumn('Kind', width='small'),
                 },
             )
-            st.download_button(
+            d1, d2 = st.columns([1, 1])
+            d1.download_button(
                 '⬇ Download CSV',
                 display.to_csv(index=False).encode('utf-8'),
                 file_name=(
@@ -1195,4 +1196,27 @@ else:
                     f'_{datetime.now():%Y-%m-%d_%H-%M-%S}.csv'
                 ),
                 mime='text/csv',
+                width='stretch',
             )
+
+            # Hand the run to the Funding Strategy view rather than making the
+            # consultant export a CSV and re-upload it into a separate chat.
+            # Only the payload is stashed here; that view owns the session.
+            if d2.button(
+                '🗺️ Start strategy session', type='primary',
+                width='stretch', key='gs_to_strategy',
+                help='Open this result set and capability profile in Funding '
+                     'Strategy, where a playbook works it into an approved '
+                     '12-month roadmap.',
+            ):
+                st.session_state.strategy_handoff = {
+                    'origin':  'Grant Search',
+                    'results': display.to_dict('records'),
+                    'profile': dict(prof),
+                    'company': {
+                        'name':    str(prof.get('company_name') or ''),
+                        'website': str(prof.get('companyWebsite') or ''),
+                        'pool':    str(prof.get('pool') or ''),
+                    },
+                }
+                st.switch_page('views/strategy_chat.py')

@@ -13,9 +13,22 @@ Reads a job config from GCS, then:
          src/modules/tech_research.py); the matching summary is assembled
          from the findings and the full output is stored in
          technology_data / technology_summary / technology_updated_at
+  4b. Optionally (financial_research) runs a SECOND Deep Research focus —
+       financials, src/modules/finance_research.py — over the same unique
+       domains, writing financial_data / financial_summary /
+       financials_updated_at. These columns ride along on the first parquet
+       write, so nothing has to re-read and rewrite the file afterwards.
   5. Generates text-embedding-ada-002 embeddings (8 concurrent workers)
   6. Saves parquet to data/all-contacts/{source}/{source}_{date}_{hex6}.parquet
-  7. Writes contact-import-jobs/{run_id}/status.json
+  7. Emits finance-research-runs/{run_id}/state.json for the financial phase,
+     so the Deep Research view and HubSpot Import's "Financial research run"
+     mode see these companies exactly like a manually launched run
+  8. Writes contact-import-jobs/{run_id}/status.json
+
+Financial research is ADDITIVE and must never cost the import rows: a company
+whose financial task fails or runs out of deadline still saves, just without
+the financial columns. That is the opposite of the technology focus, where a
+failed task leaves no matching summary to embed and the row is dropped.
 
 Usage:
     python jobs/contact_import_job.py contact-import-configs/<run_id>.json
@@ -39,12 +52,20 @@ Config schema:
     "email":          "Email",
     "phone":          "Phone Number"
   },
-  "profile_method": "scrape",            // or "deep_research"
-  "research_model": "gpt-5.6-terra",     // deep_research only
+  "profile_method": "scrape",            // or "deep_research" (technology focus)
+  "research_model": "gpt-5.6-terra",     // used by BOTH research focuses
+  "financial_research": false,           // true = also run the financial focus
+  "max_research_companies": 250,         // spend cap; the overflow is deferred,
+                                         //   not researched (0/null = no cap)
   "dedup_all_sources": false,            // true = dedup vs all of data/all-contacts/
   "pool":              null              // "prospects" = write into the prospect pool
                                          //   instead of a plain lead-source folder
 }
+
+`financial_research` is deliberately orthogonal to `profile_method`:
+profile_method answers "how is the matching summary built" (and only the
+technology focus can answer it — finance_research has no build_matching_summary
+by design), while financial_research adds diligence columns on top of either.
 """
 
 import asyncio
@@ -77,6 +98,10 @@ import src.modules.tech_research as tr
 _BUCKET            = 'cc-matcher-bucket-jeg-v1'
 _CONTACTS_ROOT     = 'data/all-contacts/'
 _STATUS_PREFIX     = 'contact-import-jobs/'
+# Financial runs are recorded in the same store the Deep Research view writes,
+# so views/finance_researcher.py and HubSpot Import's financial mode (which
+# enumerates this prefix) see an import-launched run like any other.
+_FIN_RUNS_PREFIX   = 'finance-research-runs/'
 _SCRAPE_TIMEOUT    = 15         # seconds (aiohttp)
 _PW_TIMEOUT        = 20_000     # ms (Playwright)
 _MAX_CONCURRENT    = 8          # scraping semaphore (Playwright processes ~200MB each)
@@ -88,8 +113,14 @@ _TOKEN_LIMIT       = 7_500
 # Deep Research profiling — tasks run server-side in parallel; the job just
 # polls. Deadline leaves headroom for embedding + save within the 7200s
 # Cloud Run task timeout.
+#
+# The deadline is anchored at JOB START, not at the start of the research
+# phase. On the scrape+financial path the scrape runs first, so a deadline
+# measured from the research call could push total runtime past the task
+# timeout — which kills the container and loses the import entirely.
 _RESEARCH_POLL_S     = 30
 _RESEARCH_DEADLINE_S = 6_000
+_JOB_START           = time.time()
 
 _SUMMARISE_SYSTEM = (
     'Summarise what this company does in 3-5 sentences. '
@@ -390,93 +421,159 @@ def _run_scrape_pipeline(new_df: pd.DataFrame, openai_key: str):
     return ok_df, ok_summaries, rows_ok
 
 
-def _run_deep_research_pipeline(new_df: pd.DataFrame, model: str, openai_key: str):
-    """Deep Research path: one background technology-research task per unique
-    company domain; results fan out to all contact rows of that domain.
-    Returns (ok_df, ok_summaries, rows_ok, companies_total, companies_ok,
-    cost_usd). ok_df carries technology_data/technology_summary/
-    technology_updated_at columns."""
-    oai     = OpenAI(api_key=openai_key)
-    domains = new_df['companyWebsite'].apply(_bare_domain)
+def _research_deadline() -> float:
+    """Wall-clock instant the research phase must be finished by. Anchored at
+    job start so a slow scrape shortens research rather than overrunning the
+    Cloud Run task timeout."""
+    return _JOB_START + _RESEARCH_DEADLINE_S
 
-    companies: dict[str, dict] = {}
+
+def _domain_entries(
+    df: pd.DataFrame, max_companies: int | None
+) -> tuple[pd.Series, dict[str, dict], int]:
+    """(bare-domain per row, {domain: identity entry}, n_deferred).
+
+    One entry per unique domain, in order of first appearance so the spend cap
+    is deterministic. Rows whose domain is deferred simply get no research —
+    they still import."""
+    domains = df['companyWebsite'].apply(_bare_domain)
+
+    entries: dict[str, dict] = {}
+    deferred = 0
     for i, d in enumerate(domains):
-        if d and d not in companies:
-            row = new_df.iloc[i]
-            companies[d] = {
-                'company_name': str(row.get('companyName') or ''),
-                'website':      str(row.get('companyWebsite') or ''),
-                'state':        str(row.get('state') or ''),
-                'response_id':  None,
-                'output':       None,
-                'error':        None,
-            }
+        if not d or d in entries:
+            continue
+        if max_companies and len(entries) >= max_companies:
+            deferred += 1
+            continue
+        row = df.iloc[i]
+        entries[d] = {
+            'company_name': str(row.get('companyName') or row.get('company_name') or ''),
+            'website':      str(row.get('companyWebsite') or ''),
+            'state':        str(row.get('state') or ''),
+        }
+    return domains, entries, deferred
 
-    print(f'Launching Deep Research ({model}) for {len(companies)} unique companies…', flush=True)
-    for d, entry in companies.items():
-        try:
-            resp = oai.responses.create(
-                model=model,
-                input=tr.build_research_prompt({
-                    'company_name': entry['company_name'] or d,
-                    'website':      entry['website'],
-                    'state':        entry['state'],
-                }),
-                background=True,
-                tools=[{'type': 'web_search'}],
-            )
-            entry['response_id'] = resp.id
-        except Exception as e:
-            entry['error'] = f'launch failed: {e}'
 
-    cost_usd = 0.0
-    pending  = {d for d, e in companies.items() if e['response_id']}
-    deadline = time.time() + _RESEARCH_DEADLINE_S
+def _new_tasks(entries: dict[str, dict]) -> dict[str, dict]:
+    """A fresh per-focus task record for each identity entry. Focuses must not
+    share dicts — each carries its own response_id, output and cost."""
+    return {
+        d: {**ident, 'response_id': None, 'output': None,
+            'error': None, 'cost_usd': 0.0}
+        for d, ident in entries.items()
+    }
 
+
+def _run_research_sets(
+    oai: OpenAI, model: str, sets: list[dict], deadline: float
+) -> None:
+    """Launch every background research task across all focus sets, then poll
+    them together against one shared deadline.
+
+    Launching both focuses up front and polling them in one loop costs the same
+    wall clock as running one — the tasks execute server-side in parallel.
+    Running them sequentially would need two deadlines inside one task timeout
+    and would starve whichever focus went second.
+
+    Each set is {'label', 'tasks', 'build_prompt', 'fields'}; results are
+    written into the task dicts in place.
+    """
+    pending: list[tuple[dict, dict]] = []   # (set, task)
+
+    for s in sets:
+        print(
+            f"Launching {s['label']} Deep Research ({model}) for "
+            f"{len(s['tasks'])} unique companies…",
+            flush=True,
+        )
+        for d, task in s['tasks'].items():
+            try:
+                resp = oai.responses.create(
+                    model=model,
+                    input=s['build_prompt']({
+                        'company_name': task['company_name'] or d,
+                        'website':      task['website'],
+                        'state':        task['state'],
+                    }),
+                    background=True,
+                    tools=[{'type': 'web_search'}],
+                )
+                task['response_id'] = resp.id
+                pending.append((s, task))
+            except Exception as e:
+                task['error'] = f'launch failed: {e}'
+
+    total = len(pending)
     while pending and time.time() < deadline:
         time.sleep(_RESEARCH_POLL_S)
-        for d in list(pending):
-            entry = companies[d]
+        still: list[tuple[dict, dict]] = []
+        for s, task in pending:
             try:
-                resp = oai.responses.retrieve(entry['response_id'])
+                resp = oai.responses.retrieve(task['response_id'])
             except Exception:
-                continue   # transient — retry next poll
-            if resp.status in ('queued', 'in_progress'):
+                still.append((s, task))   # transient — retry next poll
                 continue
-            pending.discard(d)
+            if resp.status in ('queued', 'in_progress'):
+                still.append((s, task))
+                continue
             if resp.status == 'completed':
                 if getattr(resp, 'usage', None):
-                    cost_usd += fr.response_cost_usd(model, resp.usage)
+                    task['cost_usd'] = fr.response_cost_usd(model, resp.usage)
                 parsed, err = fr.parse_research_output(
-                    oai, resp.output_text or '', fields=tr.ALL_FIELDS
+                    oai, resp.output_text or '', fields=s['fields']
                 )
                 if parsed:
-                    entry['output'] = parsed
+                    task['output'] = parsed
                 else:
-                    entry['error'] = err
+                    task['error'] = err
             else:
                 err = getattr(resp, 'error', None)
-                entry['error'] = str(err) if err else f'research task {resp.status}'
-        print(f'  research: {len(companies) - len(pending)}/{len(companies)} complete', flush=True)
+                task['error'] = str(err) if err else f'research task {resp.status}'
+        pending = still
+        print(f'  research: {total - len(pending)}/{total} complete', flush=True)
 
-    for d in pending:
-        companies[d]['error'] = 'research deadline exceeded'
+    for s, task in pending:
+        task['error'] = 'research deadline exceeded'
         try:
-            oai.responses.cancel(companies[d]['response_id'])
+            oai.responses.cancel(task['response_id'])
         except Exception:
             pass
 
-    for d, e in companies.items():
-        if e['error']:
-            print(f'  {d}: {e["error"]}', flush=True)
+    for s in sets:
+        for d, task in s['tasks'].items():
+            if task['error']:
+                print(f"  [{s['label']}] {d}: {task['error']}", flush=True)
 
-    # Fan company results out to contact rows
+
+def _tech_set(entries: dict[str, dict]) -> dict:
+    return {
+        'label':        'technology',
+        'tasks':        _new_tasks(entries),
+        'build_prompt': tr.build_research_prompt,
+        'fields':       tr.ALL_FIELDS,
+    }
+
+
+def _financial_set(entries: dict[str, dict]) -> dict:
+    return {
+        'label':        'financial',
+        'tasks':        _new_tasks(entries),
+        'build_prompt': fr.build_research_prompt,
+        'fields':       fr.ALL_FIELDS,
+    }
+
+
+def _apply_tech_results(new_df: pd.DataFrame, domains: pd.Series, tasks: dict):
+    """Fan technology results out to contact rows. A company with no usable
+    result has no matching summary to embed, so its rows are DROPPED.
+    Returns (ok_df, ok_summaries)."""
     today = datetime.today().strftime('%Y-%m-%d')
     ok_mask, summaries, tech_data, tech_digests = [], [], [], []
     for i in range(len(new_df)):
-        entry = companies.get(domains.iloc[i])
-        out   = entry['output'] if entry else None
-        text  = tr.build_matching_summary(out).strip() if out else ''
+        task = tasks.get(domains.iloc[i])
+        out  = task['output'] if task else None
+        text = tr.build_matching_summary(out).strip() if out else ''
         if out and text:
             ok_mask.append(True)
             summaries.append(text)
@@ -489,14 +586,88 @@ def _run_deep_research_pipeline(new_df: pd.DataFrame, model: str, openai_key: st
     ok_df['technology_data']       = tech_data
     ok_df['technology_summary']    = tech_digests
     ok_df['technology_updated_at'] = today
+    return ok_df, summaries
 
-    companies_ok = sum(1 for e in companies.values() if e['output'])
-    print(
-        f'  {companies_ok}/{len(companies)} companies researched OK '
-        f'(${cost_usd:,.2f}), {len(ok_df):,} contact rows profiled',
-        flush=True,
-    )
-    return ok_df, summaries, len(ok_df), len(companies), companies_ok, cost_usd
+
+def _apply_financial_results(df: pd.DataFrame, tasks: dict) -> pd.DataFrame:
+    """Write financial columns onto the rows of each researched company.
+
+    Additive only — a company with no usable result keeps its row and gets
+    empty strings, because the financial focus produces nothing the row needs
+    in order to embed and match."""
+    today   = datetime.today().strftime('%Y-%m-%d')
+    domains = df['companyWebsite'].apply(_bare_domain)
+
+    data, digests, updated = [], [], []
+    for d in domains:
+        task = tasks.get(d)
+        out  = task['output'] if task else None
+        if out:
+            data.append(json.dumps(out))
+            digests.append(fr.build_financial_digest(out))
+            updated.append(today)
+        else:
+            data.append('')
+            digests.append('')
+            updated.append('')
+
+    out_df = df.copy()
+    out_df['financial_data']         = data
+    out_df['financial_summary']      = digests
+    out_df['financials_updated_at']  = updated
+    return out_df
+
+
+def _write_finres_state(
+    client: storage.Client, fin_run_id: str, model: str, pool: str | None,
+    tasks: dict, saved_keys: set[str],
+) -> None:
+    """Emit finance-research-runs/{run_id}/state.json in the exact shape
+    views/finance_researcher.py writes, so an import-launched financial run is
+    resumable, reviewable, and visible to HubSpot Import's financial mode
+    (which enumerates this prefix and requires >=1 company with `output`).
+
+    `applied` is True: the columns were written onto the parquet as it was
+    created, so there is nothing left to apply. The view still offers the
+    button, and re-applying is idempotent — it writes the same values back.
+    """
+    companies = []
+    for idx, (d, task) in enumerate(sorted(tasks.items())):
+        key = pl.company_key({
+            'company_name':   task['company_name'],
+            'companyWebsite': task['website'],
+        })
+        companies.append({
+            'idx':          idx,
+            'key':          key,
+            'company_name': task['company_name'] or d,
+            'website':      task['website'],
+            'response_id':  task['response_id'],
+            # The view treats only 'completed'/'error' as terminal; anything
+            # else makes it re-poll a response this job already consumed.
+            'status':       'completed' if task['output'] else 'error',
+            'error':        task['error'],
+            'cost_usd':     task['cost_usd'],
+            'output':       task['output'],
+            # False when the company's rows did not survive the import (e.g.
+            # its technology research failed), so Apply cannot silently no-op
+            # without explanation.
+            'row_saved':    key in saved_keys,
+        })
+
+    state = {
+        'run_id':     fin_run_id,
+        'focus':      'financials',
+        'pool':       pool,
+        'model':      model,
+        'created_at': datetime.now().isoformat(timespec='seconds'),
+        'applied':    True,
+        'origin':     'contact-import-job',
+        'companies':  companies,
+    }
+    client.bucket(_BUCKET).blob(
+        f'{_FIN_RUNS_PREFIX}{fin_run_id}/state.json'
+    ).upload_from_string(json.dumps(state), content_type='application/json')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -514,6 +685,9 @@ def main(config_blob_path: str) -> None:
     col_map        = config['col_map']
     profile_method = config.get('profile_method', 'scrape')
     research_model = config.get('research_model', 'gpt-5.6-terra')
+    financial      = bool(config.get('financial_research', False))
+    # Spend cap on unique companies researched (either focus). 0/None = no cap.
+    max_research   = config.get('max_research_companies') or None
     dedup_all      = bool(config.get('dedup_all_sources', False))
     # Destination pool (src/modules/pools.py). None = a plain lead-source
     # folder, which is what every config written before pools existed means.
@@ -568,27 +742,102 @@ def main(config_blob_path: str) -> None:
         return
 
     # ── Step 4: Build company profiles (scrape or Deep Research) ─────────────
-    research_extras: dict = {}
+    research_extras: dict = {'profile_method': profile_method}
+    fin_tasks: dict = {}
+
     if profile_method == 'deep_research':
-        (ok_df, ok_summaries, rows_scraped_ok,
-         companies_total, companies_ok, research_cost) = _run_deep_research_pipeline(
-            new_df, research_model, openai_key
+        # Both focuses cover the same unique domains, so plan them once and
+        # launch them together. A domain whose technology research fails loses
+        # its rows even if its financial research succeeded — that spend is
+        # accepted in exchange for not running the two focuses back to back,
+        # which would not fit inside one task timeout.
+        oai = OpenAI(api_key=openai_key)
+        domains, entries, deferred = _domain_entries(new_df, max_research)
+        if deferred:
+            print(f'  spend cap: {deferred} companies deferred (not researched)', flush=True)
+
+        tech_s = _tech_set(entries)
+        sets   = [tech_s] + ([_financial_set(entries)] if financial else [])
+        _run_research_sets(oai, research_model, sets, _research_deadline())
+
+        ok_df, ok_summaries = _apply_tech_results(new_df, domains, tech_s['tasks'])
+        rows_scraped_ok     = len(ok_df)
+        tech_ok = sum(1 for t in tech_s['tasks'].values() if t['output'])
+        tech_cost = sum(t['cost_usd'] for t in tech_s['tasks'].values())
+        print(
+            f'  {tech_ok}/{len(entries)} companies researched OK '
+            f'(${tech_cost:,.2f}), {rows_scraped_ok:,} contact rows profiled',
+            flush=True,
         )
-        research_extras = {
-            'profile_method':        'deep_research',
-            'research_model':        research_model,
-            'companies_researched':  companies_total,
-            'companies_research_ok': companies_ok,
-            'research_cost_usd':     round(research_cost, 2),
-        }
+        research_extras.update({
+            'research_model':              research_model,
+            'companies_researched':        len(entries),
+            'companies_research_ok':       tech_ok,
+            'companies_research_deferred': deferred,
+            'research_cost_usd':           round(tech_cost, 2),
+        })
+        if financial:
+            fin_tasks = sets[1]['tasks']
         del raw_df, mapped_df, new_df
     else:
         ok_df, ok_summaries, rows_scraped_ok = _run_scrape_pipeline(new_df, openai_key)
-        research_extras = {'profile_method': 'scrape'}
         # Free large objects before embedding — page text can be GBs for big imports
         del raw_df, mapped_df, new_df
 
+        if financial and not ok_df.empty:
+            # Research only the rows that survived scraping — no wasted spend.
+            # The shared deadline has already been eaten into by the scrape.
+            oai = OpenAI(api_key=openai_key)
+            _, entries, deferred = _domain_entries(ok_df, max_research)
+            if deferred:
+                print(f'  spend cap: {deferred} companies deferred (not researched)', flush=True)
+            fin_s = _financial_set(entries)
+            _run_research_sets(oai, research_model, [fin_s], _research_deadline())
+            fin_tasks = fin_s['tasks']
+            research_extras['companies_research_deferred'] = deferred
+
+    # Financial columns ride along on the first parquet write — no rewrite.
+    if fin_tasks:
+        ok_df    = _apply_financial_results(ok_df, fin_tasks)
+        fin_ok   = sum(1 for t in fin_tasks.values() if t['output'])
+        fin_cost = sum(t['cost_usd'] for t in fin_tasks.values())
+        print(
+            f'  financial: {fin_ok}/{len(fin_tasks)} companies researched OK '
+            f'(${fin_cost:,.2f})',
+            flush=True,
+        )
+        research_extras.update({
+            'financial_research':     True,
+            'research_model':         research_model,
+            'companies_financial':    len(fin_tasks),
+            'companies_financial_ok': fin_ok,
+            'financial_cost_usd':     round(fin_cost, 2),
+        })
+
+    # Record the financial phase as a normal Deep Research run. Emitted even
+    # when no rows survive: the research was paid for, and the run state keeps
+    # it reviewable and importable to HubSpot rather than silently discarded.
+    fin_run_id = None
+    if fin_tasks:
+        fin_run_id = f"finres_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_import"
+        research_extras['financial_run_id'] = fin_run_id
+
+    def _emit_fin_run(saved_keys: set[str]) -> None:
+        if not fin_run_id:
+            return
+        try:
+            _write_finres_state(
+                gcs, fin_run_id, research_model, pool, fin_tasks, saved_keys
+            )
+            print(f'Financial run recorded → {_FIN_RUNS_PREFIX}{fin_run_id}/state.json',
+                  flush=True)
+        except Exception as e:
+            # The columns are already on the rows; losing the run record must
+            # not fail an otherwise good import.
+            print(f'WARNING: could not write financial run state: {e}', flush=True)
+
     if ok_df.empty:
+        _emit_fin_run(set())
         _write_status(gcs, run_id, {
             'run_id': run_id, 'rows_fetched': rows_fetched, 'rows_after_dedup': rows_after_dedup,
             'rows_scraped_ok': 0, 'rows_saved': 0, 'gcs_path': None, 'error': None,
@@ -629,6 +878,10 @@ def main(config_blob_path: str) -> None:
     gcs.bucket(_BUCKET).blob(gcs_path).upload_from_file(buf, content_type='application/octet-stream')
 
     print(f'\nDone. {rows_saved:,} contacts saved → {gcs_path}', flush=True)
+
+    # Keys are read off the SAVED frame, after the column rename, so they are
+    # exactly the identities pl.key_mask will match if anyone re-applies.
+    _emit_fin_run({pl.company_key(r) for _, r in out.iterrows()})
 
     _write_status(gcs, run_id, {
         'run_id':          run_id,

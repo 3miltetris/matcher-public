@@ -35,8 +35,25 @@ fathom_api_key.txt
 *.pem
 key.txt
 
+# Same class, different vocabulary: on 2026-09-28 `OAUTH_CLIENT_ID.txt` was
+# found in the upload context. It matched none of the patterns above because
+# an OAuth credential is spelled with neither "key" nor "api". Verified that
+# no tracked file's NAME matches these before adding them.
+*oauth*
+*OAUTH*
+*client_id*
+*CLIENT_ID*
+*client-id*
+*secret*
+*SECRET*
+
 # Local data drops (exported Google Sheets, scratch extracts). Dockerfile.app
 # ends in `COPY . .`, so an unignored CSV at the repo root is both committed
 # and baked into the published image.
 *.csv
 local-data/
+
+# BW&CO playbooks + NIH knowledge base + client strategy packets. These are
+# served from GCS (strategy-playbooks/), never from the image — and the
+# claude_*.md packets name real clients. Dockerfile.app ends in `COPY . .`.
+project-context/

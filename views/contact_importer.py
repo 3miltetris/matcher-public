@@ -12,6 +12,15 @@ by the Destination radio in step 2. A pool import is written in the clients
 column convention and is deduplicated against the prospect AND client pools,
 so a company we already work for cannot re-enter as a prospect.
 
+A pool import can also run **financial** Deep Research inline (step 4), on top
+of whichever profiling method builds the matching summary. The columns are
+written as the parquet is created — no second pass over the file — and the
+phase is recorded as a normal run under finance-research-runs/, so the Deep
+Research view and HubSpot Import see it like a manually launched one. It is
+offered only for pool destinations: the recorded run needs a pool for a later
+Apply to target, and a lead dump is where an accidental five-figure research
+bill would come from.
+
 The Cloud Run job (contact-import-job) writes a status.json on completion
 so this view polls without holding a long Streamlit connection.
 """
@@ -317,10 +326,30 @@ if st.session_state.ci_active_run:
             c4.metric('Contacts saved', f"{status.get('rows_saved', 0):,}")
             if is_research:
                 st.caption(
-                    f"Deep Research ({status.get('research_model', '?')}): "
+                    f"🔬 Technology Deep Research ({status.get('research_model', '?')}): "
                     f"{status.get('companies_research_ok', 0)}/"
                     f"{status.get('companies_researched', 0)} companies researched — "
                     f"cost ${status.get('research_cost_usd', 0):,.2f}"
+                )
+            if status.get('financial_research'):
+                st.caption(
+                    f"💰 Financial Deep Research ({status.get('research_model', '?')}): "
+                    f"{status.get('companies_financial_ok', 0)}/"
+                    f"{status.get('companies_financial', 0)} companies researched — "
+                    f"cost ${status.get('financial_cost_usd', 0):,.2f}"
+                )
+                if status.get('financial_run_id'):
+                    st.caption(
+                        f"Recorded as financial research run "
+                        f"`{status['financial_run_id']}` — already applied to the "
+                        'rows above, and selectable in HubSpot Import.'
+                    )
+            deferred = status.get('companies_research_deferred') or 0
+            if deferred:
+                st.warning(
+                    f'**{deferred:,}** companies were imported without research — '
+                    'they hit the spend cap set for this run. Research them from '
+                    'the Deep Research view when you want them.'
                 )
             if status.get('gcs_path'):
                 st.caption(f"Saved → `{status['gcs_path']}`")
@@ -659,41 +688,104 @@ profile_method = st.radio(
     key='ci_profile_method',
 )
 
+n_companies = int(deduped_df['companyWebsite'].apply(_bare_domain).nunique())
+
+# Financial Deep Research is offered only for a pool destination. It is
+# diligence on a company we are actively pursuing, and the run it records
+# carries a pool so a later Apply writes back to the right store — a
+# lead-source folder is neither. It is also how an accidental five-figure
+# spend on a 30k-row lead dump is prevented.
+financial_research = False
+if dest_pool:
+    financial_research = st.checkbox(
+        f'💰 Also run financial Deep Research on each {pl.noun(dest_pool)}',
+        value=False,
+        key='ci_financial_research',
+        help='Runs the same financial diligence as the Deep Research view '
+             '(54 fields: revenue, funding, federal awards, headcount, '
+             'proposal-readiness score) as part of this import, writing '
+             'financial_data / financial_summary / financials_updated_at onto '
+             'the rows as they are created. Recorded as a normal financial '
+             'research run, so it also shows up in HubSpot Import. This is a '
+             'second research task per company — it roughly doubles the cost '
+             'when combined with Deep Research profiling.',
+    )
+else:
+    st.caption(
+        'Financial Deep Research is available when the destination is a '
+        'company pool — pick one in step 2.'
+    )
+
+needs_research = profile_method == 'deep_research' or financial_research
 research_model = None
+max_research   = 0
 confirmed      = True
 
-if profile_method == 'deep_research':
-    n_companies = int(deduped_df['companyWebsite'].apply(_bare_domain).nunique())
+if needs_research:
     research_model = st.radio(
         'Deep Research model',
         options=fr.DEEP_RESEARCH_MODELS,
         index=1,   # Terra — recommended balance of cost and depth
         format_func=lambda m: f'{m}  ({fr.EST_COST_LABEL[m]})',
         key='ci_research_model',
+        help='Used by both research focuses.',
     )
-    est_total = fr.EST_COST_PER_COMPANY[research_model] * n_companies
-    st.metric(
+
+    # One task per focus per company, so the estimate scales with the number
+    # of focuses actually selected.
+    focuses = (['technology'] if profile_method == 'deep_research' else []) \
+            + (['financials'] if financial_research else [])
+
+    max_research = st.number_input(
+        'Max companies to research',
+        min_value=0, max_value=10_000,
+        value=min(n_companies, 250),
+        step=25,
+        key='ci_max_research',
+        help='Hard spend cap. Companies beyond this are imported WITHOUT '
+             'research rather than researched — 0 means no cap. The overflow '
+             'is reported in the job status and can be researched later from '
+             'the Deep Research view.',
+    )
+    n_researched = min(n_companies, max_research) if max_research else n_companies
+
+    est_total = fr.EST_COST_PER_COMPANY[research_model] * n_researched * len(focuses)
+    c1, c2 = st.columns(2)
+    c1.metric('Companies researched', f'{n_researched:,}',
+              delta=(f'-{n_companies - n_researched:,} over cap'
+                     if n_researched < n_companies else None),
+              delta_color='off')
+    c2.metric(
         'Estimated research cost',
         f'~${est_total:,.0f}',
-        help=f'{n_companies:,} unique companies × {fr.EST_COST_LABEL[research_model]}. '
-             'Actual cost is computed from token usage and reported in the job status.',
+        help=f'{n_researched:,} companies × {len(focuses)} focus'
+             f'{"es" if len(focuses) != 1 else ""} × '
+             f'{fr.EST_COST_LABEL[research_model]}. Actual cost is computed '
+             'from token usage and reported in the job status.',
     )
     if est_total > fr.COST_CONFIRM_THRESHOLD_USD:
         confirmed = st.checkbox(
             f'I understand this import may cost roughly ${est_total:,.0f} '
-            f'({n_companies:,} companies × {fr.EST_COST_LABEL[research_model]}).',
+            f'({n_researched:,} companies × {len(focuses)} research focus'
+            f'{"es" if len(focuses) != 1 else ""} × '
+            f'{fr.EST_COST_LABEL[research_model]}).',
             key='ci_cost_confirm',
         )
+
+if profile_method == 'deep_research':
     st.caption(
         f'**{len(deduped_df):,}** new contacts across **{n_companies:,}** unique companies '
-        f'will be profiled by Deep Research (technology focus) and embedded '
-        f'(text-embedding-ada-002) by a Cloud Run job. Companies whose research '
-        f'fails or exceeds the ~100-minute budget are skipped (re-importable later). '
-        f'The job re-deduplicates at runtime as a safety check.'
+        f'will be profiled by Deep Research (technology focus'
+        + (' + financials' if financial_research else '') +
+        f') and embedded (text-embedding-ada-002) by a Cloud Run job. '
+        f'Companies whose **technology** research fails or exceeds the ~100-minute '
+        f'budget are skipped (re-importable later); a failed **financial** task only '
+        f'leaves those columns empty. The job re-deduplicates at runtime as a safety check.'
     )
 else:
     st.caption(
         f'**{len(deduped_df):,}** new contacts will be scraped, summarised (GPT-3.5-turbo), '
+        + ('researched for financials, ' if financial_research else '') +
         f'and embedded (text-embedding-ada-002) by a Cloud Run job. '
         f'The job re-deduplicates at runtime as a safety check, so the final count may differ slightly.'
     )
@@ -721,9 +813,11 @@ if st.button('🚀 Start import job', type='primary', key='ci_trigger_btn',
                 'col_map':           col_map,
                 'profile_method':    profile_method,
                 'dedup_all_sources': bool(dedup_all),
+                'financial_research': bool(financial_research),
             }
-            if profile_method == 'deep_research':
-                config['research_model'] = research_model
+            if needs_research:
+                config['research_model']         = research_model
+                config['max_research_companies'] = int(max_research)
             config_blob_path = _write_config(gcs, config)
 
         with st.spinner('Triggering Cloud Run job…'):

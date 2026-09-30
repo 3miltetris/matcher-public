@@ -91,6 +91,8 @@ pages = {
                 url_path="bulk_matching"),
         st.Page("views/aspect_match.py", title="Aspect Match", icon="🎯",
                 url_path="aspect_match"),
+        st.Page("views/strategy_chat.py", title="Funding Strategy", icon="🗺️",
+                url_path="strategy_chat"),
     ],
     "Talent": [
         st.Page("views/resumes.py", title="Resumes", icon="📇",

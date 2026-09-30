@@ -43,3 +43,23 @@ key.txt
 # and baked into the published image.
 *.csv
 local-data/
+
+# Same vocabulary problem as the key patterns above: an OAuth credential is
+# spelled with neither "key" nor "api", so OAUTH_CLIENT_ID.txt matched nothing.
+# These are already in .gcloudignore; mirrored here so the file is not
+# committable either.
+*oauth*
+*OAUTH*
+*client_id*
+*CLIENT_ID*
+*client-id*
+*secret*
+*SECRET*
+
+# BW&CO playbooks, the NIH knowledge base, and the client strategy packets
+# they produced (named clients: assessments, pursue orders, IC scoring).
+# Dockerfile.app ends in `COPY . .`, so committing this folder would publish
+# client-confidential material into the matcher-app image in Artifact Registry.
+# The playbooks and knowledge base live in GCS under strategy-playbooks/ —
+# see src/modules/strategy_session.py.
+project-context/
