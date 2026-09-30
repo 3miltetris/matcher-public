@@ -24,6 +24,7 @@ from google.cloud import storage
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 import src.modules.anthropic_utils as au
+import src.modules.newsletter as nl
 import src.modules.ui_common as uc
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -282,6 +283,7 @@ def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
 _SAM_RESERVED_COLS = frozenset({
     'topic_number', 'agency', 'title', 'description', 'open_date', 'due_date',
     'scraped_at', 'sam_confidence', 'sam_reason', 'grant_summary', 'embeddings', 'source',
+    *nl.COLUMNS,
 })
 
 
@@ -329,6 +331,12 @@ def _embed_and_save(
     progress.empty()
 
     out['embeddings'] = embeddings
+
+    # Newsletter screening — the published opportunity title is the hint.
+    nl_bar = st.progress(0, text='Newsletter screening…')
+    nl.tag_frame(out, anth_key, title_hints=out['title'].tolist(),
+                 progress=lambda d, t: nl_bar.progress(d / t, text=f'Newsletter screening {d}/{t}'))
+    nl_bar.empty()
 
     if extra_cols:
         for col_name, col_val in extra_cols.items():

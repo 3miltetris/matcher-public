@@ -56,12 +56,30 @@ st.caption(
     'without leaving the matcher.'
 )
 
+# "Continue on Haiku" after a partial refusal. It CONTINUES rather than
+# re-generates: the partial stays in the history exactly as saved and one new
+# consultant turn asks for the rest. Deleting the partial and regenerating
+# would be a history edit, which newer models check against their own thinking
+# blocks, and would throw away text the consultant already read. Appending
+# keeps the history append-only and only pays for the missing part.
+_FALLBACK_NAME = 'Haiku 4.5'
+_CONTINUE_PROMPT = (
+    'Your previous answer stopped part-way. Continue it from exactly where it '
+    'stopped — do not repeat what you already wrote, and keep the same '
+    'structure and approval gates.'
+)
+
 for _k, _v in {
     'sc_record':    None,     # the live session record
     'sc_pending':   False,    # an assistant turn is owed
     'sc_error':     None,
     'sc_drive_files': None,   # cached Drive listing for the selected company
     'sc_partial':   None,     # text streamed by a turn that then failed
+    # One turn on a model other than the session's. Set only by the "continue
+    # on Haiku" button after a partial refusal, and cleared as soon as that
+    # turn runs — the session model is never changed, so the next turn goes
+    # back to it and its cache stays warm.
+    'sc_model_override': None,
 }.items():
     st.session_state.setdefault(_k, _v)
 
@@ -234,9 +252,13 @@ def _render_setup() -> None:
     model = r1.selectbox(
         'Model', ss.MODELS, index=0, key='sc_model',
         format_func=lambda m: ss.MODEL_LABELS.get(m, m),
-        help='Sonnet 4.6 is the house default and matches every other Claude '
-             'call in this app. Opus 5 reasons harder on the portfolio and '
-             '"why now" stages, at roughly 1.7x the token price.',
+        help='Opus 5.5 is the default here — strongest on the portfolio and '
+             '"why now" stages, and cheaper per token than Opus 5. Sonnet 4.6 '
+             'matches every other Claude call in this app. On a client whose '
+             'material trips the safety classifiers (dried or powdered '
+             'biologics is the known case), pick Haiku 4.5 outright — it is '
+             'the weakest model here but the one measured to complete that '
+             'material; otherwise a refusal falls back to it automatically.',
     )
     web = r2.checkbox(
         '🌐 Live web search', value=True, key='sc_web',
@@ -481,6 +503,11 @@ def _render_chat(record: dict) -> None:
         with st.chat_message(msg['role']):
             if msg.get('fell_back'):
                 st.caption(f"⚠️ answered by {msg.get('model', '')} after a refusal")
+            elif msg.get('continued_on'):
+                st.caption(f"⚠️ continued by {msg.get('model', '')} after a "
+                           'partial refusal')
+            if msg.get('partial_refusal'):
+                st.caption('✂️ stopped part-way by a safety classifier')
             for line in acts:
                 st.caption(line)
             if text:
@@ -584,11 +611,14 @@ def _log(msg: str) -> None:
 
 def _run_turn(record: dict) -> None:
     started = time.monotonic()
+    override = st.session_state.sc_model_override
+    st.session_state.sc_model_override = None      # one turn only, even on failure
+    turn_model = override or record['model']
     request = ss.build_request(
         system_text  = record['system_text'],
         context_text = ss.render_context(record.get('context_blocks') or []),
         messages     = record['messages'],
-        model        = record['model'],
+        model        = turn_model,
         web_search   = bool(record.get('web_search')),
     )
 
@@ -624,7 +654,8 @@ def _run_turn(record: dict) -> None:
             acts.append(line)
             act_box.caption(' · '.join(acts[-4:]))
 
-        _log(f"turn start session={record['session_id']} model={record['model']} "
+        _log(f"turn start session={record['session_id']} model={turn_model} "
+             f"override={bool(override)} "
              f"playbook={record.get('playbook')} msgs={len(record['messages'])} "
              f"system_chars={len(record['system_text'])} web={record.get('web_search')}")
         try:
@@ -679,6 +710,11 @@ def _run_turn(record: dict) -> None:
             'content':    result['content'],
             'model':      used,
             'fell_back':  bool(result.get('fell_back')),
+            # Stored, not just shown, so the "continue on Haiku" button is
+            # still offered after a reload or when a colleague opens the
+            # session by ID. Metadata like `model`; build_request drops it.
+            'partial_refusal': bool(result.get('partial_refusal')),
+            'continued_on':    override,
             'usage':      result['usage'],
         })
     # stream_turn priced each attempt at its own model's rate; do not re-price
@@ -693,15 +729,13 @@ def _run_turn(record: dict) -> None:
             f'**{used}** had already written some of it. What you see above is '
             'real and has been saved — it is just incomplete. This fires on '
             'dried/powdered-biologic material and is a known false positive. '
-            'Ask Claude to continue from where it stopped, or rephrase the '
-            'turn; removing the triggering row from the attached results also '
-            'clears it. If it keeps firing, switch **Model for the next turn** '
-            f'in the sidebar to **{ss.MODEL_LABELS[ss.FALLBACK_MODEL]}** — on '
-            'this kind of material it is often the only one that finishes.'
+            f'Use **↪ Continue on {_FALLBACK_NAME}** below to have it finish '
+            'the answer — on this kind of material it is often the only model '
+            'that does — or rephrase the turn yourself.'
         )
     elif result['stop_reason'] == 'refusal':
         st.session_state.sc_error = (
-            f"Both **{record['model']}** and the fallback "
+            f"Both **{turn_model}** and the fallback "
             f"**{ss.FALLBACK_MODEL}** declined this turn, so there is no "
             'answer to show. This is usually the client material rather than '
             'your question — dried/powdered biologics are a known false '
@@ -745,5 +779,29 @@ else:
         if st.button('↻ Retry the last turn', key='sc_retry'):
             st.session_state.sc_error = None
             st.session_state.sc_pending = True
+            st.rerun()
+
+    # Offered only when the conversation ENDS on a partially refused answer.
+    # Once the consultant replies, the moment has passed: continuing would
+    # answer a message they did not write.
+    _last = _record['messages'][-1] if _record['messages'] else None
+    _can_continue = (_last is not None
+                     and _last['role'] == 'assistant'
+                     and _last.get('partial_refusal')
+                     and _last.get('model') != ss.FALLBACK_MODEL
+                     and not st.session_state.sc_pending)
+    if _can_continue:
+        if st.button(f'↪ Continue on {_FALLBACK_NAME}', key='sc_continue_haiku',
+                     help=f'Asks {_FALLBACK_NAME} to finish the answer from where '
+                          'it stopped. The partial answer stays as it is; only '
+                          'this one turn runs on the fallback model, so the next '
+                          'turn goes back to the session model.'):
+            _record['messages'].append(
+                {'role': 'user', 'content': [{'type': 'text',
+                                              'text': _CONTINUE_PROMPT}]})
+            st.session_state.sc_model_override = ss.FALLBACK_MODEL
+            st.session_state.sc_error = None
+            st.session_state.sc_pending = True
+            _save(_record)
             st.rerun()
     _render_chat(_record)

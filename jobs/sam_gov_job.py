@@ -78,6 +78,7 @@ from google.cloud import storage
 from openai import OpenAI
 
 import src.modules.anthropic_utils as au
+import src.modules.newsletter as nl
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -671,6 +672,11 @@ async def _summarize_all(titles: list[str], descs: list[str], anth_key: str,
         await asyncio.gather(*[_one(i) for i in range(len(titles))])
 
     return results
+
+
+def _nl_progress(done: int, total: int) -> None:
+    if done % 25 == 0 or done == total:
+        print(f'  newsletter: {done}/{total}', flush=True)
 
 
 # ── Embeddings ─────────────────────────────────────────────────────────────────
@@ -1646,6 +1652,16 @@ def main(config_blob_path: str) -> None:
     for col_name, col_val in custom_cols.items():
         out[col_name] = col_val
 
+    # ── Step 6b: Newsletter screening ──────────────────────────────────────────
+    # A SAM.gov notice title IS the solicitation's published title, so it goes
+    # in as the hint; the model only replaces it when the text names a parent
+    # program (a CSO or BAA the notice belongs to). Failures leave the row
+    # unchecked rather than costing the import.
+    print(f'Newsletter screening {len(out):,} rows…', flush=True)
+    nl.tag_frame(out, anth_key, title_hints=out['title'].tolist(), progress=_nl_progress)
+    newsletter_counts = nl.summarize(out)
+    print(f'  {newsletter_counts}', flush=True)
+
     # ── Step 7: Save to GCS ────────────────────────────────────────────────────
     hex_suffix = _secrets.token_hex(3)
     gcs_path   = f'{_SAM_STORE_PREFIX}sam_gov_{today}_{hex_suffix}.parquet'
@@ -1667,6 +1683,7 @@ def main(config_blob_path: str) -> None:
         revisions=revision_reports[:200],
         rows_deferred_quota=rows_deferred_quota,
         gcs_path=gcs_path,
+        **newsletter_counts,
     ))
 
 

@@ -27,6 +27,9 @@ _STEPS = [
          'Grants.gov, or let the agent walk your watched funding sites.'),
         ('🔍', 'views/grant_search.py', 'Grant Search',
          'Ask which topics match a technology description, ad hoc.'),
+        ('📰', 'views/newsletter.py', 'Newsletter',
+         "Review the day's new topics that are worth a newsletter slot, by "
+         'vertical, and export the draft.'),
     ]),
     ('Clients & prospects', [
         ('👤', 'views/contact_importer.py', 'Import Contacts',

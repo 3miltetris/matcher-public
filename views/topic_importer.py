@@ -19,6 +19,7 @@ from google.cloud import storage
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 import src.modules.anthropic_utils as au
+import src.modules.newsletter as nl
 import src.modules.ui_common as uc
 
 # ── GCS ────────────────────────────────────────────────────────────────────
@@ -38,6 +39,7 @@ topic or subtopic from the provided solicitation document.
 
 For each topic, extract:
 - topic_number: The topic or subtopic identifier (e.g., "A24-001", "N241-001", "Topic 3", etc.). Null if not present.
+- solicitation_title: The official title of the overall solicitation or funding mechanism these topics belong to, copied verbatim from the document (usually its cover page or header — e.g., "Department of the Navy SBIR 26.1 Broad Agency Announcement", "AFWERX Open Topic 26.1"), including its number if shown. The same value for every topic from the same solicitation. Null if the document never states it — do not invent one.
 - title: The verbatim title of the topic. If no explicit title exists, create a concise 8-10 word snippet from the start of the description.
 - description: The full verbatim description text for that topic. Include all technical requirements, objectives, and scope language. Do not truncate.
 - due_date: Any due date, close date, or submission deadline associated with the topic. Null if not present. Use ISO format YYYY-MM-DD if possible.
@@ -47,17 +49,18 @@ Return ONLY a valid JSON array. No preamble, no markdown, no backticks.
 CRITICAL: All string values must be properly JSON-escaped. Do NOT include literal newline characters inside JSON string values, use \\n instead.
 
 Example:
-[{"topic_number":"A24-001","title":"Autonomous UUV Navigation Systems","description":"Full verbatim description here.","due_date":"2024-09-15","funding_amount":"$150,000"}]
+[{"topic_number":"A24-001","solicitation_title":"Army SBIR 24.4 Broad Agency Announcement","title":"Autonomous UUV Navigation Systems","description":"Full verbatim description here.","due_date":"2024-09-15","funding_amount":"$150,000"}]
 
 If the document has a single global due date or funding amount, apply it to all topics. Extract ALL topics.\
 """
 
 _EXTRACT_MODEL = 'claude-sonnet-4-6'
 _EMBED_MODEL   = 'text-embedding-ada-002'
-_COL_ORDER     = ['topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount', 'scraped_at', 'grant_summary']
+_COL_ORDER     = ['topic_number', 'solicitation_title', 'title', 'agency', 'source', 'due_date', 'funding_amount', 'scraped_at', 'grant_summary']
 _RESERVED_COLS = frozenset({
     'topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount',
     'scraped_at', 'description', 'embeddings', 'grant_summary',
+    *nl.COLUMNS,
 })
 
 
@@ -114,7 +117,7 @@ def _extract_topics(text: str, anth_key: str) -> list[dict]:
 
 def _build_df(topics: list[dict], sub_agency: str, source: str = '') -> pd.DataFrame:
     df = pd.DataFrame(topics)
-    for col in ['topic_number', 'title', 'description', 'due_date', 'funding_amount']:
+    for col in ['topic_number', 'solicitation_title', 'title', 'description', 'due_date', 'funding_amount']:
         if col not in df.columns:
             df[col] = None
     # Normalise to canonical column name before saving
@@ -130,11 +133,20 @@ def _build_df(topics: list[dict], sub_agency: str, source: str = '') -> pd.DataF
     return df[present + extra].reset_index(drop=True)
 
 
-def _embed_and_save(df: pd.DataFrame, broad_agency: str, oai_key: str) -> list[str]:
+def _embed_and_save(df: pd.DataFrame, broad_agency: str, oai_key: str, anth_key: str) -> list[str]:
     tp     = TextProcessor(api_key=oai_key)
     bm     = BucketManager(_BUCKET, client=_get_storage_client())
     today  = datetime.today().strftime('%Y-%m-%d')
     saved  = []
+
+    # Newsletter screening. The extracted (and possibly hand-edited)
+    # solicitation_title column rides in as the hint via tag_frame.
+    df = df.copy()
+    nl_bar = st.progress(0, text='Newsletter screening…')
+    nl.tag_frame(df, anth_key, progress=lambda d, t: nl_bar.progress(
+        d / t, text=f'Newsletter screening {d}/{t}'))
+    nl_bar.empty()
+    st.session_state.ti_newsletter = nl.summarize(df)
 
     for sub_agency, group in df.groupby('agency'):
         group    = group.copy()
@@ -296,6 +308,8 @@ def render():
             num_rows='dynamic',
             column_config={
                 'topic_number': st.column_config.TextColumn('Topic #',      width='small'),
+                'solicitation_title': st.column_config.TextColumn('Solicitation', width='medium',
+                    help='Official title of the solicitation these topics belong to — used as the headline in the newsletter.'),
                 'title':        st.column_config.TextColumn('Title',        width='medium'),
                 'agency':       st.column_config.TextColumn('Agency',       width='small'),
                 'source':       st.column_config.TextColumn('Source',       width='small'),
@@ -432,9 +446,16 @@ def render():
                 oai_key = st.secrets['openai_api_key']
 
                 try:
-                    out_paths = _embed_and_save(edited_df, broad_agency, oai_key)
+                    out_paths = _embed_and_save(edited_df, broad_agency, oai_key,
+                                                st.secrets['anthropic_api_key'])
+                    _nl = st.session_state.get('ti_newsletter') or {}
                     st.session_state.ti_save_results = [
                         f'Saved **{p}**' for p in out_paths
+                    ] + [
+                        f"📰 Newsletter: **{_nl.get('newsletter_good', 0)}** of "
+                        f"{_nl.get('newsletter_checked', 0)} checked topic(s) flagged"
+                        + (f" · {_nl['newsletter_failed']} could not be checked"
+                           if _nl.get('newsletter_failed') else '')
                     ]
                     st.session_state.ti_topics_df = None
                     st.rerun()

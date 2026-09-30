@@ -73,6 +73,8 @@ pages = {
                 url_path="grant_sources"),
         st.Page("views/grant_search.py", title="Grant Search", icon="🔍",
                 url_path="grant_search"),
+        st.Page("views/newsletter.py", title="Newsletter", icon="📰",
+                url_path="newsletter"),
     ],
     "Clients & prospects": [
         st.Page("views/contact_importer.py", title="Import Contacts", icon="👤",

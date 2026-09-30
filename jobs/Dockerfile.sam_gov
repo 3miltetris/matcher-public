@@ -13,6 +13,8 @@ COPY jobs/sam_gov_job.py jobs/sam_gov_job.py
 COPY src/__init__.py src/__init__.py
 COPY src/modules/__init__.py src/modules/__init__.py
 COPY src/modules/anthropic_utils.py src/modules/anthropic_utils.py
+# Newsletter screening of every stored notice (verticals + solicitation title).
+COPY src/modules/newsletter.py src/modules/newsletter.py
 
 ENV PYTHONPATH=/app
 

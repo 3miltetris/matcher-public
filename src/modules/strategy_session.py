@@ -40,9 +40,11 @@ Three things in here are easy to get wrong and are deliberate:
     models this view defaults to, so a plain user turn it is.
 
 `thinking` is never passed. Omitting it gives each model its own default (off
-on Sonnet 4.6, adaptive on Sonnet 5 and Opus 5), which is what we want, and it
-sidesteps the Opus 5 rule that `thinking: disabled` is a 400 above `high`
-effort. `temperature`/`top_p`/`top_k` are never passed either — see the SDK
+on Sonnet 4.6, adaptive on Sonnet 5, Opus 5 and Opus 5.5), which is what we
+want, and it sidesteps two rules at once: `thinking: disabled` is a 400 above
+`high` effort on Opus 5, and a 400 at EVERY effort level on Opus 5.5. Depth is
+controlled through `output_config.effort` instead — see `effort_config()`.
+`temperature`/`top_p`/`top_k` are never passed either — see the SDK
 version-pin note in CLAUDE.md.
 
 Streamlit-free so the same assembly can move into a Cloud Run job later if
@@ -64,13 +66,25 @@ SESSION_PREFIX   = 'strategy-sessions/'
 
 # ── Models ─────────────────────────────────────────────────────────────────
 
-MODELS = ['claude-sonnet-4-6', 'claude-sonnet-5', 'claude-opus-5',
-          'claude-haiku-4-5-20251001']
+# Opus 5.5 leads the list because the view's picker defaults to `index=0`. It
+# is both stronger and CHEAPER than Opus 5 ($4/$20 per MTok against $5/$25), so
+# there is no cost argument for keeping a Sonnet first any more.
+#
+# One caveat that is specific to this app's material: Opus 5.5 widened its
+# safety classifiers — `bio` and `reasoning_extraction` now join `cyber`. The
+# refusals documented below are BIO material (dried/powdered biologics), so on
+# an Inaedis-class client this model is if anything likelier to decline than
+# the Sonnets were. That is survivable precisely because FALLBACK_MODEL exists
+# and Haiku is measured to answer; a consultant working a bio client can also
+# pick Haiku outright from the mid-session switcher.
+MODELS = ['claude-opus-5-5', 'claude-sonnet-4-6', 'claude-sonnet-5',
+          'claude-opus-5', 'claude-haiku-4-5-20251001']
 
 MODEL_LABELS = {
-    'claude-sonnet-4-6': 'Sonnet 4.6 — house default',
+    'claude-opus-5-5':   'Opus 5.5 — strongest, and cheaper than Opus 5',
+    'claude-sonnet-4-6': 'Sonnet 4.6 — former house default',
     'claude-sonnet-5':   'Sonnet 5 — stronger reasoning',
-    'claude-opus-5':     'Opus 5 — strongest, ~1.7x cost',
+    'claude-opus-5':     'Opus 5 — superseded by 5.5, kept for comparison',
     # Haiku is selectable, not just the automatic fallback, because on some
     # real client material it is the ONLY model that completes the turn.
     # Measured on the live Inaedis session (NIH playbook, 85,614 prompt
@@ -85,7 +99,7 @@ MODEL_LABELS = {
 # Models that accept the dynamic-filtering web-search tool. Deliberately NOT
 # `MODELS`: Haiku is in the picker but rejects `_20260209`.
 _DYNAMIC_SEARCH_MODELS = {
-    'claude-sonnet-4-6', 'claude-sonnet-5', 'claude-opus-5',
+    'claude-opus-5-5', 'claude-sonnet-4-6', 'claude-sonnet-5', 'claude-opus-5',
 }
 
 # A refusal fallback, for the same reason client_profile_job carries one.
@@ -119,11 +133,19 @@ FALLBACK_MODEL = 'claude-haiku-4-5-20251001'
 # 1.25x — billing them at the full input rate would hide the entire saving the
 # cache breakpoints exist to produce.
 _PRICES = {
+    'claude-opus-5-5':   (4.00, 20.00),
     'claude-sonnet-4-6': (3.00, 15.00),
     'claude-sonnet-5':   (3.00, 15.00),
     'claude-opus-5':     (5.00, 25.00),
     'claude-haiku-4-5-20251001': (1.00, 5.00),   # the refusal fallback
 }
+
+# Cache reads are 0.10x input on every model here EXCEPT Opus 5.5, whose reads
+# are $0.20/MTok against $4.00 input — 0.05x. A flat 0.10x would overstate the
+# dominant token category on the default model by 2x, which defeats the point
+# of pricing reads separately at all.
+_CACHE_READ_MULT = {'claude-opus-5-5': 0.05}
+_DEFAULT_CACHE_READ_MULT = 0.10
 _WEB_SEARCH_USD = 10.00 / 1000      # per search request
 
 # Two web-search tool versions, and picking the wrong one is a 400.
@@ -145,6 +167,29 @@ _WEB_SEARCH_BASIC   = {'type': 'web_search_20250305', 'name': 'web_search'}
 def web_search_tool(model: str) -> dict:
     return (_WEB_SEARCH_DYNAMIC if model in _DYNAMIC_SEARCH_MODELS
             else _WEB_SEARCH_BASIC)
+
+
+# Reasoning effort, and it has to be set explicitly now.
+#
+# Every other model in MODELS defaults to effort `high`. Opus 5.5 defaults to
+# `medium` — so promoting it to the house default WITHOUT this would quietly
+# run the playbook a rung BELOW what Opus 5 gave, while the view's own caption
+# promises it "reasons harder on the portfolio". A silent downgrade, not an
+# error. Sending `high` on the others is a no-op restatement of their default,
+# which is the point: one rule, no per-model special case to forget.
+#
+# FALLBACK_MODEL is excluded, and this is the same trap as the web-search tool
+# version: `output_config.effort` ERRORS on claude-haiku-4-5. Fixing effort
+# once in build_request would break the rescue request exactly when the rescue
+# is needed, so — like the tool — it is chosen per attempt from the model
+# actually being called.
+_EFFORT = 'high'
+_NO_EFFORT_MODELS = {'claude-haiku-4-5-20251001'}
+
+
+def effort_config(model: str) -> dict | None:
+    """`output_config` for this model, or None where effort is unsupported."""
+    return None if model in _NO_EFFORT_MODELS else {'effort': _EFFORT}
 
 MAX_TOKENS       = 32000            # streamed, so the SDK timeout is not a factor
 MAX_PAUSE_RESUMES = 6               # server-tool turns can stop with pause_turn
@@ -455,6 +500,11 @@ def build_request(*, system_text: str, context_text: str, messages: list[dict],
         # Replaced per attempt in stream_turn with the variant that model
         # supports; set here only to signal that search is enabled.
         kwargs['tools'] = [web_search_tool(model)]
+
+    # Likewise replaced (or dropped) per attempt — Haiku rejects it outright.
+    oc = effort_config(model)
+    if oc:
+        kwargs['output_config'] = oc
     return kwargs
 
 
@@ -511,6 +561,14 @@ def stream_turn(client, *, request: dict, on_text=None, on_activity=None,
         attempt = dict(request, model=model)
         if request.get('tools'):
             attempt['tools'] = [web_search_tool(model)]
+        # Both of these are per-model: the fallback rejects the dynamic search
+        # tool AND `output_config` entirely, so carrying either one over from
+        # the requested model would 400 the rescue attempt.
+        oc = effort_config(model)
+        if oc:
+            attempt['output_config'] = oc
+        else:
+            attempt.pop('output_config', None)
 
         result = _stream_once(client, attempt, on_text, on_activity)
         for k in usage:
@@ -638,7 +696,8 @@ def turn_cost(model: str, usage: dict) -> float:
     m = 1_000_000
     return (
         usage.get('input_tokens', 0) / m * rate_in
-        + usage.get('cache_read_input_tokens', 0) / m * rate_in * 0.10
+        + usage.get('cache_read_input_tokens', 0) / m * rate_in
+          * _CACHE_READ_MULT.get(model, _DEFAULT_CACHE_READ_MULT)
         + usage.get('cache_creation_input_tokens', 0) / m * rate_in * 1.25
         + usage.get('output_tokens', 0) / m * rate_out
         + usage.get('web_search_requests', 0) * _WEB_SEARCH_USD
@@ -856,6 +915,10 @@ def transcript_markdown(record: dict) -> str:
         who = 'Consultant' if msg.get('role') == 'user' else 'Claude'
         if msg.get('fell_back'):
             who += f" ({msg.get('model', '')} — after a refusal on the session model)"
+        elif msg.get('continued_on'):
+            who += f" ({msg.get('model', '')} — continuing a partially refused answer)"
+        if msg.get('partial_refusal'):
+            who += ' — stopped part-way by a safety classifier'
         out += [f'## {who}', '', text, '']
         for line in activity_lines(msg.get('content')):
             out.append(f'> {line}')

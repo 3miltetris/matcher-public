@@ -63,6 +63,7 @@ from anthropic import AsyncAnthropic
 from google.cloud import storage
 from openai import OpenAI
 
+from src.modules import newsletter as nl
 from src.modules import source_registry as sr
 from src.modules.browser_agent import (
     DEFAULT_MAX_TOOL_CALLS,
@@ -376,6 +377,9 @@ def main(config_blob_path: str) -> None:
             'opportunities_found': counts['found'],
             'opportunities_new':   counts['new'],
             'opportunities_saved': counts['saved'],
+            'newsletter_checked':  counts.get('newsletter_checked', 0),
+            'newsletter_good':     counts.get('newsletter_good', 0),
+            'newsletter_failed':   counts.get('newsletter_failed', 0),
             'gcs_paths':           gcs_paths,
             'api_sites':           api_sites,
             'login_walled':        login_walled,
@@ -399,6 +403,12 @@ def main(config_blob_path: str) -> None:
             print(f'Embedding {len(rows)} new opportunit(ies) for {broad_agency}…', flush=True)
             vectors = _embed_all([r.get('description', '') for r in rows], oai_key)
             frame   = _build_topic_frame(rows, vectors, run_id)
+            # The agent read the solicitation title off the page, which beats
+            # anything inferred afterwards — it goes in as the hint.
+            nl.tag_frame(frame, anth_key,
+                         title_hints=[r.get('solicitation_title', '') for r in rows])
+            for k, v in nl.summarize(frame).items():
+                counts[k] = counts.get(k, 0) + v
             path    = _save_topics(gcs, broad_agency, frame)
             gcs_paths.append(path)
             counts['saved'] += len(rows)

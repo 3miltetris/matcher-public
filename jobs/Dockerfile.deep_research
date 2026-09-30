@@ -33,6 +33,10 @@ COPY src/__init__.py src/__init__.py
 COPY src/modules/__init__.py src/modules/__init__.py
 COPY src/modules/source_registry.py src/modules/source_registry.py
 COPY src/modules/browser_agent.py src/modules/browser_agent.py
+# Newsletter screening of every stored opportunity (verticals + solicitation
+# title); anthropic_utils is its safe response reader.
+COPY src/modules/newsletter.py src/modules/newsletter.py
+COPY src/modules/anthropic_utils.py src/modules/anthropic_utils.py
 
 ENV PYTHONPATH=/app
 

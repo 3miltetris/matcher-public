@@ -164,6 +164,18 @@ TOOLS = [
                                 'type': 'string',
                                 'description': 'Solicitation / topic / reference number if shown.',
                             },
+                            'solicitation_title': {
+                                'type': 'string',
+                                'description': (
+                                    'The official name of the solicitation or funding '
+                                    'call this opportunity belongs to, copied exactly as '
+                                    'the page publishes it (e.g. the BAA, CSO, RPP, '
+                                    'challenge or program-announcement name). When the '
+                                    'opportunity is one topic inside a larger call, give '
+                                    "the larger call's name. Empty if the page never "
+                                    'names it — never invent one.'
+                                ),
+                            },
                             'url':            {'type': 'string', 'description': 'Direct link to this opportunity.'},
                             'open_date':      {'type': 'string', 'description': 'Publication or open date, as shown.'},
                             'close_date':     {'type': 'string', 'description': 'Response deadline, as shown.'},
@@ -549,6 +561,7 @@ def _clean_opportunities(raw, base_url: str) -> list:
             'title':          title[:500],
             'description':    desc,
             'topic_number':   str(item.get('topic_number') or '').strip()[:120],
+            'solicitation_title': str(item.get('solicitation_title') or '').strip()[:300],
             'url':            url,
             'open_date':      str(item.get('open_date') or '').strip()[:60],
             'close_date':     str(item.get('close_date') or '').strip()[:60],
