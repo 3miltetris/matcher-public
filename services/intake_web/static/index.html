@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Due Diligence Intake — BW&amp;CO</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="wrap">
+      <span class="brand">BW&amp;CO</span>
+      <span class="title">Due diligence intake</span>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <ol class="progress" id="progress" aria-label="Progress" hidden></ol>
+    <div id="notice" class="notice" role="status" hidden></div>
+
+    <!-- 1. Start -->
+    <section id="view-start" class="card">
+      <h1>Tell us about your company</h1>
+      <p class="lede">This replaces our previous due-diligence form. It takes about 15 minutes;
+        your answers save as you go.</p>
+      <form id="start-form" novalidate>
+        <label>Company legal name <span class="req">*</span>
+          <input name="company_legal_name" required maxlength="300" autocomplete="organization"></label>
+        <label>Company website <span class="req">*</span>
+          <input name="website" required maxlength="300" placeholder="example.com" autocomplete="url"></label>
+        <label>Your email <span class="req">*</span>
+          <input name="contact_email" type="email" required maxlength="300" autocomplete="email"></label>
+        <div id="turnstile"></div>
+        <button type="submit" class="primary">Start</button>
+      </form>
+    </section>
+
+    <!-- 2. Uploads -->
+    <section id="view-uploads" class="card" hidden>
+      <h1>Share your documents <span class="optional">(optional)</span></h1>
+      <p class="lede">A pitch deck, one-pager or technical lead CV helps our team prepare.
+        Files are stored privately and copied into your BW&amp;CO client folder.</p>
+      <p class="warn"><strong>Please do not upload export-controlled (ITAR/EAR) or CUI material.</strong></p>
+      <label class="drop">
+        <input type="file" id="file-input" multiple accept=".pdf,.pptx,.docx">
+        <span>Choose files — PDF, PPTX or DOCX, up to <b id="max-files">3</b> files of <b id="max-mb">25</b> MB</span>
+      </label>
+      <ul id="file-list" class="files"></ul>
+      <div class="actions">
+        <button type="button" id="skip-uploads">Skip</button>
+        <button type="button" id="done-uploads" class="primary">Continue</button>
+      </div>
+    </section>
+
+    <!-- 3. Sections -->
+    <section id="view-section" class="card" hidden>
+      <h1 id="section-title"></h1>
+      <form id="section-form" novalidate></form>
+      <label class="confirm"><input type="checkbox" id="section-confirm"> These answers look right</label>
+      <div class="actions">
+        <button type="button" id="prev-section">Back</button>
+        <span class="saved" id="saved-indicator" aria-live="polite"></span>
+        <button type="button" id="next-section" class="primary">Next</button>
+      </div>
+    </section>
+
+    <!-- 4. Done -->
+    <section id="view-done" class="card" hidden>
+      <h1>Thank you</h1>
+      <p class="lede">Your answers have been received. A member of the BW&amp;CO team will be in touch.</p>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

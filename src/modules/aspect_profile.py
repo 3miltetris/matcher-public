@@ -265,6 +265,7 @@ MATERIAL_COLS = [
     'summary', 'company_summary', 'full_text', 'page_text',
     'client_docs_summary', 'client_docs_data',
     'client_meetings_summary', 'client_meetings_data',
+    'intake_summary', 'intake_data',
     'technology_data', 'technology_summary',
     'financial_data', 'financial_summary',
 ]
@@ -339,6 +340,27 @@ def _meetings_text(row) -> str:
     return '\n\n'.join(parts)
 
 
+def _intake_text(row) -> str:
+    """Answers the founder gave on the DD intake form (src/modules/intake/).
+
+    Self-reported, so it is labelled as such in the prompt. Only answers whose
+    schema `profile_role` is `capability` are in extracted[...]; forward-looking
+    answers sit in extracted['notable_updates'] and are deliberately left out
+    here - they reach the unexplored-market pass via stated_intentions() only,
+    and eligibility / personal answers never reach the profile at all."""
+    parts = []
+    digest = _s(row.get('intake_summary'))
+    if digest:
+        parts.append('Intake digest:\n' + digest)
+    extracted = _json_obj(row.get('intake_data')).get('extracted') or {}
+    if isinstance(extracted, dict):
+        extracted = {k: v for k, v in extracted.items() if k != 'notable_updates'}
+    lines = _flatten_kv(extracted)
+    if lines:
+        parts.append('Founder answers:\n' + '\n'.join(lines))
+    return '\n\n'.join(parts)
+
+
 def _research_text(row, data_col: str, summary_col: str, fields: list[str]) -> str:
     data = _json_obj(row.get(data_col))
     if data:
@@ -368,7 +390,7 @@ def stated_intentions(row, limit: int = 20) -> list[str]:
     is the one place they are useful: a market the client is already thinking
     about is the strongest candidate there is - as a lead, never as capability."""
     out: list[str] = []
-    for col in ('client_meetings_data', 'client_docs_data'):
+    for col in ('client_meetings_data', 'client_docs_data', 'intake_data'):
         extracted = _json_obj(row.get(col)).get('extracted')
         if not isinstance(extracted, dict):
             continue
@@ -395,6 +417,8 @@ SOURCES: list[dict] = [
      'cap': 14000, 'extract': _drive_text},
     {'key': 'meetings',   'label': 'Client meetings (Fathom)',     'default': True,
      'cap': 14000, 'extract': _meetings_text},
+    {'key': 'intake',     'label': 'DD intake form (founder-reported)', 'default': True,
+     'cap': 10000, 'extract': _intake_text},
     {'key': 'technology', 'label': 'Deep Research — technology',  'default': True,
      'cap': 14000, 'extract': _tech_text},
     {'key': 'financials', 'label': 'Deep Research — financials',  'default': False,

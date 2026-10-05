@@ -1,0 +1,16 @@
+# intake-web (public DD intake service) — see services/intake_web/.
+# SDK upper bounds follow CLAUDE.md "SDK version pins".
+fastapi>=0.115.0,<1
+uvicorn[standard]>=0.30.0
+openai>=3.7.0,<4
+tiktoken>=0.12.0
+pandas>=2.0.0
+numpy>=1.26.0
+pyarrow>=14.0.0
+google-cloud-storage>=2.0.0
+google-cloud-run>=0.10.0
+google-auth>=2.0.0
+google-api-python-client>=2.100.0
+pymupdf>=1.27.0
+requests>=2.31.0
+tldextract>=5.0.0

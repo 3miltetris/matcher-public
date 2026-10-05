@@ -20,6 +20,9 @@ from googleapiclient.http import MediaIoBaseDownload
 from src.modules import doc_extract
 
 DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+# Write access — used only by the DD intake service (creates _INTERNAL
+# folders, copies uploads, writes the responses Doc). Never the default.
+DRIVE_WRITE_SCOPES = ['https://www.googleapis.com/auth/drive']
 
 FOLDER_MIME   = 'application/vnd.google-apps.folder'
 SHORTCUT_MIME = 'application/vnd.google-apps.shortcut'
@@ -41,13 +44,14 @@ _FILE_FIELDS = ('nextPageToken, files(id, name, mimeType, modifiedTime, size, '
 _RETRY_STATUSES = (429, 500, 502, 503, 504)
 
 
-def build_drive_service(credentials=None):
+def build_drive_service(credentials=None, scopes=None):
     """Build a Drive v3 service. Pass explicit credentials (Streamlit path:
     from_service_account_info(..., scopes=DRIVE_SCOPES)); None uses ADC
-    (Cloud Run job path)."""
+    (Cloud Run job path) with `scopes`, defaulting to read-only. Only the DD
+    intake service passes DRIVE_WRITE_SCOPES."""
     if credentials is None:
         import google.auth
-        credentials, _ = google.auth.default(scopes=DRIVE_SCOPES)
+        credentials, _ = google.auth.default(scopes=scopes or DRIVE_SCOPES)
     return _discovery_build('drive', 'v3', credentials=credentials,
                             cache_discovery=False)
 

@@ -87,6 +87,13 @@ src/
     doc_extract.py            # Streamlit-free document text extraction (PDF/DOCX/XLSX/TXT/CSV) — shared by Drive Sync view + drive-sync-job
     drive_client.py           # Streamlit-free Google Drive v3 helpers (shared-drive listing, export/download, backoff) — shared by Drive Sync view + drive-sync-job
     lead_importer.py          # Shared scraping/summarization/embedding helpers (reference; not imported by jobs)
+    folder_match.py           # Streamlit-free company-name <-> Drive folder-name matching (normalize/match_folder) — moved out of views/drive_sync.py; shared with the DD intake service
+    intake/                   # Stage 14 — the public DD intake service's logic (no FastAPI imports): schema, validation,
+                              #   sessions, signed-URL uploads, prospect rows, Drive folder + Doc, HubSpot upsert, submit pipeline
+services/
+  intake_web/                 # Stage 14 — public FastAPI app (routes only) + static wizard + Dockerfile (explicit COPY list)
+scripts/intake/pull_hubspot_form.py # one-off: dump the HubSpot DD form definition (needs the `forms` token scope)
+tests/intake/                 # pytest — the repo's first test suite (in-memory GCS fake in conftest.py)
 
 jobs/
   matching_job.py             # Cloud Run Job — scoring, AI validation, email pre-write
@@ -112,6 +119,7 @@ requirements.drive_sync_job.txt     # drive-sync-job dependencies (anthropic, op
 requirements.fathom_sync_job.txt    # fathom-sync-job dependencies (anthropic, requests, pandas/numpy/pyarrow, GCS — no openai: this job never embeds)
 requirements.client_profile_job.txt # client-profile-job dependencies (anthropic, openai, tiktoken, pandas/numpy/pyarrow, GCS)
 requirements.deep_research_job.txt  # deep-research-job dependencies (anthropic, openai, playwright, beautifulsoup4, tiktoken, pandas/numpy/pyarrow, GCS)
+requirements.intake_web.txt         # intake-web dependencies (fastapi, uvicorn, openai, google-api-python-client, google-cloud-run, pymupdf, tldextract, pandas/numpy/pyarrow, GCS)
 ```
 
 ### Pipeline Stages
@@ -324,6 +332,22 @@ The matcher's outreach is personalised: "this topic fits *your* company". The ne
 - **Model: `claude-opus-5-5` with effort set explicitly to `medium`,** using `output_config.format` json_schema. Structured outputs are **not** supported on `claude-sonnet-4-6`, which is why this is not on the house Sonnet. Effort is stated even though `medium` is Opus 5.5's default, so a later model swap cannot silently change depth. **A refusal retries on `claude-haiku-4-5-20251001`** with the format but *without* `effort` (which 400s on Haiku) — biotech topics are the known false-positive material and Opus 5.5 widened its bio classifier; see Stage 12 for why the server-side `fallbacks` parameter cannot reach Haiku. `newsletter_model` records which model actually answered. The system prompt carries `cache_control`; **measured ≈ $0.013 per topic** (~2.3k cached system tokens read per call after the first) and roughly 1 s per topic at 8 workers.
 - **Via Newsletter view** (`views/newsletter.py`): pick a scraped-date window (today by default) and agency folders → **Load topics** (only parquets created on or after the window start are read — an overwritten blob gets a new creation time, so the filter can include extra files but never miss one — then rows are filtered on `scraped_at`; archived SAM.gov rows are excluded) → metrics → **Check N unchecked** (backfills legacy or failed rows in-process, cost shown up front) → **Review**: a `st.data_editor` filtered by Newsletter-worthy / Skipped / All and vertical, where Include, Verticals (`|`-separated, validated by `parse_verticals`), Solicitation title and Hook are editable; **Save review** writes them plus `newsletter_reviewed_by` / `newsletter_reviewed_at` back onto the stored rows → **Draft**: Markdown preview and `.md` / `.csv` downloads grouped by vertical, **each item placed once under its first (most relevant) vertical** with "Also relevant to" noted, since repeating an item across three sections reads as padding. A "Re-check every loaded topic" expander re-runs screening after a prompt change and clears saved reviews (behind a confirmation checkbox).
 - **`write_back()` rewrites parquets in place and is defensive about it.** It re-reads each blob immediately before writing and re-locates every row by title (position first, then a unique title match); a row it cannot locate unambiguously is skipped and reported, never guessed — a SAM.gov revision or another consultant's save may have rewritten the file since it was loaded. Verified on a scratch copy of a live parquet: values land, an unlocatable row is reported, embeddings round-trip intact.
+
+**Stage 14 — DD intake** (founder-filled due-diligence form → prospect + Drive folder + Google Doc + HubSpot)
+
+Replaces the HubSpot due-diligence form with a public intake flow (`DD_INTAKE_PLAN.md`). **Phase 1 is built**: the founder fills the form by hand, optionally uploading documents. AI pre-fill (Phase 2) and federal-database enrichment (Phase 3) are not built; `ai_fillable` / `enrichable` on each field and the empty `ai_draft` / `enrichment` / `field_outcomes` slots in the submission record are where they plug in.
+
+- **This is the project's first public endpoint.** `intake-web` is a separate Cloud Run service (`--allow-unauthenticated`, its own `intake-web@` service account), not a page of `matcher-app`: the Matcher stays behind IAP and nothing from it ships in this image. Its Dockerfile is an explicit COPY list ending in an import smoke check, never `COPY . .`.
+- **`src/modules/intake/schema.py` is the single source of truth, transcribed from the live HubSpot "New Due Diligence Form"** (`f6099a96-…`, dumped with `scripts/intake/pull_hubspot_form.py`): 49 questions, labels and options verbatim, required flags as the form has them. Every other shape — frontend form (`/api/schema`), validation, digest, profile source text, Google Doc layout and HubSpot property map — is derived from `FIELDS` by `schema_export.py`. Sectors are the form's own `verticals` (13 options incl. Agtech & Foodtech and "Health Tech" — **not** `newsletter.VERTICALS`, whose spellings differ and would not match the HubSpot property's options); the profile build still derives `MARKET_CATEGORIES` markets on its own. **Deliberate departures from the form:** it has no conditional logic, so the intake adds it — health questions (patient population, studies, unmet need, PI employment) only when Health Tech/Medtech/Biotech is ticked, investor questions only when funding includes Outside Investors, the adjacent-markets and federal-award-detail follow-ups only after a yes — and a hidden question is neither required nor stored; the unfinished `Option 5` is dropped from "Who pays". Core field ids (`schema.COMPANY_NAME`, `WEBSITE`, `CONTACT_EMAIL`, `VERTICALS`, …) are read by name downstream; keep them.
+- **`profile_role` decides what an answer may become in the Matcher.** `capability` answers go into the profile source text; `intention` answers (goals, next milestone, adjacent markets) go to `intake_data.extracted.notable_updates`, which `aspect_profile._intake_text()` leaves out and `stated_intentions()` feeds only to the unexplored-market pass — the same confirmed-vs-aspirational rule as Fathom; `exclude` (eligibility, personal data — the default) stays in `intake_data.answers` and the Google Doc and never reaches a model.
+- **A prospect is contact rows, then a profile build.** `profile_writer.write_prospect()` looks the company up by **bare domain across both pools**. A company we already hold (client or prospect) gets `intake_data` / `intake_summary` / `intake_updated_at` written onto its existing rows in place, a new contact row only for a new email, and its `summary`/`embeddings` left alone. Otherwise a new prospect parquet `data/all-contacts/prospects/intake_{date}_{hex6}.parquet` is written in the clients convention with an ada-002 embedding of the capability answers; the hex is derived from the session id, so a retried step rewrites the same blob. `profile_trigger` then runs `client-profile-job` for that one company. The new **`intake` source** in `aspect_profile.SOURCES` (default on, cap 10k) is what lets the job read the answers — it changes `source_fingerprint` only for companies that have intake material.
+- **Submit is idempotent and resumable.** `validate → profile_rows` run in the request (the founder sees success once the rows exist); `drive_folder → copy_uploads → gdoc → hubspot → submission_record → writeback → profile_trigger` run as a FastAPI background task (service deployed with `--no-cpu-throttling`). Each step's status and ids are saved in the session JSON after the step; three attempts with backoff, then an email alert and `status: failed`. `python -m src.modules.intake.submit_pipeline resume <session_id>` finishes a failed session, skipping done steps. Sessions are written under the blob generation (`if_generation_match`), so a racing write fails rather than dropping a step record.
+- **Drive is written, for the first time in this repo.** `drive_client.DRIVE_WRITE_SCOPES` (full `drive`) is used only by this service; every other caller keeps the read-only default. `intake-web@` must be a **Content Manager** of the client shared drive. Folder reuse order: the id a previous intake stored → a folder Drive Sync assigned to the company → a single exact or contains name match anywhere in the drive (`folder_match`). A fuzzy-only or ambiguous match **creates a new folder** under `INTAKE_PARENT_FOLDER_ID` and sets `intake_data.needs_review` — writing a founder's documents into another client's folder is the outcome that must never happen. New folders are `{Legal Name}_INTERNAL` (spaces kept) inside **`Submitted Forms`** (`1Np2trJ-T7NSKoijjfxcuz1dD4wECGZEX`, a root-level folder of the client shared drive `0AH579d6JZ6cfUk9PVA`). Because Drive Sync treats every root-level folder as a section, `Submitted Forms` appears as one in its scans and intake folders there can be assigned and synced without being moved; staff may still move them into the a-h / i-p sections. Copied files and the Doc carry an `appProperties` marker (`intake_upload_id` / `intake_session_id`) so a retry finds them instead of duplicating.
+- **HubSpot via the CRM API, not the Forms API — but into the form's own properties.** Each answer is written to the property the HubSpot form writes (contact `0-1` or company `0-2`, per field), so staff views, lists and history stay continuous; most dropdowns store **opaque coded values** (`8syoo8PS…`), carried as `Field.option_values` parallel to the labels and resolved by `Field.hubspot_value()` — writing a label would fail or create junk. The intake creates only its four `dd_*` tracking properties. `hubspot_sync` searches the company by `domain` and the contact by email, creates with every mapped property, and on an existing record overwrites only the form's properties and `dd_*`; anything else (company `name`, `domain`, …) is filled only where blank. Verified against the live portal 2026-10-05: every mapped property exists and every option value matches. No form-submission event fires, so workflows that used the old form must trigger on **`dd_submitted_at` is known**. Token scopes beyond the existing set: `forms`, `crm.objects.companies.write`, `crm.objects.contacts.read`, `crm.objects.contacts.write`.
+- **Uploads go browser → GCS on V4 signed PUT URLs** (15 min, type- and size-restricted via `x-goog-content-length-range`; PDF/PPTX/DOCX, ≤3 × 25 MB). Cloud Run has no key file, so URLs are signed through IAM signBlob — `intake-web@` needs `roles/iam.serviceAccountTokenCreator` **on itself**. Every object is re-checked (size + magic bytes) before it is copied to Drive. The bucket needs a CORS rule allowing `PUT` from the service origin, and lifecycle rules delete `intake/uploads/` after 30 days and `intake/sessions/` after 14.
+- **Abuse limits:** Cloudflare Turnstile on session creation, per-IP (10/day) and per-session write rate limits held in memory (`--max-instances 2`). `INTAKE_DEV=1` skips Turnstile only when no secret is set — never set it on the deployed service.
+- **Logs and alerts carry session ids, company names and step names only**, never answers or document text.
+
 
 ---
 
@@ -715,6 +739,10 @@ cc-matcher-bucket-jeg-v1/
       raw/
   suggestions/
     <uuid>.json
+  intake/                               # Stage 14 — DD intake service (lifecycle rules scoped to these prefixes)
+    sessions/{session_id}.json          # draft answers + upload registry + per-step pipeline status (deleted after 14 days)
+    uploads/{session_id}/{id}.pdf       # raw founder uploads via signed URL (deleted after 30 days; the Drive copy is kept)
+    submissions/{session_id}.json       # final answers (+ Phase 2 draft-vs-final slots) — internal only
 ```
 
 ### BucketManager usage pattern
@@ -920,6 +948,7 @@ openai_key = os.environ['OPENAI_API_KEY']
 | `sam_gov_api_key` | SAM.gov Upload view (API fetch tab) | `st.secrets['sam_gov_api_key']` — passed into the sam-gov-job config JSON (**not** a Secret Manager secret; it therefore sits in plaintext inside the `sam-gov-configs/daily_schedule.json` GCS blob, unlike the Fathom key which is deliberately Secret Manager-only). **Two tiers exist and they are not interchangeable.** The project ran on the *individual* key (Account Details → API Key) until 2026-09-21; it dies after a few dozen requests/day. **It now runs on a non-federal *system account* key** (approved 2026-09-21), created under SAM.gov Workspace → System Accounts, which gets 1,000/day, requires the Non-Federal System Administrator role from your Entity Administrator, **expires every 90 days — next rotation due ~2026-12-20** (replacement auto-generated 15 days ahead, both valid during the overlap), and is bound to the IP allowlist documented under "SAM.gov static egress IP". **Rotation touches three places, and the second is the one that fails silently:** `streamlit-secrets`, the plaintext copy in the `daily_schedule.json` blob (the only one the daily Cloud Scheduler run reads), and a `matcher-app` redeploy so the UI remounts the secret. |
 | `fathom_api_key` | Fathom Meetings view (connection test + metadata scan) | `st.secrets.get('fathom_api_key')` — created at fathom.video → Settings → API Keys. Must sit **above** `[gcp_service_account]` in secrets.toml. Keys are **per user, not per org**: a key sees only meetings its owner recorded plus meetings shared with their team. The view degrades gracefully without it (a sync can still be triggered — the job reads its own copy from Secret Manager). |
 | `fathom-api-key` (Secret Manager) | Cloud Run fathom-sync-job | `os.environ['FATHOM_API_KEY']` — deliberately Secret Manager rather than the job config JSON, so the token never lands in a GCS blob (unlike the SAM.gov key) |
+| `hubspot-api-key`, `turnstile-secret`, `smtp-user`, `smtp-password` (Secret Manager) | Cloud Run `intake-web` service | `os.environ['HUBSPOT_API_KEY']` / `TURNSTILE_SECRET` / `SMTP_USER` / `SMTP_PASSWORD`, plus `OPENAI_API_KEY` from `openai-api-key`. Config env vars: `INTAKE_SHARED_DRIVE_ID`, `INTAKE_PARENT_FOLDER_ID`, `INTAKE_NOTIFY_TO`, `TURNSTILE_SITE_KEY` |
 | `anthropic-api-key` (Secret Manager) | Cloud Run matching job + sam-gov-job | `os.environ['ANTHROPIC_API_KEY']` |
 | `openai-api-key` (Secret Manager) | Cloud Run matching job + sam-gov-job + contact-import-job | `os.environ['OPENAI_API_KEY']` |
 
@@ -1947,6 +1976,24 @@ The Chromium install adds several minutes to the build, as it does for contact-i
 gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=deep-research-job" \
   --limit 50 --format "value(textPayload)"
 ```
+
+### `intake-web` (public Cloud Run service) — build, deploy, and manage
+
+The Stage 14 DD intake service. Runs as `intake-web@cc-matcher-v1.iam.gserviceaccount.com`, which needs: `roles/storage.objectAdmin` on the bucket, `roles/secretmanager.secretAccessor`, `roles/run.admin` on `client-profile-job` (runWithOverrides), `roles/iam.serviceAccountTokenCreator` on **itself** (signed URLs), and **Content Manager on the client shared drive** (Drive UI, not gcloud).
+
+```bash
+gcloud builds submit --config cloudbuild.intake_web.yaml --project cc-matcher-v1 .
+
+gcloud run deploy intake-web \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/intake-web:latest \
+  --region us-central1 --project cc-matcher-v1 \
+  --service-account intake-web@cc-matcher-v1.iam.gserviceaccount.com \
+  --allow-unauthenticated --no-cpu-throttling --max-instances 2 --memory 1Gi \
+  --set-secrets=OPENAI_API_KEY=openai-api-key:latest,HUBSPOT_API_KEY=hubspot-api-key:latest,TURNSTILE_SECRET=turnstile-secret:latest,SMTP_USER=smtp-user:latest,SMTP_PASSWORD=smtp-password:latest \
+  --set-env-vars=INTAKE_SHARED_DRIVE_ID=<drive id>,INTAKE_PARENT_FOLDER_ID=<folder id>,TURNSTILE_SITE_KEY=<site key>,INTAKE_NOTIFY_TO=john@bwcoconsulting.com
+```
+
+Local: `INTAKE_DEV=1 uvicorn services.intake_web.main:app --port 8080` (ADC credentials). Tests: `python -m pytest tests/intake`. Finish a failed submission: `python -m src.modules.intake.submit_pipeline resume <session_id>`.
 
 ---
 
