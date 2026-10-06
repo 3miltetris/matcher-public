@@ -3,31 +3,39 @@
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
-  const LS_KEY = 'bwco_intake_session';
+  // Drafts used to be found through localStorage; the server now keys them to
+  // the signed-in email. The old key is read once so an in-flight draft is kept.
+  const LEGACY_LS_KEY = 'bwco_intake_session';
   const UPLOAD_SECTION = '7_uploads';
+  const CONTACT_EMAIL = 'contact_email';
 
   const state = {
     config: null, sections: [], fieldsById: {},
     sessionId: null, answers: {}, confirmed: new Set(), current: 0,
-    turnstileId: null, saveTimer: null,
+    turnstileId: null, saveTimer: null, email: null,
   };
 
   // ── API ────────────────────────────────────────────────────────────────
   async function api(method, path, body) {
     const res = await fetch(path, {
-      method, headers: body ? { 'Content-Type': 'application/json' } : {},
+      method, credentials: 'same-origin',
+      headers: body ? { 'Content-Type': 'application/json' } : {},
       body: body ? JSON.stringify(body) : undefined,
     });
     let data = {};
     try { data = await res.json(); } catch (_) { /* empty body */ }
-    if (!res.ok) { const e = new Error(data.detail || `Request failed (${res.status})`); e.status = res.status; e.data = data; throw e; }
+    if (!res.ok) {
+      const e = new Error(data.detail || `Request failed (${res.status})`); e.status = res.status; e.data = data;
+      if (res.status === 401 && path.startsWith('/api/sessions')) signedOut(e.message);
+      throw e;
+    }
     return data;
   }
 
   function notice(msg) { const n = $('notice'); n.textContent = msg || ''; n.hidden = !msg; }
 
   function show(view) {
-    for (const v of ['start', 'uploads', 'section', 'done']) $(`view-${v}`).hidden = v !== view;
+    for (const v of ['signin', 'sent', 'start', 'uploads', 'section', 'done']) $(`view-${v}`).hidden = v !== view;
     $('progress').hidden = view !== 'section';
     window.scrollTo(0, 0);
   }
@@ -41,36 +49,86 @@
   const visibleFields = (s) => s.fields.filter((f) => f.type !== 'file' && isVisible(f));
   const activeSections = () => state.sections.filter((s) => visibleFields(s).length);
 
-  // ── Start ──────────────────────────────────────────────────────────────
+  // ── Sign in ────────────────────────────────────────────────────────────
+  // The Cloudflare script loads async; until it does, window.turnstile may be
+  // undefined (or, with an id="turnstile" element, that element), so check
+  // for the API itself rather than the name.
+  const turnstileReady = () => !!(window.turnstile && typeof window.turnstile.render === 'function');
+
   function renderTurnstile() {
     const key = state.config.turnstile_site_key;
-    if (!key) return;                       // local dev: server skips verification
+    if (!key || state.turnstileId !== null) return;   // local dev: server skips verification
     const tryRender = () => {
-      if (window.turnstile) state.turnstileId = window.turnstile.render('#turnstile', { sitekey: key });
+      if (turnstileReady()) state.turnstileId = window.turnstile.render('#turnstile-box', { sitekey: key });
       else setTimeout(tryRender, 200);
     };
     tryRender();
   }
 
+  function resetTurnstile() {
+    if (turnstileReady() && state.turnstileId !== null) window.turnstile.reset(state.turnstileId);
+  }
+
+  function showSignin() {
+    setWho(null);
+    show('signin');                 // first, so a Turnstile hiccup can never blank the page
+    try { renderTurnstile(); } catch (e) { notice('The verification check could not load. Please refresh the page.'); }
+  }
+
+  function signedOut(msg) {
+    clearTimeout(state.saveTimer);
+    state.sessionId = null;
+    showSignin();
+    notice(msg || 'Please sign in again to continue.');
+  }
+
+  function setWho(email) {
+    state.email = email;
+    $('who').hidden = !email;
+    $('who-email').textContent = email || '';
+  }
+
+  async function onSignin(ev) {
+    ev.preventDefault();
+    notice('');
+    const form = ev.target;
+    if (!form.reportValidity()) return;
+    const email = form.elements.email.value.trim();
+    const token = state.turnstileId !== null && turnstileReady()
+      ? window.turnstile.getResponse(state.turnstileId) || '' : '';
+    form.querySelector('button').disabled = true;
+    try {
+      await api('POST', '/api/auth/request', { email, turnstile_token: token });
+      $('sent-email').textContent = email;
+      show('sent');
+    } catch (e) {
+      notice(e.message);
+    } finally { form.querySelector('button').disabled = false; resetTurnstile(); }
+  }
+
+  async function onSignout() {
+    try { await api('POST', '/api/auth/logout'); } catch (_) { /* cookie cleared or not, start over */ }
+    state.sessionId = null; state.answers = {}; state.confirmed = new Set();
+    notice('');
+    showSignin();
+  }
+
+  // ── Start ──────────────────────────────────────────────────────────────
   async function onStart(ev) {
     ev.preventDefault();
     notice('');
     const form = ev.target;
     if (!form.reportValidity()) return;
-    const fd = new FormData(form);
-    const body = Object.fromEntries(fd.entries());
-    body.turnstile_token = state.turnstileId !== null && window.turnstile
-      ? window.turnstile.getResponse(state.turnstileId) || '' : '';
+    const body = Object.fromEntries(new FormData(form).entries());
     form.querySelector('button').disabled = true;
     try {
-      const { session_id } = await api('POST', '/api/sessions', body);
+      const { session_id, resumed } = await api('POST', '/api/sessions', body);
+      if (resumed && await resume(session_id)) return;   // a draft opened in another tab
       state.sessionId = session_id;
-      localStorage.setItem(LS_KEY, session_id);
-      state.answers = { company_legal_name: body.company_legal_name, website: body.website, contact_email: body.contact_email };
+      state.answers = { company_legal_name: body.company_legal_name, website: body.website, [CONTACT_EMAIL]: state.email };
       show('uploads');
     } catch (e) {
       notice(e.message);
-      if (window.turnstile && state.turnstileId !== null) window.turnstile.reset(state.turnstileId);
     } finally { form.querySelector('button').disabled = false; }
   }
 
@@ -134,7 +192,7 @@
       wrap.innerHTML = `<label>${esc(f.label)}${req}${help}` +
         (tag === 'textarea'
           ? `<textarea name="${f.id}" maxlength="8000">${esc(val || '')}</textarea>`
-          : `<input type="${type}" name="${f.id}" maxlength="500" value="${esc(val || '')}">`) +
+          : `<input type="${type}" name="${f.id}" maxlength="500" value="${esc(val || '')}"${f.id === CONTACT_EMAIL ? ' readonly title="Your sign-in address"' : ''}>`) +
         `</label>`;
     }
     return wrap;
@@ -232,7 +290,6 @@
     try {
       await api('POST', `/api/sessions/${state.sessionId}/submit`,
         { answers: state.answers, confirmed_sections: [...state.confirmed] });
-      localStorage.removeItem(LS_KEY);
       show('done');
     } catch (e) {
       if (e.status === 422 && e.data.errors) {
@@ -256,6 +313,10 @@
       $('max-mb').textContent = config.max_mb;
     } catch (e) { notice('The form could not be loaded. Please refresh the page.'); return; }
 
+    $('link-ttl').textContent = state.config.link_ttl_min;
+    $('signin-form').addEventListener('submit', onSignin);
+    $('resend').addEventListener('click', () => { notice(''); showSignin(); });
+    $('sign-out').addEventListener('click', onSignout);
     $('start-form').addEventListener('submit', onStart);
     $('file-input').addEventListener('change', onFiles);
     const toSections = () => { state.current = 0; renderSection(); show('section'); };
@@ -271,24 +332,42 @@
     $('prev-section').addEventListener('click', () => { state.current = Math.max(0, state.current - 1); renderSection(); });
     $('next-section').addEventListener('click', onNext);
 
-    const saved = localStorage.getItem(LS_KEY);
-    if (saved) {
-      try {
-        const s = await api('GET', `/api/sessions/${saved}`);
-        if (s.status === 'draft') {
-          state.sessionId = saved; state.answers = s.answers || {};
-          state.confirmed = new Set(s.confirmed_sections || []);
-          const idx = activeSections().findIndex((x) => !state.confirmed.has(x.id));
-          state.current = idx < 0 ? 0 : idx;
-          renderSection(); show('section');
-          return;
-        }
-      } catch (_) { /* expired */ }
-      localStorage.removeItem(LS_KEY);
+    // A sign-in link: exchange the token by POST (mail scanners only GET),
+    // then drop it from the address bar so it never lands in history.
+    const token = new URLSearchParams(window.location.search).get('t');
+    if (token) {
+      history.replaceState(null, '', window.location.pathname);
+      try { await api('POST', '/api/auth/verify', { token }); }
+      catch (e) { showSignin(); notice(e.message); return; }
     }
-    renderTurnstile();
+
+    let me;
+    try { me = await api('GET', '/api/auth/me'); }
+    catch (_) { showSignin(); return; }
+    setWho(me.email);
+
+    if (me.session_id && await resume(me.session_id)) return;
+    const legacy = safeLocal(() => localStorage.getItem(LEGACY_LS_KEY));
+    safeLocal(() => localStorage.removeItem(LEGACY_LS_KEY));
+    if (legacy && await resume(legacy)) return;
     show('start');
   }
+
+  // Open a draft at its first unconfirmed section; false if it is not one.
+  async function resume(sessionId) {
+    try {
+      const s = await api('GET', `/api/sessions/${sessionId}`);
+      if (s.status !== 'draft') return false;
+      state.sessionId = sessionId; state.answers = s.answers || {};
+      state.confirmed = new Set(s.confirmed_sections || []);
+      const idx = activeSections().findIndex((x) => !state.confirmed.has(x.id));
+      state.current = idx < 0 ? 0 : idx;
+      renderSection(); show('section');
+      return true;
+    } catch (_) { return false; }
+  }
+
+  function safeLocal(fn) { try { return fn(); } catch (_) { return null; } }
 
   boot();
 })();

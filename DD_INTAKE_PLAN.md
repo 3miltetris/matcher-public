@@ -221,7 +221,7 @@ On any step failure after step 2: log with session ID, retry with backoff (max 3
 
 **Phase 3 — Enrichment.** SAM entity, USAspending, SBIR.gov suggestions with confirm UI.
 
-**Phase 4 — Hardening and polish.** Magic-link save/resume, alerting, lifecycle rules, consultant notification, load and abuse testing.
+**Phase 4 — Hardening and polish.** Magic-link save/resume (**built 2026-10-06** — sign-in by emailed link, limited to the admin-managed allowlist in `admin-config/intake_allowlist.json`; see CLAUDE.md Stage 14), alerting, lifecycle rules, consultant notification, load and abuse testing.
 
 ## 13. Testing
 

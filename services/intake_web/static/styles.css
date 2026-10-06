@@ -10,6 +10,10 @@ body { margin: 0; background: var(--bg); }
 .top .wrap { display: flex; gap: 12px; align-items: baseline; padding-block: 14px; }
 .brand { font-weight: 700; letter-spacing: .04em; }
 .title { color: var(--muted); }
+#turnstile-box { margin-bottom: 16px; }
+.who { margin-left: auto; color: var(--muted); font-size: .9rem; }
+button.link { border: 0; background: none; padding: 0 0 0 8px; color: var(--accent); text-decoration: underline; }
+input[readonly] { background: var(--bg); color: var(--muted); }
 main { padding-block: 24px 64px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 24px; }
 h1 { font-size: 1.4rem; margin: 0 0 8px; }

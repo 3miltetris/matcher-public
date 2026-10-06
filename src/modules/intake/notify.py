@@ -19,11 +19,19 @@ def recipients() -> list[str]:
     return [r.strip() for r in raw.split(',') if r.strip()]
 
 
+def smtp_configured() -> bool:
+    return bool(os.environ.get('SMTP_USER') and os.environ.get('SMTP_PASSWORD'))
+
+
 def send(subject: str, body: str) -> bool:
-    """Best-effort: a failed alert is logged, never raised."""
+    """Alert to the team. Best-effort: a failure is logged, never raised."""
+    return send_to(recipients(), subject, body)
+
+
+def send_to(to: list[str], subject: str, body: str) -> bool:
+    """Best-effort: a failed send is logged (subject only), never raised."""
     user = os.environ.get('SMTP_USER')
     pw   = os.environ.get('SMTP_PASSWORD')
-    to   = recipients()
     if not (user and pw and to):
         log.warning('notify: SMTP not configured; dropped %r', subject)
         return False
@@ -40,6 +48,16 @@ def send(subject: str, body: str) -> bool:
     except Exception as e:
         log.error('notify: send failed for %r: %s', subject, e)
         return False
+
+
+def sign_in_link(email: str, link: str, ttl_min: int) -> bool:
+    """The founder's magic link. Carries no answer data."""
+    return send_to([email], 'Your BW&CO due diligence form link', (
+        'Use the link below to open the BW&CO due diligence form. Your answers '
+        'save as you go, so you can come back to it with a new link at any time.\n\n'
+        f'{link}\n\n'
+        f'The link works once and expires in {ttl_min} minutes. If you did not '
+        'ask for it, you can ignore this email.\n'))
 
 
 def submission_received(session_id: str, company: str, links: dict) -> bool:

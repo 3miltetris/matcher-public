@@ -12,6 +12,8 @@
     <div class="wrap">
       <span class="brand">BW&amp;CO</span>
       <span class="title">Due diligence intake</span>
+      <span class="who" id="who" hidden><span id="who-email"></span>
+        <button type="button" class="link" id="sign-out">Sign out</button></span>
     </div>
   </header>
 
@@ -19,8 +21,31 @@
     <ol class="progress" id="progress" aria-label="Progress" hidden></ol>
     <div id="notice" class="notice" role="status" hidden></div>
 
+    <!-- 0. Sign in -->
+    <section id="view-signin" class="card" hidden>
+      <h1>Due diligence form</h1>
+      <p class="lede">Enter your work email and we will send you a link to open the form.
+        Your answers save as you go, and you can come back to it from any device with a new link.</p>
+      <form id="signin-form" novalidate>
+        <label>Your email <span class="req">*</span>
+          <input name="email" type="email" required maxlength="300" autocomplete="email"></label>
+        <div id="turnstile-box"></div>
+        <button type="submit" class="primary">Email me a link</button>
+      </form>
+    </section>
+
+    <!-- 0b. Link sent -->
+    <section id="view-sent" class="card" hidden>
+      <h1>Check your inbox</h1>
+      <p class="lede">If <b id="sent-email"></b> is approved for this form, a sign-in link is on its way.
+        It works once and expires in <span id="link-ttl">30</span> minutes.</p>
+      <p class="lede">No email after a few minutes? Check your spam folder, or contact your BW&amp;CO
+        consultant to make sure your address has been approved.</p>
+      <div class="actions"><button type="button" id="resend">Use a different email</button></div>
+    </section>
+
     <!-- 1. Start -->
-    <section id="view-start" class="card">
+    <section id="view-start" class="card" hidden>
       <h1>Tell us about your company</h1>
       <p class="lede">This replaces our previous due-diligence form. It takes about 15 minutes;
         your answers save as you go.</p>
@@ -29,9 +54,6 @@
           <input name="company_legal_name" required maxlength="300" autocomplete="organization"></label>
         <label>Company website <span class="req">*</span>
           <input name="website" required maxlength="300" placeholder="example.com" autocomplete="url"></label>
-        <label>Your email <span class="req">*</span>
-          <input name="contact_email" type="email" required maxlength="300" autocomplete="email"></label>
-        <div id="turnstile"></div>
         <button type="submit" class="primary">Start</button>
       </form>
     </section>

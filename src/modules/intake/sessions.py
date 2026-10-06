@@ -8,6 +8,7 @@ blob generation as an optimistic lock: an autosave racing the background
 submit pipeline fails loudly instead of silently dropping a step record.
 """
 
+import hashlib
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,7 @@ BUCKET          = 'cc-matcher-bucket-jeg-v1'
 SESSION_PREFIX  = 'intake/sessions/'
 UPLOAD_PREFIX   = 'intake/uploads/'
 SUBMIT_PREFIX   = 'intake/submissions/'
+OWNER_PREFIX    = 'intake/owners/'
 EXPIRY_DAYS     = 14
 
 # token_urlsafe(24) → 32 chars, 192 bits.
@@ -58,9 +60,10 @@ def is_expired(session: dict, days: int = EXPIRY_DAYS) -> bool:
     return datetime.now(timezone.utc) - created > timedelta(days=days)
 
 
-def create_session(bm: BucketManager, start: dict) -> dict:
+def create_session(bm: BucketManager, start: dict, owner_email: str = '') -> dict:
     session = {
         'session_id':  new_session_id(),
+        'owner_email': owner_email,
         'created_at':  now_iso(),
         'updated_at':  now_iso(),
         'status':      DRAFT,
@@ -96,6 +99,34 @@ def save_session(bm: BucketManager, session: dict) -> dict:
     except PreconditionFailed as e:
         raise SessionConflict(session['session_id']) from e
     return session
+
+
+# ── Owner index ──────────────────────────────────────────────────────────────
+# intake/owners/{sha256(email)}.json → the founder's current draft, so a
+# magic link opened on any device resumes it. Kept outside intake/sessions/
+# (and its 14-day lifecycle rule); a pointer to a vanished or finished session
+# simply reads as "no draft".
+
+def owner_blob(email: str) -> str:
+    return f'{OWNER_PREFIX}{hashlib.sha256(email.encode("utf-8")).hexdigest()}.json'
+
+
+def owner_draft(bm: BucketManager, email: str) -> dict | None:
+    """The email's open draft session, or None."""
+    rec, _ = bm.download_json(owner_blob(email))
+    if not rec:
+        return None
+    try:
+        session = load_session(bm, rec.get('session_id', ''))
+    except SessionNotFound:
+        return None
+    if session.get('status') != DRAFT or session.get('owner_email') != email:
+        return None
+    return session
+
+
+def set_owner_draft(bm: BucketManager, email: str, session_id: str) -> None:
+    bm.upload_json(owner_blob(email), {'session_id': session_id, 'updated_at': now_iso()})
 
 
 def _strip(session: dict) -> dict:
