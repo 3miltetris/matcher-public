@@ -560,6 +560,13 @@ if by_market:
 r1, r2, r3 = st.columns(3)
 with r1:
     do_rerank = st.checkbox('LLM re-rank', value=True)
+    rescore = st.checkbox(
+        'Re-score (ignore saved scores)', value=False, disabled=not do_rerank,
+        help='Every pair is scored once and the score saved, so repeating a search '
+             'gives the same numbers. Tick this to score every pair afresh and '
+             'overwrite what is saved. Changing the profile, topic text or model '
+             're-scores the affected pairs automatically.',
+    )
 with r2:
     rerank_model = st.selectbox('Re-rank model', _RERANK_MODELS, index=0, disabled=not do_rerank)
 with r3:
@@ -568,19 +575,22 @@ with r3:
     )
 
 max_pairs = len(plan) * int(top_k)
+max_calls = max_pairs * am.RERANK_SAMPLES
 if do_rerank:
     st.caption(
-        f'Up to **{max_pairs:,}** re-rank calls '
+        f'Up to **{max_pairs:,}** re-rank pairs '
         f'({len(plan)} {"market unit" if by_market else "client"}'
-        f'{"s" if len(plan) != 1 else ""} × top {int(top_k)}), '
-        f'{am.CONCURRENCY} at a time.'
-        + (' Identical (client, topic, aspect) pairs are scored once and shared '
-           'across markets, so the real count is usually lower.' if by_market else '')
+        f'{"s" if len(plan) != 1 else ""} × top {int(top_k)}), each scored '
+        f'{am.RERANK_SAMPLES}× with the median kept — up to {max_calls:,} calls, '
+        f'{am.CONCURRENCY} at a time. Pairs scored before are reused at no cost'
+        + (', and identical (client, topic, aspect) pairs are shared across markets'
+           if by_market else '')
+        + ', so the real count is usually lower.'
     )
 confirm = True
-if do_rerank and max_pairs > _CONFIRM_PAIRS:
+if do_rerank and max_calls > _CONFIRM_PAIRS:
     confirm = st.checkbox(
-        f'I understand this can make up to {max_pairs:,} Claude calls and the page '
+        f'I understand this can make up to {max_calls:,} Claude calls and the page '
         'must stay open until it finishes.',
         value=False,
     )
@@ -645,8 +655,10 @@ if run:
                     lambda done, total: rr_prog.progress(
                         done / total, text=f'LLM re-ranking {done}/{total}…'
                     ),
+                    storage_client=gcs, rescore=rescore,
                 )
                 rr_prog.empty()
+                cached_pairs = len(_rerank_groups(results[results['llm_cached']]))
                 unscored = int((results['llm_score'] == 0).sum())
                 # A pair scores 0 only when the call failed or the answer was
                 # unparseable — the reason is the one thing worth surfacing when
@@ -683,6 +695,7 @@ if run:
                 'mode': mode, 'kind': kind_label, 'category': category,
                 'tiers': sorted(tiers), 'units': len(plan),
                 'rerank_calls': len(_rerank_groups(candidates)) if reranked else 0,
+                'rerank_cached': cached_pairs if reranked else 0,
             }
 
     except Exception as e:
@@ -754,8 +767,14 @@ if st.session_state.get('am_results') is not None:
                 f'{"s" if len(meta.get("tiers") or []) != 1 else ""} '
                 f'*{", ".join(ap.tier_ordinal(t) for t in (meta.get("tiers") or [])) or "all"}*'
                 f' · category *{meta.get("category")}*'
-                + (f' · {meta["rerank_calls"]:,} re-rank call(s) for {meta.get("candidates", 0):,} '
+                + (f' · {meta["rerank_calls"]:,} re-rank pair(s) for {meta.get("candidates", 0):,} '
                    'candidate row(s)' if meta.get('rerank_calls') else '')
+            )
+        if meta.get('rerank_calls'):
+            st.caption(
+                f'{meta.get("rerank_cached", 0):,} of {meta["rerank_calls"]:,} re-rank pair(s) '
+                f'reused saved scores; the rest were scored {am.RERANK_SAMPLES}× and the '
+                'median kept (see the *llm_samples* column).'
             )
 
         if meta.get('unscored'):

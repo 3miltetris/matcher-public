@@ -1045,6 +1045,14 @@ else:
 
     r1, r2, r3 = st.columns(3)
     do_rerank    = r1.checkbox('LLM re-rank', value=True, key='gs_match_rerank')
+    rescore      = r1.checkbox(
+        'Re-score (ignore saved scores)', value=False, disabled=not do_rerank,
+        key='gs_match_rescore',
+        help='Every pair is scored once and the score saved, so repeating a search '
+             'gives the same numbers. Tick this to score every pair afresh and '
+             'overwrite what is saved. Changing the profile, topic text or model '
+             're-scores the affected pairs automatically.',
+    )
     rerank_model = r2.selectbox('Re-rank model', am.RERANK_MODELS, index=0,
                                 disabled=not do_rerank, key='gs_match_rerank_model')
     min_llm      = r3.number_input('Keep LLM score ≥', min_value=1, max_value=5, value=3,
@@ -1052,9 +1060,11 @@ else:
 
     if do_rerank and units:
         st.caption(
-            f'Up to **{len(units) * int(top_k):,}** re-rank calls '
+            f'Up to **{len(units) * int(top_k):,}** re-rank pairs '
             f'({len(units)} unit{"s" if len(units) != 1 else ""} × top {int(top_k)}), '
-            f'{am.CONCURRENCY} at a time. Identical pairs are scored once and shared.'
+            f'each scored {am.RERANK_SAMPLES}× with the median kept, '
+            f'{am.CONCURRENCY} calls at a time. Identical pairs are scored once and '
+            'shared, and pairs scored in an earlier search are reused at no cost.'
         )
 
     run = st.button(
@@ -1093,6 +1103,7 @@ else:
                     st.warning(msg)
 
                 unscored, failures, reranked = 0, {}, False
+                cached_pairs, total_pairs = 0, 0
                 results = candidates
                 if not candidates.empty and do_rerank:
                     rr_prog = st.progress(0.0, text='LLM re-ranking…')
@@ -1101,8 +1112,11 @@ else:
                         lambda done, total: rr_prog.progress(
                             done / total, text=f'LLM re-ranking {done}/{total}…'
                         ),
+                        storage_client=_get_storage_client(), rescore=rescore,
                     )
                     rr_prog.empty()
+                    cached_pairs = len(am.rerank_groups(results[results['llm_cached']]))
+                    total_pairs  = len(am.rerank_groups(results))
                     unscored = int((results['llm_score'] == 0).sum())
                     # A pair scores 0 only when the call failed or the answer was
                     # unparseable. Without this, a re-ranker outage looks exactly
@@ -1133,6 +1147,8 @@ else:
                     'unscored':   unscored,
                     'failures':   failures,
                     'min_llm':    int(min_llm) if reranked else None,
+                    'rerank_pairs':  total_pairs,
+                    'rerank_cached': cached_pairs,
                 }
         except Exception as e:
             st.error(f'Match failed: {e}')
@@ -1172,6 +1188,12 @@ else:
                 f'from {meta.get("candidates", 0):,} candidate(s) across '
                 f'{meta.get("units", 0)} unit(s).'
             )
+            if meta.get('rerank_pairs'):
+                st.caption(
+                    f'{meta.get("rerank_cached", 0):,} of {meta["rerank_pairs"]:,} re-rank '
+                    f'pair(s) reused saved scores; the rest were scored {am.RERANK_SAMPLES}× '
+                    'and the median kept (see the *llm_samples* column).'
+                )
             if meta.get('unscored'):
                 st.warning(
                     f'{meta["unscored"]:,} pair(s) could not be scored and were '

@@ -15,17 +15,24 @@ implementation of the parts that are load-bearing and easy to get subtly wrong:
     (the confirmed prompt asks "could they propose today", which scores every
     hypothesis 1-2 and silently empties an unexplored run);
   * re-rank calls are deduped by (client, agency, topic, aspect, market kind),
-    never across kinds, because the two prompts answer different questions.
+    never across kinds, because the two prompts answer different questions;
+  * each re-rank pair is sampled RERANK_SAMPLES times (median kept) and cached
+    in GCS by a hash of model + prompts, so a repeated search returns the same
+    scores instead of fresh draws at the model's default temperature.
 
 Nothing here imports streamlit: progress is reported through plain callables so
 a caller can wire it to st.progress, a log line, or nothing at all.
 """
 
 import asyncio
+import hashlib
 import json
 import random
 import re
+import statistics
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -39,6 +46,17 @@ import src.modules.aspect_profile as ap
 RERANK_MODELS = ['claude-haiku-4-5-20251001', 'claude-sonnet-4-6']
 CONCURRENCY   = 15
 MAX_RETRIES   = 5
+
+# Re-rank stability. The SDK no longer accepts `temperature`, so every call
+# samples at the model default and a pair on a 3/4 boundary lands on either
+# side run to run. Three independent samples per pair, median kept, narrows
+# the first score; the GCS cache makes every later run of the same pair return
+# that exact score. The cache key covers model + system prompt + user message
+# + sample count, so any change to the profile, the topic text, the rubric or
+# the model is a miss and re-scores on its own — nothing needs invalidating.
+RERANK_SAMPLES      = 3
+RERANK_CACHE_PREFIX = 'aspect-match-cache/rerank/'
+_CACHE_IO_WORKERS   = 32
 
 # Stored on every result row, and what the re-rank prompt selection keys off.
 ROW_CONFIRMED  = 'confirmed'
@@ -63,7 +81,7 @@ TOPIC_COLS = [
 DISPLAY_FIRST = [
     'client', 'pool', 'market', 'market_kind', 'market_tier', 'aspect_label', 'aspect_score',
     'aspects_hit', 'aspects_total',
-    'llm_score', 'llm_rationale', 'topic_number', 'title', 'agency', 'broad_agency',
+    'llm_score', 'llm_samples', 'llm_rationale', 'topic_number', 'title', 'agency', 'broad_agency',
 ]
 
 
@@ -342,14 +360,23 @@ def match_units(
 RERANK_SYSTEM = (
     'You are screening a federal grant topic against one specific capability of a '
     'company that a proposal-writing firm represents.\n'
+    'First identify the topic\'s CORE technical need — the thing a proposal must '
+    'deliver — then check whether the capability text describes doing it.\n'
     'Score the fit from 1 to 5:\n'
-    '5 = the company could propose to this topic directly with the capability described\n'
-    '4 = strong fit with minor gaps\n'
-    '3 = plausible fit, but notable gaps or adaptation needed\n'
-    '2 = superficial or keyword-level overlap only\n'
-    '1 = no fit\n\n'
+    '5 = the core need is squarely what the capability describes; the company could '
+    'write the technical approach today with no new capability\n'
+    '4 = the core need is covered, but one secondary requirement (a sub-system, '
+    'application domain, test environment or deliverable) is not evidenced\n'
+    '3 = the capability addresses part of the core need; real adaptation or a '
+    'partner would be needed\n'
+    '2 = shared domain or keywords only; the core need is something the capability '
+    'does not do\n'
+    '1 = no meaningful connection\n\n'
     'Judge only the capability as described — never assume capabilities that are not stated.\n'
-    'Return ONLY valid JSON: {"score": <integer 1-5>, "rationale": "<one sentence>"}'
+    'When torn between two scores, choose the lower.\n'
+    'Return ONLY a JSON object, no markdown or headings — rationale first, then score:\n'
+    '{"rationale": "<at most 50 words naming the core need and whether it is '
+    'covered>", "score": <integer 1-5>}'
 )
 
 
@@ -373,7 +400,10 @@ RERANK_UNEXPLORED_SYSTEM = (
     '1 = unrelated to anything the company can do\n\n'
     'Judge the extension ONLY against the listed capabilities — never assume capabilities '
     'that are not stated, and never credit the hypothesis for being ambitious.\n'
-    'Return ONLY valid JSON: {"score": <integer 1-5>, "rationale": "<one sentence>"}'
+    'When torn between two scores, choose the lower.\n'
+    'Return ONLY a JSON object, no markdown or headings — rationale first, then score:\n'
+    '{"rationale": "<at most 50 words naming which listed capability carries over and '
+    'what gap remains>", "score": <integer 1-5>}'
 )
 
 
@@ -415,40 +445,62 @@ def parse_rerank(text: str) -> tuple[int | None, str]:
             return max(1, min(5, score)), str(obj.get('rationale') or '')[:400]
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
-    # Tolerate a stray sentence around the JSON rather than losing the score
-    m = re.search(r'"?score"?\s*[:=]\s*([1-5])', cleaned)
-    if m:
-        r = re.search(r'"?rationale"?\s*[:=]\s*"([^"]*)"', cleaned)
-        return int(m.group(1)), (r.group(1)[:400] if r else '')
+    # Tolerate a stray sentence around the JSON, or a markdown answer
+    # ("**Rationale:** ... **Score:** 4"), rather than losing the score. The
+    # LAST score mention wins: a rationale-first answer can quote the rubric.
+    hits = re.findall(r'score\W{0,6}?[:=]\W{0,6}?([1-5])\b', cleaned, re.IGNORECASE)
+    if hits:
+        r = (
+            re.search(r'"rationale"\s*:\s*"([^"]*)"', cleaned, re.IGNORECASE)
+            or re.search(r'rationale\W*[:=]\W*(.+?)\s*(?:\*\*)?score', cleaned,
+                         re.IGNORECASE | re.DOTALL)
+        )
+        return int(hits[-1]), (r.group(1).strip()[:400] if r else '')
     return None, '(unparseable response)'
 
 
+def rerank_system(row: dict) -> str:
+    return RERANK_UNEXPLORED_SYSTEM if row.get('market_kind') == ROW_UNEXPLORED else RERANK_SYSTEM
+
+
+def combine_samples(samples: list[tuple[int | None, str]]) -> tuple[int | None, str]:
+    """Median of the samples that produced a score, with the rationale of a
+    sample that gave exactly that score. median_low, so an even count (one
+    sample failed) settles on the lower score — the rubric's own tie-break."""
+    scored = [(s, r) for s, r in samples if s is not None]
+    if not scored:
+        # Every sample failed: surface the first failure reason
+        return None, (samples[0][1] if samples else '(scoring failed: no samples)')
+    med = statistics.median_low(s for s, _ in scored)
+    return med, next(r for s, r in scored if s == med)
+
+
 async def rerank_async(
-    rows: list[tuple[int, dict]], api_key: str, model: str, on_done
-) -> list[tuple[int, int | None, str]]:
+    rows: list[tuple[int, dict]], api_key: str, model: str, on_done,
+    samples: int = RERANK_SAMPLES, persist=None,
+) -> list[tuple[int, int | None, str, list[int | None]]]:
+    """Score each row `samples` times and keep the median. Returns
+    (idx, score, rationale, per-sample scores). `persist(idx, score, rationale,
+    sample_scores)`, when given, runs on a worker thread as each pair finishes,
+    so a page that dies mid-run keeps everything already scored."""
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with AsyncAnthropic(api_key=api_key) as client:
-        async def one(idx: int, row: dict) -> tuple[int, int | None, str]:
+        async def sample(row: dict) -> tuple[int | None, str]:
             async with sem:
                 for attempt in range(MAX_RETRIES):
                     try:
                         resp = await client.messages.create(
                             model=model,
-                            max_tokens=250,
+                            max_tokens=300,
                             # No temperature: the anthropic 1.x SDK removed the
-                            # parameter, and it is rejected outright by the newer
-                            # models. Determinism comes from the strict JSON
-                            # contract in the system prompt instead.
-                            system=(
-                                RERANK_UNEXPLORED_SYSTEM
-                                if row.get('market_kind') == ROW_UNEXPLORED
-                                else RERANK_SYSTEM
-                            ),
+                            # parameter. Calls therefore sample at the model
+                            # default, which is why each pair is scored
+                            # `samples` times and the median kept.
+                            system=rerank_system(row),
                             messages=[{'role': 'user', 'content': rerank_user_message(row)}],
                         )
-                        score, rationale = parse_rerank(au.response_text(resp))
-                        return idx, score, rationale
+                        return parse_rerank(au.response_text(resp))
                     except Exception as e:
                         err = str(e)
                         retryable = any(
@@ -458,8 +510,19 @@ async def rerank_async(
                         if retryable and attempt < MAX_RETRIES - 1:
                             await asyncio.sleep((2 ** attempt) + random.random())
                             continue
-                        return idx, None, f'(scoring failed: {type(e).__name__})'
-                return idx, None, '(scoring failed: retries exhausted)'
+                        return None, f'(scoring failed: {type(e).__name__})'
+                return None, '(scoring failed: retries exhausted)'
+
+        async def one(idx: int, row: dict):
+            got = await asyncio.gather(*(sample(row) for _ in range(max(1, samples))))
+            score, rationale = combine_samples(got)
+            sample_scores = [s for s, _ in got]
+            if persist is not None:
+                try:
+                    await asyncio.to_thread(persist, idx, score, rationale, sample_scores)
+                except Exception:
+                    pass  # a cache write must never cost the score
+            return idx, score, rationale, sample_scores
 
         tasks   = [asyncio.create_task(one(i, r)) for i, r in rows]
         results = []
@@ -497,28 +560,112 @@ def rerank_groups(candidates: pd.DataFrame) -> list[list[int]]:
     return list(groups.values())
 
 
+# ── Re-rank score cache ────────────────────────────────────────────────────
+#
+# One JSON blob per scored pair, keyed by a hash of exactly what the model saw.
+# Per-pair blobs rather than one shared file: concurrent runs by two consultants
+# can't clobber each other, and nothing ever has to be read whole.
+
+def rerank_cache_key(row: dict, model: str, samples: int = RERANK_SAMPLES) -> str:
+    payload = json.dumps(
+        [model, rerank_system(row), rerank_user_message(row), int(samples)],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _cache_blob(storage_client, key: str):
+    return storage_client.bucket(ap.BUCKET).blob(f'{RERANK_CACHE_PREFIX}{key}.json')
+
+
+def _cache_read(storage_client, key: str) -> dict | None:
+    try:
+        rec = json.loads(_cache_blob(storage_client, key).download_as_bytes())
+        return rec if isinstance(rec.get('score'), int) else None
+    except Exception:
+        return None  # missing, unreadable or malformed: re-score
+
+
+def _cache_write(storage_client, key: str, rec: dict) -> None:
+    _cache_blob(storage_client, key).upload_from_string(
+        json.dumps(rec), content_type='application/json'
+    )
+
+
+def _fmt_samples(scores) -> str:
+    return ' · '.join('–' if s is None else str(s) for s in scores)
+
+
 def run_rerank(
-    candidates: pd.DataFrame, api_key: str, model: str, progress=None
+    candidates: pd.DataFrame, api_key: str, model: str, progress=None, *,
+    storage_client=None, rescore: bool = False, samples: int = RERANK_SAMPLES,
 ) -> pd.DataFrame:
     """Score every deduped (client, agency, topic, aspect, kind) pair 1-5 and
     write the result onto every row of its group. `progress`, when given, is
-    called as progress(done, total) after each completed call."""
+    called as progress(done, total) — cache hits count as done up front.
+
+    With a `storage_client`, scores are read from and written to the GCS
+    re-rank cache, so the same pair scores identically on every later run.
+    `rescore=True` ignores what is cached and overwrites it. A pair is cached
+    only when every sample succeeded; a partial or failed pair is used for this
+    run but re-scored next time.
+
+    Adds llm_score, llm_rationale, llm_samples (the per-sample scores, e.g.
+    '3 · 4 · 4') and llm_cached."""
     groups = rerank_groups(candidates)
     rows   = [(n, candidates.loc[g[0]].to_dict()) for n, g in enumerate(groups)]
     total  = len(rows)
+    keys   = {n: rerank_cache_key(r, model, samples) for n, r in rows}
+
+    cached: dict[int, dict] = {}
+    if storage_client is not None and not rescore and rows:
+        with ThreadPoolExecutor(max_workers=_CACHE_IO_WORKERS) as ex:
+            for n, rec in zip(keys, ex.map(lambda k: _cache_read(storage_client, k),
+                                           keys.values())):
+                if rec is not None:
+                    cached[n] = rec
+
+    todo = [(n, r) for n, r in rows if n not in cached]
+    hits = len(cached)
+    if progress is not None and total:
+        progress(hits, total)
 
     def on_done(done: int) -> None:
         if progress is not None:
-            progress(done, total)
+            progress(hits + done, total)
 
-    results = asyncio.run(rerank_async(rows, api_key, model, on_done))
+    persist = None
+    if storage_client is not None:
+        def persist(n, score, rationale, sample_scores):
+            if score is None or any(s is None for s in sample_scores):
+                return
+            _cache_write(storage_client, keys[n], {
+                'score': int(score), 'rationale': rationale,
+                'samples': [int(s) for s in sample_scores], 'model': model,
+                'scored_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            })
+
+    results = (
+        asyncio.run(rerank_async(todo, api_key, model, on_done, samples, persist))
+        if todo else []
+    )
 
     out = candidates.copy()
     out['llm_score']     = 0
     out['llm_rationale'] = ''
-    for n, score, rationale in results:
+    out['llm_samples']   = ''
+    out['llm_cached']    = False
+
+    def stamp(n, score, rationale, sample_scores, from_cache):
         for idx in groups[n]:
             # 0 keeps unscored pairs visible but below any usable minimum
             out.at[idx, 'llm_score']     = int(score) if score is not None else 0
             out.at[idx, 'llm_rationale'] = rationale
+            out.at[idx, 'llm_samples']   = _fmt_samples(sample_scores)
+            out.at[idx, 'llm_cached']    = from_cache
+
+    for n, rec in cached.items():
+        stamp(n, rec['score'], str(rec.get('rationale') or ''), rec.get('samples') or [], True)
+    for n, score, rationale, sample_scores in results:
+        stamp(n, score, rationale, sample_scores, False)
     return out
