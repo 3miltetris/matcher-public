@@ -74,7 +74,8 @@ Unit = namedtuple('Unit', 'prof market mi kind')
 # Topic columns carried into the results, when present.
 TOPIC_COLS = [
     'topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'close_date',
-    'open_date', 'funding_amount', 'grant_summary', 'source',
+    'open_date', 'is_rolling', 'last_verified_active', 'verify_status',
+    'funding_amount', 'grant_summary', 'source',
 ]
 
 # Result columns worth seeing first, in this order.
@@ -82,6 +83,7 @@ DISPLAY_FIRST = [
     'client', 'pool', 'market', 'market_kind', 'market_tier', 'aspect_label', 'aspect_score',
     'aspects_hit', 'aspects_total',
     'llm_score', 'llm_samples', 'llm_rationale', 'topic_number', 'title', 'agency', 'broad_agency',
+    'is_rolling',
 ]
 
 

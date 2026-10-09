@@ -34,6 +34,7 @@ import streamlit as st
 
 import src.modules.newsletter as nl
 import src.modules.ui_common as uc
+from src.modules.grant_utils import drop_dead_topics
 
 _BUCKET = uc.BUCKET
 _PREFIX = uc.TOPICS_PREFIX
@@ -91,8 +92,8 @@ def _load(start: date, end: date, agencies: list[str]) -> pd.DataFrame:
     scraped = df.get('scraped_at', pd.Series([''] * len(df))).astype(str).str[:10]
     lo, hi = start.isoformat(), end.isoformat()
     df = df[(scraped >= lo) & (scraped <= hi)].reset_index(drop=True)
-    if 'sam_status' in df.columns:
-        df = df[df['sam_status'].fillna('active').astype(str) != 'archived'].reset_index(drop=True)
+    # Archived notices and expired rolling deadlines are not newsletter candidates.
+    df = drop_dead_topics(df).reset_index(drop=True)
 
     for col in nl.COLUMNS + nl.REVIEW_COLUMNS:
         if col not in df.columns:

@@ -43,7 +43,7 @@ import src.modules.aspect_profile as ap
 import src.modules.pools as pl
 import src.modules.ui_common as uc
 from src.modules.Embedding.text_embedder import TextProcessor
-from src.modules.grant_utils import normalize_grant_columns
+from src.modules.grant_utils import normalize_grant_columns, drop_dead_topics
 
 # ── GCS ────────────────────────────────────────────────────────────────────
 
@@ -131,9 +131,9 @@ def _load_topics(agencies: list[str], award_sources: list[str] | None = None) ->
     if not frames:
         return pd.DataFrame()
     topics = pd.concat(frames, ignore_index=True)
-    # Notices marked archived by the SAM.gov revision check are no longer live
-    if 'sam_status' in topics.columns:
-        topics = topics[topics['sam_status'].fillna('').astype(str) != 'archived'].reset_index(drop=True)
+    # Drop notices the revision check archived and rolling deadlines a re-check
+    # found gone (verify_status == 'inactive').
+    topics = drop_dead_topics(topics).reset_index(drop=True)
     return topics
 
 
@@ -671,12 +671,22 @@ if search_mode == _MODE_DESC:
         else:
             st.success(f'**{len(results):,}** topics matched.')
 
+            has_rolling = ('is_rolling' in results.columns
+                           and results['is_rolling'].fillna(False).astype(bool).any())
+            if has_rolling and st.checkbox(
+                '🔁 Rolling deadlines only', key='gs_rolling_only',
+                help='Show only continuously-open / rolling-deadline opportunities '
+                     'that a source check has confirmed still active.'):
+                results = results[results['is_rolling'].fillna(False).astype(bool)]
+
             primary_cols = ['similarity_score']
             # Surface award/solicitation up front rather than leaving it buried among
             # the trailing columns — a past award read as an open opportunity is the
             # one mistake this whole separation exists to prevent.
             if 'record_kind' in results.columns and (results['record_kind'] == 'award').any():
                 primary_cols = ['record_kind'] + primary_cols
+            if has_rolling:
+                primary_cols = ['is_rolling'] + primary_cols
             other_cols  = [c for c in results.columns
                            if c not in primary_cols and c != 'embeddings']
             result_cols = primary_cols + other_cols
@@ -686,6 +696,11 @@ if search_mode == _MODE_DESC:
             }
             if 'record_kind' in result_cols:
                 col_cfg['record_kind'] = st.column_config.TextColumn('Kind', width='small')
+            if 'is_rolling' in result_cols:
+                col_cfg['is_rolling'] = st.column_config.CheckboxColumn('Rolling', width='small')
+            if 'last_verified_active' in result_cols:
+                col_cfg['last_verified_active'] = st.column_config.TextColumn(
+                    'Verified', width='small', help='Date a source last confirmed this still active.')
 
             st.dataframe(
                 results[result_cols],

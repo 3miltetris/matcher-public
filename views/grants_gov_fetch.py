@@ -62,6 +62,7 @@ _GRANTS_RESERVED_COLS = frozenset({
     'topic_number', 'agency', 'title', 'description', 'open_date', 'close_date',
     'scraped_at', 'grant_summary', 'embeddings', 'award_ceiling', 'status',
     'sam_confidence', 'sam_reason',
+    'is_rolling', 'last_verified_active', 'verify_status',
     *nl.COLUMNS,
 })
 
@@ -136,6 +137,96 @@ def _fetch_all_descriptions(items: list[dict]) -> list[str]:
             progress.progress(done / len(items), text=f'Fetching descriptions… {done}/{len(items)}')
     progress.empty()
     return results
+
+
+def _lookup_opp_status(number: str) -> tuple[bool, str | None]:
+    """Current Grants.gov status for an opportunity number.
+
+    Returns (ok, status): ok=False means the lookup itself failed (leave the row
+    untouched); status=None means the number no longer appears in any status
+    (treat as gone); otherwise the lowercased oppStatus. All four statuses are
+    queried so a closed/archived opportunity is still returned.
+    """
+    try:
+        r = requests.post(
+            _SEARCH_URL,
+            json={'keyword': number, 'rows': 25, 'startRecord': 0,
+                  'oppStatuses': 'posted|forecasted|closed|archived'},
+            timeout=20,
+        )
+        r.raise_for_status()
+        hits = (r.json().get('data') or {}).get('oppHits') or []
+        for h in hits:
+            if str(h.get('number') or '').strip() == str(number).strip():
+                return True, str(h.get('oppStatus') or '').strip().lower()
+        return True, None
+    except Exception:
+        return False, None
+
+
+def _refresh_rolling_grants(gcs: storage.Client) -> dict:
+    """Re-check every stored rolling GRANTS-GOV opportunity against the live API.
+
+    Still posted/forecasted → re-stamp active; closed, archived or gone →
+    verify_status 'inactive'. Grants.gov returns a definitive status, so (unlike
+    the scraped funding sources) there is no consecutive-miss guard. Rewrites only
+    the parquets that changed.
+    """
+    today  = datetime.today().strftime('%Y-%m-%d')
+    frames: dict = {}            # blob -> df
+    numbers: set = set()
+    for blob in gcs.list_blobs(_BUCKET, prefix=_GRANTS_PREFIX):
+        if not blob.name.endswith('.parquet'):
+            continue
+        try:
+            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+        except Exception:
+            continue
+        if 'is_rolling' not in df.columns or 'topic_number' not in df.columns:
+            continue
+        for col, default in (('last_verified_active', ''), ('verify_status', 'active')):
+            if col not in df.columns:
+                df[col] = default
+        roll   = df['is_rolling'].fillna(False).astype(bool)
+        active = df['verify_status'].fillna('').astype(str) != 'inactive'
+        if (roll & active).any():
+            frames[blob] = df
+            numbers.update(df.loc[roll & active, 'topic_number'].astype(str))
+
+    status_map: dict = {}
+    if numbers:
+        with ThreadPoolExecutor(max_workers=_DETAIL_WORKERS) as pool:
+            futs = {pool.submit(_lookup_opp_status, n): n for n in numbers}
+            for fut in as_completed(futs):
+                n = futs[fut]
+                ok, status = fut.result()
+                if not ok:
+                    continue                      # leave unchanged on lookup error
+                status_map[n] = ('active' if status in ('posted', 'forecasted')
+                                 else 'inactive')  # closed/archived/None → gone
+
+    refreshed = expired = 0
+    for blob, df in frames.items():
+        roll   = df['is_rolling'].fillna(False).astype(bool)
+        active = df['verify_status'].fillna('').astype(str) != 'inactive'
+        dirty  = False
+        for idx in df.index[roll & active]:
+            res = status_map.get(str(df.at[idx, 'topic_number']))
+            if res == 'active':
+                df.at[idx, 'last_verified_active'] = today
+                df.at[idx, 'verify_status']        = 'active'
+                refreshed += 1
+                dirty = True
+            elif res == 'inactive':
+                df.at[idx, 'verify_status'] = 'inactive'
+                expired += 1
+                dirty = True
+        if dirty:
+            buf = io.BytesIO()
+            df.to_parquet(buf, index=False)
+            buf.seek(0)
+            blob.upload_from_file(buf, content_type='application/octet-stream')
+    return {'checked': len(numbers), 'refreshed': refreshed, 'expired': expired}
 
 
 def _search_grants(
@@ -251,11 +342,13 @@ DO NOT IMPORT (NO) if any of the following are true:
 
 When uncertain, only import if the opportunity is clearly relevant.
 
+Also decide whether this is a ROLLING opportunity: one that accepts applications continuously or on an ongoing basis rather than by a single fixed deadline. Set "is_rolling": true for "applications accepted on an ongoing basis", continuously-open or standing programs, and anything with no close date. Set it false for an opportunity with one specific close date.
+
 ---
 
 OUTPUT FORMAT:
 Respond only with valid JSON. No preamble, no markdown, no explanation outside the JSON.
-{"import": true, "confidence": "high", "reason": "One or two sentences explaining the decision."}\
+{"import": true, "confidence": "high", "is_rolling": false, "reason": "One or two sentences explaining the decision."}\
 """
 
 
@@ -300,6 +393,7 @@ def _run_screening(df: pd.DataFrame, anth_key: str) -> pd.DataFrame:
     out['_import']     = [r['import']     for r in results]
     out['_confidence'] = [r['confidence'] for r in results]
     out['_reason']     = [r['reason']     for r in results]
+    out['_is_rolling'] = [bool(r.get('is_rolling')) for r in results]
     return out
 
 
@@ -391,6 +485,14 @@ def _embed_and_save(
     out['status']        = df['status'].astype(str)
     out['scraped_at']    = today
 
+    # Rolling = screener flagged it OR no close date was published.
+    _rolling_llm = (df['_is_rolling'].fillna(False).astype(bool).values
+                    if '_is_rolling' in df.columns else [False] * len(df))
+    _blank_cd = out['close_date'].astype(str).str.strip().str.lower().isin(['', 'nan', 'nat', 'none'])
+    out['is_rolling']           = (pd.Series(_rolling_llm, index=out.index) | _blank_cd)
+    out['last_verified_active'] = today
+    out['verify_status']        = 'active'
+
     summaries        = _summarize_all(out['title'].tolist(), out['description'].tolist(), anth_key)
     out['grant_summary'] = summaries
 
@@ -443,6 +545,24 @@ def render():
         'Claude screens each result for R&D relevance, then passing rows are embedded '
         'and saved to the topic store. No API key required.'
     )
+
+    with st.expander('🔁 Refresh rolling grants', expanded=False):
+        st.caption(
+            'Re-check every stored **rolling** GRANTS-GOV opportunity against the live '
+            'API. Still posted/forecasted → re-confirmed active; closed, archived or '
+            'gone → marked inactive and dropped from matching.'
+        )
+        if st.button('Refresh now', key='ggov_refresh_rolling'):
+            with st.spinner('Checking rolling opportunities against Grants.gov…'):
+                try:
+                    rep = _refresh_rolling_grants(_get_storage_client())
+                    st.success(
+                        f"Checked {rep['checked']:,} rolling opportunit(ies): "
+                        f"{rep['refreshed']:,} re-confirmed active, "
+                        f"{rep['expired']:,} marked inactive."
+                    )
+                except Exception as e:
+                    st.error(f'Refresh failed: {e}')
 
     # ── Section 1 · Fetch parameters ───────────────────────────────────────────
 
@@ -615,6 +735,24 @@ def render():
     with st.expander(f'✅ Passing ({len(passing)})', expanded=True):
         if passing.empty:
             st.info('No rows passed screening.')
+        elif '_is_rolling' in passing.columns:
+            # Editable Rolling flag so a reviewer can correct the auto-detection.
+            _edit_cols = ['title', 'agency', '_is_rolling', '_confidence', '_reason']
+            _ecfg = dict(_disp_cfg)
+            _ecfg['_is_rolling'] = st.column_config.CheckboxColumn(
+                'Rolling', width='small',
+                help='Continuously-open / rolling-deadline opportunity. '
+                     'Tick to flag one the screener missed.')
+            _edited = st.data_editor(
+                passing[_edit_cols].reset_index(drop=True),
+                hide_index=True,
+                use_container_width=True,
+                column_config=_ecfg,
+                disabled=[c for c in _edit_cols if c != '_is_rolling'],
+                key='ggov_passing_editor',
+            )
+            passing = passing.copy()
+            passing['_is_rolling'] = _edited['_is_rolling'].values
         else:
             st.dataframe(
                 passing[_disp_cols].reset_index(drop=True),

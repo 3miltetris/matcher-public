@@ -273,6 +273,7 @@ RESULT_COLUMNS = [
     'aspect_score', 'aspect_scores', 'aspects_hit', 'aspects_total',
     'llm_score', 'llm_rationale', 'record_kind', 'topic_number', 'title',
     'agency', 'broad_agency', 'open_date', 'due_date', 'close_date',
+    'is_rolling', 'last_verified_active', 'verify_status',
     'funding_amount', 'grant_summary', 'source',
 ]
 

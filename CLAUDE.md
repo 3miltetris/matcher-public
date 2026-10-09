@@ -541,6 +541,9 @@ The same schema in two blobs, one per pool (Stage 11) — `aspect_profile.profil
 | `open_date` / `close_date` | str | |
 | `source` | str | Origin URL or label |
 | `scraped_at` | str | ISO date of processing |
+| `is_rolling` | bool | Continuously-open / rolling-deadline solicitation (BAA, CSO, "open until filled", no deadline). Auto-detected by the screening LLM + a blank-deadline fallback at ingest; hand-overridable in the review tables. |
+| `last_verified_active` | str | ISO date a source last confirmed the opportunity still open — stamped at ingest and refreshed by each source's re-check sweep |
+| `verify_status` | str | `active` / `inactive` / `unverified`. A rolling grant a re-check can no longer find is set `inactive` and dropped from matching by `grant_utils.drop_dead_topics()`, the same way an archived SAM.gov notice is |
 | `solicitation_title` | str | Official published title of the parent solicitation / funding mechanism (Stage 13) — verbatim, blank rather than invented |
 | `newsletter_good` | bool | At least one newsletter vertical passed the "glad I read this" bar |
 | `newsletter_verticals` | str | `' \| '`-joined `newsletter.VERTICALS`, most relevant first; empty when skipped |
@@ -550,6 +553,8 @@ The same schema in two blobs, one per pool (Stage 11) — `aspect_profile.profil
 | `newsletter_reviewed_by` / `newsletter_reviewed_at` | str | Set by a consultant's save in the Newsletter view; cleared by a re-check |
 
 Topics stored before Stage 13 simply lack the newsletter columns; every reader tolerates that, and the Newsletter view treats them as unchecked.
+
+**Rolling-deadline tracking (all sources).** Continuously-open solicitations have no usable deadline, so `due_date`/`close_date` is left honest (`''`/`"Rolling"`, never a fabricated future date) and the rolling state lives in the three columns above. `grant_utils.ensure_rolling_columns()` backfills them with defaults (`is_rolling=False`, `verify_status='unverified'`) on every load via `normalize_grant_columns()`, so parquets written before the feature read cleanly. `grant_utils.drop_dead_topics()` is the single filter every reader uses (`grant_search`, `aspect_match`, `bulk_matching`, `matching_job`, `newsletter`) — it drops both `sam_status=='archived'` and `verify_status=='inactive'`. Each source re-verifies on its **existing** sweep, no new scheduler: SAM.gov's `revision_check` stamps `last_verified_active` on still-live rolling notices and sets `inactive` on archive (rolling notices are already its blank-deadline candidates); the deep-research daily sweep diffs its seen index and expires a rolling opportunity after `_EXPIRE_MISSES` (2) consecutive **complete** sweeps that fail to find it (an agent that stopped early on page budget never expires anything — guards false negatives); Grants.gov has a manual "🔁 Refresh rolling grants" button that re-queries `oppStatus` (closed/archived/gone → inactive). The flag is auto-detected by each screening LLM (`is_rolling` added to the JSON contract) with a blank-deadline fallback, and hand-overridable in the SAM CSV / Grants.gov / Topic Importer review tables. Grant Search surfaces a `Rolling` badge, a `Verified` date column, and a "🔁 Rolling deadlines only" filter.
 
 ### SAM.gov topic record (parquet, `data/all-topics/processed/SAM-GOV/`)
 Same base schema as grant topic, plus extra columns written by `sam_gov_job.py`:

@@ -159,11 +159,13 @@ DO NOT IMPORT (NO) if any of the following are true:
 
 When uncertain, only import if the opportunity is clearly relevant. Do not import on weak signals alone.
 
+Also decide whether this is a ROLLING opportunity: one that accepts submissions continuously rather than by a single fixed deadline. Set "is_rolling": true for open/standing BAAs, Commercial Solutions Openings (CSOs), "open until filled", continuously-open or multiple-cycle solicitations, and anything with no response deadline. Set it false for a notice with one specific closing date.
+
 ---
 
 OUTPUT FORMAT:
 Respond only with valid JSON. No preamble, no markdown, no explanation outside the JSON.
-{"import": true, "confidence": "high", "reason": "One or two sentences explaining the decision."}\
+{"import": true, "confidence": "high", "is_rolling": false, "reason": "One or two sentences explaining the decision."}\
 """
 
 _SUMMARY_SYSTEM = """\
@@ -628,6 +630,7 @@ async def _screen_all(df: pd.DataFrame, anth_key: str,
     out['_import']     = [(r['import']                  if r else False) for r in results]
     out['_confidence'] = [(r.get('confidence', 'low')   if r else 'low') for r in results]
     out['_reason']     = [(r.get('reason', '')          if r else '')    for r in results]
+    out['_is_rolling'] = [bool(r.get('is_rolling'))     if r else False  for r in results]
     return out
 
 
@@ -750,7 +753,8 @@ def _iso_date(s) -> str:
 
 
 _META_COLS = ['topic_number', 'title', 'source', 'open_date', 'due_date',
-              'grant_summary', 'description', 'notice_version_id', 'sam_status']
+              'grant_summary', 'description', 'notice_version_id', 'sam_status',
+              'is_rolling', 'last_verified_active', 'verify_status']
 
 
 def _load_store_meta(client: storage.Client) -> tuple[dict[str, dict], set[str]]:
@@ -787,6 +791,7 @@ def _load_store_meta(client: storage.Client) -> tuple[dict[str, dict], set[str]]
                     'description':       _clean(row.get('description')),
                     'sam_status':        _clean(row.get('sam_status')) or 'active',
                     'notice_version_id': _clean(row.get('notice_version_id')) or _parse_notice_id(row.get('source')),
+                    'is_rolling':        bool(row.get('is_rolling')) if 'is_rolling' in df.columns else False,
                     'blobs':             [],
                 }
             if blob.name not in entry['blobs']:
@@ -939,6 +944,10 @@ def _process_awards(gcs: storage.Client, award_df: pd.DataFrame, api_params: dic
         'embeddings':        embeddings,
         'notice_version_id': new_rows['_raw_notice_id'].astype(str),
         'sam_status':        'awarded',
+        # Awards are completed contracts, never rolling opportunities.
+        'is_rolling':           False,
+        'last_verified_active': '',
+        'verify_status':        'unverified',
         # Award-specific columns — the reason this store exists
         'notice_type':       new_rows['notice_type'].astype(str),
         'base_type':         new_rows['base_type'].astype(str),
@@ -1116,6 +1125,9 @@ def _process_revisions(
             'sam_status':         'active',
             'revised_at':         today,
             'sam_revision_notes': notes,
+            # Found live on SAM.gov this sweep.
+            'last_verified_active': today,
+            'verify_status':        'active',
         }
         if item.get('title'):
             fields['title'] = item['title']
@@ -1360,13 +1372,29 @@ def _run_revision_check(gcs: storage.Client, config: dict, run_id: str,
     checked_ok.difference_update(deferred)
 
     rows_updated = 0
+    rolling_refreshed = 0
     if not dry_run:
         for a in archived:
             updates.append({'topic_number': a['topic_number'], 'blobs': a['blobs'], 'fields': {
                 'sam_status':         'archived',
+                'verify_status':      'inactive',
                 'sam_revision_notes': f'No longer active on SAM.gov as of {today}.',
             }})
         updates.extend(backfills)
+        # Stamp still-live rolling notices so a consultant can see each was
+        # re-confirmed active this sweep. Revised/archived/backfilled notices are
+        # already covered by their own update; only unchanged rolling ones remain.
+        covered = {u['topic_number'] for u in updates}
+        for tn in checked_ok:
+            if tn in covered:
+                continue
+            m = meta.get(tn)
+            if m and m.get('is_rolling'):
+                updates.append({'topic_number': tn, 'blobs': m['blobs'], 'fields': {
+                    'last_verified_active': today,
+                    'verify_status':        'active',
+                }})
+                rolling_refreshed += 1
         if updates:
             print(f'Applying updates for {len(updates)} notices…', flush=True)
             rows_updated = _apply_updates(gcs, updates)
@@ -1388,6 +1416,7 @@ def _run_revision_check(gcs: storage.Client, config: dict, run_id: str,
         'revisions_deferred': len(deferred),
         'rows_archived':      len(archived),
         'rows_updated':       rows_updated,
+        'rolling_refreshed':  rolling_refreshed,
         'lookup_errors':      errors,
         'api_calls_used':     _SAM_CALL_COUNT[0],
         'api_call_budget':    budget,
@@ -1630,6 +1659,15 @@ def main(config_blob_path: str) -> None:
         version_ids = new_rows['_raw_notice_id'].astype(str)
     else:
         version_ids = new_rows['sam_url'].astype(str).map(_parse_notice_id) if 'sam_url' in new_rows.columns else ''
+    # Rolling = the screener flagged it, OR SAM.gov returned no response deadline
+    # (a blank due_date is the signature of an open/standing BAA or CSO).
+    if '_is_rolling' in new_rows.columns:
+        _rolling_llm = new_rows['_is_rolling'].fillna(False).astype(bool)
+    else:
+        _rolling_llm = pd.Series(False, index=new_rows.index)
+    _deadline_blank = new_rows['deadline'].astype(str).str.strip().str.lower().isin(
+        ['', 'nan', 'nat', 'none'])
+    is_rolling = (_rolling_llm | _deadline_blank).values
     out = pd.DataFrame({
         'topic_number':       new_rows['notice_id'].astype(str),
         'agency':             new_rows['agency'].astype(str),
@@ -1647,6 +1685,9 @@ def main(config_blob_path: str) -> None:
         'sam_status':         'active',
         'revised_at':         '',
         'sam_revision_notes': '',
+        'is_rolling':           is_rolling,
+        'last_verified_active': today,
+        'verify_status':        'active',
     })
 
     for col_name, col_val in custom_cols.items():

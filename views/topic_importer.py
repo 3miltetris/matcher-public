@@ -56,10 +56,11 @@ If the document has a single global due date or funding amount, apply it to all 
 
 _EXTRACT_MODEL = 'claude-sonnet-4-6'
 _EMBED_MODEL   = 'text-embedding-ada-002'
-_COL_ORDER     = ['topic_number', 'solicitation_title', 'title', 'agency', 'source', 'due_date', 'funding_amount', 'scraped_at', 'grant_summary']
+_COL_ORDER     = ['topic_number', 'solicitation_title', 'title', 'agency', 'source', 'due_date', 'is_rolling', 'funding_amount', 'scraped_at', 'grant_summary']
 _RESERVED_COLS = frozenset({
     'topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount',
     'scraped_at', 'description', 'embeddings', 'grant_summary',
+    'is_rolling', 'last_verified_active', 'verify_status',
     *nl.COLUMNS,
 })
 
@@ -128,6 +129,14 @@ def _build_df(topics: list[dict], sub_agency: str, source: str = '') -> pd.DataF
     df['agency']     = sub_agency
     df['source']     = source
     df['scraped_at'] = datetime.today().strftime('%Y-%m-%d')
+    # Rolling flag: preserve a hand-edited value; otherwise default from a blank due date.
+    if 'is_rolling' in df.columns:
+        df['is_rolling'] = df['is_rolling'].fillna(False).astype(bool)
+    else:
+        df['is_rolling'] = df['due_date'].astype(str).str.strip().str.lower().isin(
+            ['', 'nan', 'nat', 'none', 'null'])
+    df['last_verified_active'] = datetime.today().strftime('%Y-%m-%d')
+    df['verify_status']        = 'active'
     present = [c for c in _COL_ORDER if c in df.columns]
     extra   = [c for c in df.columns if c not in _COL_ORDER]
     return df[present + extra].reset_index(drop=True)
@@ -301,6 +310,14 @@ def render():
                 st.session_state.ti_topics_df = df
                 st.rerun()
 
+        # Ensure a Rolling column exists so it can be reviewed/overridden here.
+        if 'is_rolling' not in st.session_state.ti_topics_df.columns:
+            _tdf = st.session_state.ti_topics_df.copy()
+            _dd  = (_tdf['due_date'].astype(str).str.strip().str.lower()
+                    if 'due_date' in _tdf.columns else pd.Series('', index=_tdf.index))
+            _tdf['is_rolling'] = _dd.isin(['', 'nan', 'nat', 'none', 'null'])
+            st.session_state.ti_topics_df = _tdf
+
         # Data editor — always sync edits back to session state so they survive reruns
         edited_df = st.data_editor(
             st.session_state.ti_topics_df,
@@ -314,6 +331,8 @@ def render():
                 'agency':       st.column_config.TextColumn('Agency',       width='small'),
                 'source':       st.column_config.TextColumn('Source',       width='small'),
                 'due_date':     st.column_config.TextColumn('Due Date',       width='small'),
+                'is_rolling':   st.column_config.CheckboxColumn('Rolling',   width='small',
+                    help='Continuously-open / rolling-deadline solicitation. Auto-set when no due date; edit to correct.'),
                 'funding_amount':st.column_config.TextColumn('Funding Amount', width='small'),
                 'scraped_at':   st.column_config.TextColumn('Scraped At',    width='small'),
                 'grant_summary': st.column_config.TextColumn('Description',  width='large'),

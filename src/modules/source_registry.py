@@ -70,13 +70,14 @@ COLUMN_DEFAULTS: dict = {
     'has_api':              False,
     'api_note':             '',
     'requires_login':       False,
+    'has_credentials':      False,
     'notes':                '',
     'added_at':             '',
     'added_by':             '',
 }
 COLUMNS = list(COLUMN_DEFAULTS)
 
-_BOOL_COLS = ('enabled', 'has_api', 'requires_login')
+_BOOL_COLS = ('enabled', 'has_api', 'requires_login', 'has_credentials')
 _INT_COLS  = ('max_pages', 'consecutive_failures')
 
 # Outcome codes written to `last_status` by the job.

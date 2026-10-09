@@ -33,6 +33,8 @@ import streamlit as st
 from google.cloud import storage
 
 import src.modules.access_control as ac
+import src.modules.email_otp as eo
+import src.modules.source_credentials as sc
 import src.modules.source_registry as sr
 import src.modules.ui_common as uc
 
@@ -60,6 +62,11 @@ def _get_credentials():
 
 def _get_storage_client() -> storage.Client:
     return uc.get_storage_client()
+
+
+def _get_sm_client():
+    """Secret Manager client, built from the same service-account creds as GCS."""
+    return sc.client_from_info(st.secrets['gcp_service_account'])
 
 
 def _write_config(client: storage.Client, config: dict) -> str:
@@ -105,6 +112,234 @@ def _api_flag_digest(registry: pd.DataFrame) -> dict:
         'login':  login[cols].to_dict('records'),
         'paused': paused[cols + ['last_error']].to_dict('records'),
     }
+
+
+def _render_login_credentials(registry: pd.DataFrame, digest: dict) -> None:
+    """The login-walled panel: an admin-only manager for per-site credentials,
+    or a read-only summary for everyone else.
+
+    Credentials live in Secret Manager (``source_credentials``), never in the
+    bucket. Passwords are never rendered — only usernames / login URLs via
+    ``safe_summary``.
+    """
+    login_rows   = digest.get('login') or []
+    cred_sites   = (registry[registry['has_credentials']]
+                    if 'has_credentials' in registry.columns else registry.iloc[0:0])
+
+    # ── Non-admins: read-only ────────────────────────────────────────────────
+    if not ac.is_admin():
+        total = len(login_rows) + len(cred_sites)
+        if not total:
+            st.caption('No login-walled sites flagged.')
+            return
+        with st.expander(f'🔒 Login-walled sites ({total})'):
+            if len(cred_sites):
+                st.caption('An admin has configured a team login for these — the agent '
+                           'signs in automatically:')
+                st.dataframe(cred_sites[['name', 'url']],
+                             use_container_width=True, hide_index=True)
+            if login_rows:
+                st.caption('The agent hit a login wall on these and no login is stored. '
+                           'Ask an admin to add one in this panel.')
+                st.dataframe(pd.DataFrame(login_rows),
+                             use_container_width=True, hide_index=True)
+        return
+
+    # ── Admins: credential manager ───────────────────────────────────────────
+    with st.expander(f'🔐 Logins for walled sites ({len(login_rows)} flagged, '
+                     f'{len(cred_sites)} configured)', expanded=bool(login_rows)):
+        st.caption(
+            'Store the team login for a site behind a member wall so the agent can sign in '
+            'and scrape it. Credentials are kept in Secret Manager, never in the bucket, and '
+            'the password is filled straight into the page — it is never shown to the model '
+            'or written to logs. A site with **email 2FA** is supported if its code emails are '
+            'forwarded to the team mailbox (set the code sender below and follow the forwarding '
+            'steps). SMS / authenticator-app codes, SSO (Google / Microsoft) and CAPTCHA logins '
+            'cannot be automated — leave those for manual checking.'
+        )
+
+        try:
+            sm       = _get_sm_client()
+            cred_map = sc.load_credentials(sm)
+        except Exception as e:                                # noqa: BLE001
+            st.error(f'Could not read the credential store: {e}')
+            st.caption('One-time setup may be required: the Secret Manager secret '
+                       '`funding-source-credentials` must exist and `matcher-app@` needs '
+                       '`secretVersionManager` + `secretAccessor` on it (see deploy notes).')
+            return
+
+        # The shared 2FA mailbox address, for the forwarding instructions. Reading
+        # it needs `matcher-app@` accessor on `funding-2fa-gmail-oauth`; absence
+        # just means the forwarding block shows a placeholder.
+        try:
+            mailbox = eo.load_oauth(sm).get('mailbox', '')
+        except Exception:                                     # noqa: BLE001
+            mailbox = ''
+
+        configured = sc.configured_ids(cred_map)
+        name_by_id = dict(zip(registry['source_id'], registry['name']))
+
+        summary = sc.safe_summary(cred_map)
+        if summary:
+            st.markdown(f'**{len(summary)} site(s) with a stored login:**')
+            st.dataframe(
+                pd.DataFrame([{
+                    'Site':       name_by_id.get(r['source_id']) or r['source_id'],
+                    'Username':   r['username'],
+                    'Login URL':  r['login_url'],
+                    '2FA sender': r.get('code_sender', ''),
+                    'Updated':    (r['updated_at'] or '')[:10],
+                    'By':         r['updated_by'],
+                } for r in summary]),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.caption('No logins stored yet.')
+
+        st.markdown('**Add or update a login**')
+
+        # Offer walled sites first, then sites that already have a login, then
+        # the rest — so the common case is one click away.
+        login_ids = {r['source_id'] for r in login_rows}
+        ranked = registry.copy()
+        ranked['_rank'] = ranked['source_id'].map(
+            lambda s: 0 if s in login_ids else (1 if s in configured else 2))
+        ranked = ranked.sort_values(['_rank', 'name'])
+
+        def _label(r) -> str:
+            flags = []
+            if r['source_id'] in login_ids:
+                flags.append('🔒 walled')
+            if r['source_id'] in configured:
+                flags.append('🔑 has login')
+            tail = f"  ({', '.join(flags)})" if flags else ''
+            return f"{r['name'] or r['url']}{tail}"
+
+        options = {_label(r): r['source_id'] for _, r in ranked.iterrows()}
+        chosen_label = st.selectbox('Site', list(options), key='fsrc_cred_site')
+        chosen_id    = options.get(chosen_label)
+        existing     = cred_map.get(chosen_id, {}) if chosen_id else {}
+
+        c1, c2 = st.columns(2)
+        with c1:
+            cred_user = st.text_input('Username / email',
+                                      value=existing.get('username', ''),
+                                      key='fsrc_cred_user')
+        with c2:
+            cred_url = st.text_input(
+                'Login page URL (optional)', value=existing.get('login_url', ''),
+                key='fsrc_cred_url',
+                help='The page holding the login form, if different from the site URL.')
+        cred_pass = st.text_input(
+            'Password', type='password', key='fsrc_cred_pass',
+            help='Stored in Secret Manager. Leave blank when updating to keep the '
+                 'current password.')
+
+        with st.expander('📧 Email 2FA (only if this site emails a login code)'):
+            st.caption('If the site emails a one-time code at login, tell the agent which '
+                       'sender the code comes from and make sure those emails are forwarded '
+                       'to the team mailbox. Leave the sender blank for sites without 2FA.')
+            e1, e2 = st.columns(2)
+            with e1:
+                cred_code_sender = st.text_input(
+                    'Code sender (email or domain)',
+                    value=existing.get('code_sender', ''), key='fsrc_cred_sender',
+                    placeholder='no-reply@thesite.org',
+                    help='Who the code email comes FROM. Used to find the right email.')
+            with e2:
+                cred_code_regex = st.text_input(
+                    'Code pattern (regex, optional)',
+                    value=existing.get('code_regex', ''), key='fsrc_cred_regex',
+                    placeholder=eo.DEFAULT_CODE_REGEX,
+                    help='Leave blank to match a 4–8 digit code. Override only if the '
+                         'code has an unusual shape.')
+            box = f'`{mailbox}`' if mailbox else 'the team 2FA mailbox'
+            st.markdown(
+                f'**Forwarding setup** — the code emails must reach {box}:\n\n'
+                '1. In the inbox that currently receives this site\'s code emails, open '
+                '**Settings → Filters and Blocked Addresses → Create a new filter**.\n'
+                f'2. In **From**, enter the code sender above; create the filter and tick '
+                f'**Forward it to** → add {box}.\n'
+                '3. First time only: the mailbox owner approves the one-time forwarding '
+                'confirmation Gmail sends.\n\n'
+                '*Outlook:* **Settings → Mail → Rules → Add new rule** → condition '
+                f'*From = the sender* → action *Forward to* {box}.')
+
+        unpause = st.checkbox(
+            'Enable this site and clear its paused/failed state', value=True,
+            key='fsrc_cred_unpause',
+            help='Login-walled sites are usually auto-paused — turn this on so the next '
+                 'run signs in and scrapes them.')
+
+        save_c, del_c = st.columns([1, 1])
+        with save_c:
+            if st.button('💾 Save login', type='primary', key='fsrc_cred_save'):
+                password = cred_pass or existing.get('password', '')
+                if not cred_user.strip() or not password:
+                    st.warning('A username and password are both required '
+                               '(password can be kept from the existing login).')
+                else:
+                    try:
+                        sc.set_credential(
+                            sm, chosen_id, username=cred_user, password=password,
+                            login_url=cred_url,
+                            code_sender=cred_code_sender, code_regex=cred_code_regex,
+                            actor=st.session_state.get('user_email', ''))
+                        match = registry[registry['source_id'] == chosen_id]
+                        if not match.empty:
+                            row = match.iloc[0].to_dict()
+                            row['has_credentials'] = True
+                            if unpause:
+                                row['enabled'] = True
+                                if str(row.get('cadence')) == 'paused':
+                                    row['cadence'] = 'weekly'
+                                row['consecutive_failures'] = 0
+                            sr.upsert_sources(_get_storage_client(), [row])
+                        st.session_state.fsrc_registry = None
+                        st.success(f'Login saved for **{chosen_label}**.')
+                        st.rerun()
+                    except Exception as e:                    # noqa: BLE001
+                        st.error(f'Could not save: {e}')
+                        st.code(traceback.format_exc())
+        with del_c:
+            if chosen_id in configured:
+                if st.button('🗑 Remove login', key='fsrc_cred_del'):
+                    try:
+                        sc.delete_credential(
+                            sm, chosen_id,
+                            actor=st.session_state.get('user_email', ''))
+                        match = registry[registry['source_id'] == chosen_id]
+                        if not match.empty:
+                            row = match.iloc[0].to_dict()
+                            row['has_credentials'] = False
+                            sr.upsert_sources(_get_storage_client(), [row])
+                        st.session_state.fsrc_registry = None
+                        st.success('Login removed.')
+                        st.rerun()
+                    except Exception as e:                    # noqa: BLE001
+                        st.error(f'Could not remove: {e}')
+                        st.code(traceback.format_exc())
+
+        st.divider()
+        mcol1, mcol2 = st.columns([2, 1])
+        with mcol1:
+            if mailbox:
+                st.caption(f'2FA mailbox: `{mailbox}` — forward code emails here.')
+            else:
+                st.caption('No 2FA mailbox configured yet (secret `funding-2fa-gmail-oauth`). '
+                           'Email-2FA sites can be saved, but codes can only be read once the '
+                           'mailbox is set up — see the deploy notes.')
+        with mcol2:
+            if st.button('📧 Check 2FA mailbox', key='fsrc_cred_mailcheck'):
+                try:
+                    gmail = eo.build_gmail(eo.load_oauth(sm))
+                    if gmail is None:
+                        st.warning('No 2FA mailbox credentials stored.')
+                    else:
+                        gmail.users().getProfile(userId='me').execute()
+                        st.success('Mailbox reachable.')
+                except Exception as e:                        # noqa: BLE001
+                    st.error(f'Mailbox check failed: {e}')
 
 
 # ── Page ──────────────────────────────────────────────────────────────────
@@ -210,6 +445,12 @@ def render():
         m[2].metric('New', s.get('opportunities_new', 0))
         m[3].metric('Saved', s.get('opportunities_saved', 0))
         m[4].metric('Spend', f"${s.get('cost_usd', 0):.2f}")
+
+        if s.get('rolling_refreshed') or s.get('rolling_expired'):
+            st.caption(
+                f"🔁 Rolling deadlines: {s.get('rolling_refreshed', 0):,} re-confirmed active, "
+                f"{s.get('rolling_expired', 0):,} expired (no longer listed on their source)."
+            )
 
         if s.get('stopped_early'):
             reason = {
@@ -397,8 +638,8 @@ def render():
     edited = st.data_editor(
         view[['due', 'name', 'url', 'cadence', 'broad_agency', 'sub_agency',
               'enabled', 'max_pages', 'instructions', 'last_checked', 'last_status',
-              'consecutive_failures', 'has_api', 'requires_login', 'notes',
-              'source_id']],
+              'consecutive_failures', 'has_api', 'requires_login', 'has_credentials',
+              'notes', 'source_id']],
         use_container_width=True,
         hide_index=True,
         num_rows='dynamic',
@@ -431,6 +672,9 @@ def render():
                                                                   width='small'),
             'has_api':        st.column_config.CheckboxColumn('API', width='small'),
             'requires_login': st.column_config.CheckboxColumn('Login', width='small'),
+            'has_credentials': st.column_config.CheckboxColumn(
+                '🔑', disabled=True, width='small',
+                help='A team login is stored for this site (manage it in section 3 · Flags).'),
             'notes':          st.column_config.TextColumn('Notes', width='medium'),
             'source_id':      st.column_config.TextColumn('ID', disabled=True, width='small'),
         },
@@ -639,12 +883,7 @@ def render():
     else:
         st.caption('No sites flagged as having an API yet.')
 
-    if digest['login']:
-        with st.expander(f"🔒 Login-walled sites ({len(digest['login'])})"):
-            st.caption('The agent could not see the listing without credentials. '
-                       'Credentialed browsing is not supported — pause these, or have '
-                       'someone check them by hand.')
-            st.dataframe(pd.DataFrame(digest['login']), use_container_width=True, hide_index=True)
+    _render_login_credentials(registry, digest)
 
     if digest['paused']:
         with st.expander(f"⏸️ Auto-paused after repeated failures ({len(digest['paused'])})"):

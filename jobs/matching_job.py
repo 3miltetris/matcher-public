@@ -37,7 +37,7 @@ import src.modules.anthropic_utils as au
 from src.modules.email_generator import (
     async_generate_subject_line, async_josiah_copy, async_custom_prompt, clean_agency,
 )
-from src.modules.grant_utils import normalize_grant_columns
+from src.modules.grant_utils import normalize_grant_columns, drop_dead_topics
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -149,9 +149,9 @@ def _load_topics(client: storage.Client, agencies: list[str]) -> pd.DataFrame:
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', FutureWarning)
         topics = pd.concat(frames, ignore_index=True)
-    # Notices marked archived by the SAM.gov revision check are no longer live
-    if 'sam_status' in topics.columns:
-        topics = topics[topics['sam_status'].fillna('').astype(str) != 'archived'].reset_index(drop=True)
+    # Archived notices and expired rolling deadlines (verify_status 'inactive')
+    # are no longer live. Bulk Matching mirrors this filter so its counts match.
+    topics = drop_dead_topics(topics).reset_index(drop=True)
     return topics
 
 
@@ -436,7 +436,9 @@ def main(config_blob_path: str) -> None:
     grant_embeddings = np.stack(topics_df['embeddings'].values).astype(np.float32)
     topics_df        = topics_df.drop(columns=['embeddings'])
 
-    grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'funding_amount', 'grant_summary', 'source']
+    grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date',
+                  'is_rolling', 'last_verified_active', 'verify_status',
+                  'funding_amount', 'grant_summary', 'source']
     grant_meta = topics_df[[c for c in grant_cols if c in topics_df.columns]].reset_index(drop=True)
     if 'source' in grant_meta.columns:
         grant_meta = grant_meta.rename(columns={'source': 'grant_source'})

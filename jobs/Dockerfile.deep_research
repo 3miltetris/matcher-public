@@ -33,6 +33,10 @@ COPY src/__init__.py src/__init__.py
 COPY src/modules/__init__.py src/modules/__init__.py
 COPY src/modules/source_registry.py src/modules/source_registry.py
 COPY src/modules/browser_agent.py src/modules/browser_agent.py
+# Per-site login credentials for login-walled sites (Secret Manager map).
+COPY src/modules/source_credentials.py src/modules/source_credentials.py
+# Reads one-time 2FA codes out of the shared mailbox (Gmail API).
+COPY src/modules/email_otp.py src/modules/email_otp.py
 # Newsletter screening of every stored opportunity (verticals + solicitation
 # title); anthropic_utils is its safe response reader.
 COPY src/modules/newsletter.py src/modules/newsletter.py

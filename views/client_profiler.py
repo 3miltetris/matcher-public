@@ -51,6 +51,7 @@ import src.modules.access_control as ac
 import src.modules.aspect_profile as ap
 import src.modules.client_delete as cd
 import src.modules.pools as pl
+import src.modules.profile_exclusions as px
 import src.modules.ui_common as uc
 from src.modules.Embedding.text_embedder import TextProcessor
 
@@ -132,6 +133,9 @@ def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataF
         fp        = ap.source_fingerprint(available)
         prof      = stored.get(key)
 
+        company_name    = str(merged.get('company_name') or key.split('||', 1)[0] or '—')
+        exclude_reason  = px.excluded_reason(company_name)
+
         n_markets = 0
         if prof is not None and pd.notna(prof.get('n_markets')):
             n_markets = int(prof['n_markets'])
@@ -147,7 +151,7 @@ def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataF
 
         rows.append({
             '_key':        key,
-            'company':     str(merged.get('company_name') or key.split('||', 1)[0] or '—'),
+            'company':     company_name,
             'website':     str(merged.get('companyWebsite') or ''),
             'contacts':    len(group),
             'sources':     ', '.join(available.keys()) or '—',
@@ -160,6 +164,8 @@ def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataF
             '_fingerprint': fp,
             '_available':  list(available.keys()),
             '_row':        merged,
+            '_excluded':        exclude_reason is not None,
+            '_exclude_reason':  exclude_reason or '',
         })
 
     return pd.DataFrame(rows).sort_values(
@@ -339,6 +345,7 @@ if st.session_state.get('cp_flash'):
     # rest of the page — hand them to the next run instead.
     st.success(st.session_state.pop('cp_flash'))
 
+n_excluded = int(directory['_excluded'].sum()) if not directory.empty else 0
 with col_info:
     st.info(
         f'{len(directory):,} {_NOUN} companies · '
@@ -346,6 +353,7 @@ with col_info:
         f'{int((directory["status"] == _STATUS_STALE).sum()):,} stale · '
         f'{int((directory["status"] == _STATUS_NOMARKET).sum()):,} without markets · '
         f'{int((directory["status"] == _STATUS_NONE).sum()):,} unprofiled'
+        + (f' · {n_excluded:,} excluded (no longer clients)' if n_excluded else '')
     )
 
 # ── Section 1 · Build profiles ─────────────────────────────────────────────
@@ -444,6 +452,22 @@ if show.startswith('Needs'):
 elif show == 'Has profile':
     view = view[view['status'] != _STATUS_NONE]
 
+# Companies we no longer work with (src/modules/profile_exclusions.py) — pulled
+# out of the buildable list so they stop clogging it, shown with the reason in
+# an expander below. An opt-in override puts them back for the rare rebuild.
+excluded_view = view[view['_excluded']]
+include_excluded = False
+if not excluded_view.empty:
+    include_excluded = st.checkbox(
+        f'Include {len(excluded_view)} excluded (no-longer-client) '
+        f'compan{"y" if len(excluded_view) == 1 else "ies"} in the build list anyway',
+        value=False, key='cp_include_excluded',
+        help='These are companies listed in profile_exclusions.py with no real '
+             'recent Drive activity. Tick to override and build them anyway.',
+    )
+if not include_excluded:
+    view = view[~view['_excluded']]
+
 # Companies with no usable material can't be profiled — surface, don't offer.
 no_material = view[view['sources'] == '—']
 view = view[view['sources'] != '—']
@@ -529,6 +553,23 @@ if not view.empty:
         except Exception as e:
             st.error(f'Failed to start the profile build job: {e}')
             st.code(traceback.format_exc())
+
+if not excluded_view.empty and not include_excluded:
+    with st.expander(
+        f'🚫 {len(excluded_view)} excluded — no longer clients '
+        '(kept out of the build list)'
+    ):
+        st.caption(
+            'Listed in `src/modules/profile_exclusions.py` because they have no '
+            'real recent Drive activity. Tick the override above to build one '
+            'anyway, or edit that module to change the list.'
+        )
+        st.dataframe(
+            excluded_view[['company', 'website', '_exclude_reason']].rename(
+                columns={'_exclude_reason': 'reason'}
+            ),
+            hide_index=True, use_container_width=True,
+        )
 
 if not no_material.empty:
     with st.expander(f'{len(no_material)} {_NOUN}(s) with no profilable material'):

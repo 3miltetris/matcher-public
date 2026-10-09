@@ -48,6 +48,12 @@ MAX_LINKS      = 120
 NAV_TIMEOUT_MS = 30_000
 MAX_TOKENS     = 16_000
 
+# How long get_email_code waits for a forwarded 2FA code to land, and how often
+# it re-checks the mailbox. A code email usually arrives in seconds, but a
+# filter-forward can lag — 90s covers it without stalling the site's budget.
+_OTP_POLL_TOTAL_S    = 90
+_OTP_POLL_INTERVAL_S = 6
+
 # Per-MTok list prices, for the cost figure reported in status.json.
 _PRICING = {
     'claude-sonnet-4-6': (3.00, 15.00),
@@ -130,6 +136,53 @@ TOOLS = [
         },
     },
     {
+        'name': 'log_in',
+        'description': (
+            "Log in to this site using the team's stored credentials. Call this "
+            'when a login form or a members-only wall is blocking the listing. '
+            'The username and password are filled in automatically from secure '
+            'storage — you never see, receive, or type them. Only available when '
+            'the site has stored credentials (the task message will say so); if it '
+            'does not, this returns an error. If the login form is on a separate '
+            'page, open that page first, then call this.'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'username_field_hint': {
+                    'type': 'string',
+                    'description': 'Optional: the visible label or placeholder of '
+                                   'the username/email field, if the form is unusual.',
+                },
+                'password_field_hint': {
+                    'type': 'string',
+                    'description': 'Optional: the visible label or placeholder of '
+                                   'the password field, if the form is unusual.',
+                },
+            },
+        },
+    },
+    {
+        'name': 'get_email_code',
+        'description': (
+            'Fetch a one-time 2FA code that the site emailed, and enter it. Call '
+            'this when, after logging in, the site asks for a verification / '
+            'security code sent to email. The code is read from the team mailbox '
+            'and typed in automatically — you never see or type it. Only works '
+            'when the task message says a 2FA mailbox is configured.'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'otp_field_hint': {
+                    'type': 'string',
+                    'description': 'Optional: the visible label or placeholder of '
+                                   'the code field, if the form is unusual.',
+                },
+            },
+        },
+    },
+    {
         'name': 'report_findings',
         'description': (
             'Report everything you found and finish. Call this exactly once, at '
@@ -180,6 +233,17 @@ TOOLS = [
                             'open_date':      {'type': 'string', 'description': 'Publication or open date, as shown.'},
                             'close_date':     {'type': 'string', 'description': 'Response deadline, as shown.'},
                             'funding_amount': {'type': 'string', 'description': 'Award value or ceiling, as shown.'},
+                            'is_rolling': {
+                                'type': 'boolean',
+                                'description': (
+                                    'True if the opportunity accepts submissions '
+                                    'continuously rather than by a single fixed '
+                                    'deadline — "open until filled", "rolling basis", '
+                                    '"accepted on an ongoing basis", a standing/open '
+                                    'BAA or CSO, or a call with no published deadline. '
+                                    'False if it has one specific closing date.'
+                                ),
+                            },
                         },
                         'required': ['title', 'description'],
                     },
@@ -225,7 +289,9 @@ proposals" and state matching-fund programs count.
 What does NOT count, and must never be reported: news or press releases, awards \
 that have already been made, member spotlights, events and webinars, past \
 opportunities whose deadline has clearly passed, and generic "about us" or \
-"how to join" pages that describe no specific funding action.
+"how to join" pages that describe no specific funding action. A continuously-open \
+or rolling opportunity that has NO deadline still counts and should be reported \
+(set is_rolling true) — only a clearly-passed fixed deadline disqualifies one.
 
 How to work:
 1. Open the starting URL and read it.
@@ -262,7 +328,9 @@ _SYSTEM_BLOCKS = [{
 }]
 
 
-def _build_user_message(site: dict, known: list, max_tool_calls: int) -> str:
+def _build_user_message(site: dict, known: list, max_tool_calls: int,
+                        credentials: dict = None,
+                        has_code_fetcher: bool = False) -> str:
     parts = [
         f"Site: {site.get('name') or site.get('url')}",
         f"Starting URL: {site.get('url')}",
@@ -273,6 +341,19 @@ def _build_user_message(site: dict, known: list, max_tool_calls: int) -> str:
         parts.append(
             '\nSite-specific instructions from the team — follow these closely:\n'
             + instructions
+        )
+    if credentials:
+        # Login guidance lives in the per-site user message, never in _SYSTEM, so
+        # the system/tools cache entry stays byte-identical across every site.
+        login_url = str(credentials.get('login_url') or '').strip()
+        parts.append(
+            '\nThis site has stored login credentials. If a login form or a '
+            'members-only wall blocks the listing, call log_in to sign in — the '
+            'username and password are filled automatically.'
+            + (f' The login form is at {login_url} — open it first if you are not '
+               'already on a page with a login form.' if login_url else '')
+            + (' If the site then requires a one-time code to continue, call '
+               'get_email_code to complete that step.' if has_code_fetcher else '')
         )
     if known:
         listed = '\n'.join(f'- {t}' for t in known)
@@ -330,7 +411,8 @@ def parse_page(html: str, base_url: str):
 class PageSession:
     """One browser context bound to one site, with a small navigation history."""
 
-    def __init__(self, context, max_pages: int):
+    def __init__(self, context, max_pages: int, credentials: dict = None,
+                 code_fetcher=None):
         self.context    = context
         self.page       = None
         self.max_pages  = max_pages
@@ -340,6 +422,18 @@ class PageSession:
         self.links      = []
         self.url        = ''
         self.title      = ''
+        # Bound out-of-band: the password is read only inside log_in() and typed
+        # straight into the page. It is never placed in `messages`, a tool
+        # result, a log line, or the registry.
+        credentials     = credentials or {}
+        self.username   = str(credentials.get('username') or '')
+        self.password   = str(credentials.get('password') or '')
+        self.login_url  = str(credentials.get('login_url') or '').strip()
+        # Returns a fresh 2FA code (or None) given the login-attempt timestamp;
+        # bound to this site's sender/regex + the shared mailbox by the job. The
+        # code, like the password, never enters the conversation or logs.
+        self.code_fetcher = code_fetcher
+        self._login_ts    = 0.0
 
     async def _ensure_page(self):
         if self.page is None:
@@ -444,6 +538,210 @@ class PageSession:
         if not hits:
             return f'No matches for "{query}" on this page.'
         return f'{len(hits)} match(es) for "{query}":\n\n' + '\n---\n'.join(hits)
+
+    async def log_in(self, username_field_hint: str = '',
+                     password_field_hint: str = '') -> str:
+        """Fill and submit the login form with the bound credentials.
+
+        The password is read only here and typed straight into the field; it
+        never enters the returned string (parse_page reads visible text + hrefs,
+        not input values), the conversation, or any log. Returns the post-login
+        page so the agent can carry on.
+        """
+        if not self.password:
+            return 'ERROR: no credentials are configured for this site.'
+
+        if self.page is None:
+            if self.login_url:
+                await self.open_page(self.login_url)
+            else:
+                return ('ERROR: no page is open yet — open the login page first, '
+                        'then call log_in.')
+        page = self.page
+
+        async def _first(*locators):
+            for loc in locators:
+                try:
+                    if await loc.count():
+                        return loc
+                except Exception:
+                    continue
+            return None
+
+        # Password field — the anchor of a login form.
+        pw_locator = None
+        if password_field_hint:
+            pw_locator = await _first(
+                page.get_by_label(password_field_hint, exact=False).first,
+                page.get_by_placeholder(password_field_hint, exact=False).first,
+            )
+        if pw_locator is None:
+            pw_locator = await _first(page.locator('input[type="password"]').first)
+        if pw_locator is None:
+            return ('ERROR: could not find a password field on this page. If the '
+                    'login form is on another page, open that page first.')
+
+        # Username / email field.
+        user_locator = None
+        if username_field_hint:
+            user_locator = await _first(
+                page.get_by_label(username_field_hint, exact=False).first,
+                page.get_by_placeholder(username_field_hint, exact=False).first,
+            )
+        if user_locator is None:
+            user_locator = await _first(*[
+                page.locator(sel).first for sel in (
+                    'input[type="email"]',
+                    'input[autocomplete="username"]',
+                    'input[name*="user" i]', 'input[name*="email" i]',
+                    'input[id*="user" i]', 'input[id*="email" i]',
+                    'input[type="text"]',
+                )
+            ])
+
+        try:
+            if user_locator is not None and self.username:
+                await user_locator.fill(self.username, timeout=10_000)
+            await pw_locator.fill(self.password, timeout=10_000)
+        except Exception as e:                                # noqa: BLE001
+            return f'ERROR: could not fill the login form ({type(e).__name__}).'
+
+        # Mark the attempt so a 2FA code email that arrives after this is the one
+        # get_email_code accepts (not a stale code from an earlier attempt).
+        self._login_ts = time.time()
+
+        # Submit: a submit control, a button labelled log in / sign in, else Enter.
+        submitted = await _first(
+            page.locator('button[type="submit"]').first,
+            page.locator('input[type="submit"]').first,
+        )
+        try:
+            if submitted is not None:
+                await submitted.click(timeout=10_000)
+            else:
+                btn = page.get_by_role(
+                    'button', name=re.compile(r'log\s*in|sign\s*in|continue', re.I)
+                ).first
+                if await btn.count():
+                    await btn.click(timeout=10_000)
+                    submitted = btn
+                else:
+                    await pw_locator.press('Enter', timeout=10_000)
+                    submitted = pw_locator
+        except Exception as e:                                # noqa: BLE001
+            return f'ERROR: filled the login form but could not submit it ({type(e).__name__}).'
+
+        try:
+            await page.wait_for_load_state('domcontentloaded', timeout=NAV_TIMEOUT_MS)
+            try:
+                await page.wait_for_load_state('networkidle', timeout=5_000)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if self.pages_seen < self.max_pages:
+            self.pages_seen += 1
+        return 'Submitted the login form.\n\n' + await self._capture()
+
+    async def get_email_code(self, otp_field_hint: str = '') -> str:
+        """Fetch a forwarded 2FA code from the team mailbox and enter it.
+
+        The code is read via the bound code_fetcher (Gmail-backed, built by the
+        job), typed into the code field, and submitted. It is never returned in
+        the string the model sees or written to any log.
+        """
+        if self.code_fetcher is None:
+            return 'ERROR: no 2FA mailbox is configured for this site.'
+        if self.page is None:
+            return 'ERROR: no page is open — log in first, then call get_email_code.'
+        page = self.page
+
+        async def _first(*locators):
+            for loc in locators:
+                try:
+                    if await loc.count():
+                        return loc
+                except Exception:
+                    continue
+            return None
+
+        otp = None
+        if otp_field_hint:
+            otp = await _first(
+                page.get_by_label(otp_field_hint, exact=False).first,
+                page.get_by_placeholder(otp_field_hint, exact=False).first,
+            )
+        if otp is None:
+            otp = await _first(*[
+                page.locator(sel).first for sel in (
+                    'input[autocomplete="one-time-code"]',
+                    'input[name*="otp" i]', 'input[name*="code" i]',
+                    'input[name*="token" i]', 'input[id*="otp" i]',
+                    'input[id*="code" i]', 'input[inputmode="numeric"]',
+                    'input[type="tel"]', 'input[type="text"]',
+                )
+            ])
+        if otp is None:
+            return ('ERROR: could not find a code field on this page. If the code '
+                    'is entered on another page, open that page first.')
+
+        # Poll the mailbox for a code newer than the login attempt. The fetcher
+        # is a sync Gmail call, so run it off the event loop while other sites
+        # keep browsing.
+        since    = self._login_ts or (time.time() - 180)
+        loop     = asyncio.get_running_loop()
+        code     = None
+        deadline = time.monotonic() + _OTP_POLL_TOTAL_S
+        while True:
+            try:
+                code = await loop.run_in_executor(None, self.code_fetcher, since)
+            except Exception as e:                            # noqa: BLE001
+                return f'ERROR: could not read the 2FA mailbox ({type(e).__name__}).'
+            if code or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_OTP_POLL_INTERVAL_S)
+        if not code:
+            return (f'ERROR: no 2FA code arrived within {_OTP_POLL_TOTAL_S}s — the '
+                    'email may not have forwarded to the team mailbox, or the '
+                    'sender/pattern is misconfigured.')
+
+        try:
+            await otp.fill(str(code), timeout=10_000)
+        except Exception as e:                                # noqa: BLE001
+            return f'ERROR: found a code but could not enter it ({type(e).__name__}).'
+
+        submitted = await _first(
+            page.locator('button[type="submit"]').first,
+            page.locator('input[type="submit"]').first,
+        )
+        try:
+            if submitted is not None:
+                await submitted.click(timeout=10_000)
+            else:
+                btn = page.get_by_role(
+                    'button',
+                    name=re.compile(r'verif|submit|continue|log\s*in|sign\s*in', re.I),
+                ).first
+                if await btn.count():
+                    await btn.click(timeout=10_000)
+                else:
+                    await otp.press('Enter', timeout=10_000)
+        except Exception as e:                                # noqa: BLE001
+            return f'ERROR: entered the code but could not submit it ({type(e).__name__}).'
+
+        try:
+            await page.wait_for_load_state('domcontentloaded', timeout=NAV_TIMEOUT_MS)
+            try:
+                await page.wait_for_load_state('networkidle', timeout=5_000)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if self.pages_seen < self.max_pages:
+            self.pages_seen += 1
+        return 'Entered the emailed 2FA code.\n\n' + await self._capture()
 
     async def close(self):
         try:
@@ -566,6 +864,7 @@ def _clean_opportunities(raw, base_url: str) -> list:
             'open_date':      str(item.get('open_date') or '').strip()[:60],
             'close_date':     str(item.get('close_date') or '').strip()[:60],
             'funding_amount': str(item.get('funding_amount') or '').strip()[:120],
+            'is_rolling':     bool(item.get('is_rolling')),
         })
     return out
 
@@ -578,11 +877,19 @@ async def research_site(
     model: str = MODEL,
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
     site_timeout_s: int = DEFAULT_SITE_TIMEOUT_S,
+    credentials: dict = None,
+    code_fetcher=None,
 ) -> dict:
     """Walk one site and return what was found. Never raises.
 
     `site` is a registry row as a dict (url, name, instructions, max_pages,
     source_id). `known` is the list of already-stored titles for this source.
+    `credentials`, when given, is `{username, password, login_url}` for a
+    login-walled site — bound to the browser session out-of-band and used only
+    by the `log_in` tool; the password never enters the conversation or logs.
+    `code_fetcher`, when given, is a callable `(login_ts) -> code|None` for a
+    site with email 2FA — used only by `get_email_code`; the code never enters
+    the conversation or logs either.
     `browser` is a live Playwright Browser; a fresh context is created and
     disposed of here so sites cannot share cookies or state.
     """
@@ -603,11 +910,13 @@ async def research_site(
             viewport={'width': 1440, 'height': 900},
             ignore_https_errors=True,
         )
-        session = PageSession(context, int(site.get('max_pages') or DEFAULT_MAX_PAGES))
+        session = PageSession(context, int(site.get('max_pages') or DEFAULT_MAX_PAGES),
+                              credentials=credentials, code_fetcher=code_fetcher)
 
         messages = [{
             'role': 'user',
-            'content': _build_user_message(site, known, max_tool_calls),
+            'content': _build_user_message(site, known, max_tool_calls, credentials,
+                                           has_code_fetcher=code_fetcher is not None),
         }]
 
         calls_used = 0
@@ -695,6 +1004,15 @@ async def research_site(
                         out = await session.go_back()
                     elif call.name == 'find_on_page':
                         out = session.find_on_page(str(args.get('query') or ''))
+                    elif call.name == 'log_in':
+                        out = await session.log_in(
+                            username_field_hint=str(args.get('username_field_hint') or ''),
+                            password_field_hint=str(args.get('password_field_hint') or ''),
+                        )
+                    elif call.name == 'get_email_code':
+                        out = await session.get_email_code(
+                            otp_field_hint=str(args.get('otp_field_hint') or ''),
+                        )
                     else:
                         out = f'ERROR: unknown tool {call.name}.'
                 except Exception as e:                      # noqa: BLE001

@@ -83,11 +83,13 @@ DO NOT IMPORT (NO) if any of the following are true:
 
 When uncertain, only import if the opportunity is clearly relevant. Do not import on weak signals alone.
 
+Also decide whether this is a ROLLING opportunity: one that accepts submissions continuously rather than by a single fixed deadline. Set "is_rolling": true for open/standing BAAs, Commercial Solutions Openings (CSOs), "open until filled", continuously-open or multiple-cycle solicitations, and anything with no response deadline. Set it false for a notice with one specific closing date.
+
 ---
 
 OUTPUT FORMAT:
 Respond only with valid JSON. No preamble, no markdown, no explanation outside the JSON.
-{"import": true, "confidence": "high", "reason": "One or two sentences explaining the decision."}\
+{"import": true, "confidence": "high", "is_rolling": false, "reason": "One or two sentences explaining the decision."}\
 """
 
 
@@ -220,6 +222,7 @@ def _run_screening(df: pd.DataFrame, col_map: dict, anth_key: str) -> pd.DataFra
     out['_import']     = [r['import']     for r in results]
     out['_confidence'] = [r['confidence'] for r in results]
     out['_reason']     = [r['reason']     for r in results]
+    out['_is_rolling'] = [bool(r.get('is_rolling')) for r in results]
     return out
 
 
@@ -283,6 +286,7 @@ def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
 _SAM_RESERVED_COLS = frozenset({
     'topic_number', 'agency', 'title', 'description', 'open_date', 'due_date',
     'scraped_at', 'sam_confidence', 'sam_reason', 'grant_summary', 'embeddings', 'source',
+    'is_rolling', 'last_verified_active', 'verify_status',
     *nl.COLUMNS,
 })
 
@@ -309,6 +313,14 @@ def _embed_and_save(
     out['scraped_at']   = today
     out['sam_confidence'] = df['_confidence'].values
     out['sam_reason']   = df['_reason'].values
+
+    # Rolling = screener flagged it OR no deadline was mapped/present.
+    _rolling_llm = (df['_is_rolling'].fillna(False).astype(bool).values
+                    if '_is_rolling' in df.columns else [False] * len(df))
+    _blank_dl = out['due_date'].astype(str).str.strip().str.lower().isin(['', 'nan', 'nat', 'none'])
+    out['is_rolling']           = (pd.Series(_rolling_llm, index=out.index) | _blank_dl)
+    out['last_verified_active'] = today
+    out['verify_status']        = 'active'
 
     titles    = out['title'].tolist()
     descs     = out['description'].tolist()
@@ -624,6 +636,11 @@ def render():
                         f"**{status.get('rows_archived', 0):,}** archived, "
                         f"**{status.get('rows_updated', 0):,}** updated in store."
                     )
+                    if status.get('rolling_refreshed'):
+                        st.caption(
+                            f"🔁 {status['rolling_refreshed']:,} rolling deadline(s) "
+                            f"re-confirmed active this sweep."
+                        )
                     if status.get('stopped_early'):
                         _why = (
                             'the SAM.gov **daily quota** ran out (resets midnight UTC)'
@@ -1093,6 +1110,25 @@ def render():
     with st.expander(f'✅ Passing ({len(passing)})', expanded=True):
         if passing.empty:
             st.info('No rows passed screening.')
+        elif '_is_rolling' in passing.columns:
+            # Editable so a reviewer can correct the auto-detected rolling flag
+            # before save. Only the Rolling checkbox is editable.
+            _edit_cols = [c for c in [m_title, m_desc, '_is_rolling', '_confidence', '_reason'] if c]
+            _ecfg = dict(_cfg)
+            _ecfg['_is_rolling'] = st.column_config.CheckboxColumn(
+                'Rolling', width='small',
+                help='Continuously-open / rolling-deadline solicitation. '
+                     'Tick to flag one the screener missed.')
+            edited = st.data_editor(
+                passing[_edit_cols].reset_index(drop=True),
+                hide_index=True,
+                use_container_width=True,
+                column_config=_ecfg,
+                disabled=[c for c in _edit_cols if c != '_is_rolling'],
+                key='sam_passing_editor',
+            )
+            passing = passing.copy()
+            passing['_is_rolling'] = edited['_is_rolling'].values
         else:
             st.dataframe(
                 passing[_display].reset_index(drop=True),

@@ -63,7 +63,9 @@ from anthropic import AsyncAnthropic
 from google.cloud import storage
 from openai import OpenAI
 
+from src.modules import email_otp as eo
 from src.modules import newsletter as nl
+from src.modules import source_credentials as sc
 from src.modules import source_registry as sr
 from src.modules.browser_agent import (
     DEFAULT_MAX_TOOL_CALLS,
@@ -94,6 +96,10 @@ _MIN_CONCURRENCY   = 1
 _MAX_CONCURRENCY   = 6
 _MAX_DRY_PREVIEWS  = 4
 _MAX_RESULT_ROWS   = 400
+# Consecutive clean sweeps a rolling opportunity must be missing from its source
+# before it is marked inactive — one miss could be an agent that ran short of
+# page budget, so require two in a row.
+_EXPIRE_MISSES     = 2
 
 
 # -- Infrastructure helpers -------------------------------------------------
@@ -199,6 +205,11 @@ def _build_topic_frame(rows: list, embeddings: list, run_id: str) -> pd.DataFram
     out['source_name']    = [r.get('source_name', '') for r in rows]
     out['first_seen']     = today
     out['deep_research_run_id'] = run_id
+    # Rolling = the agent flagged it, OR the listing published no close date.
+    out['is_rolling']           = [bool(r.get('is_rolling'))
+                                   or not str(r.get('close_date', '')).strip() for r in rows]
+    out['last_verified_active'] = today
+    out['verify_status']        = 'active'
     return out
 
 
@@ -236,8 +247,8 @@ def _select_sites(registry: pd.DataFrame, config: dict) -> pd.DataFrame:
 
 # -- The run ----------------------------------------------------------------
 
-async def _browse_all(anth, sites: list, seen_by_id: dict, settings: dict,
-                      deadline: float, on_result) -> str:
+async def _browse_all(anth, sites: list, seen_by_id: dict, creds_by_id: dict,
+                      gmail, settings: dict, deadline: float, on_result) -> str:
     """Browse every site, calling `on_result(site, result)` as each finishes."""
     # Imported here rather than at module scope so the job module can be
     # imported (and its pure helpers tested) in an environment without Chromium.
@@ -256,12 +267,23 @@ async def _browse_all(anth, sites: list, seen_by_id: dict, settings: dict,
                         stopped_early = stopped_early or 'timeout'
                         return site, None
                     known = sr.known_titles(seen_by_id.get(site['source_id'], {}))
+                    cred  = creds_by_id.get(site['source_id'])
+                    # A bound per-site code fetcher, only when the mailbox is up
+                    # and the site declares which sender its codes come from.
+                    fetcher = None
+                    if gmail is not None and cred and cred.get('code_sender'):
+                        _sender = cred.get('code_sender')
+                        _regex  = cred.get('code_regex') or ''
+                        fetcher = lambda since, _s=_sender, _r=_regex: eo.fetch_code(
+                            gmail, sender=_s, after_epoch=int(since), regex=_r)
                     return site, await research_site(
                         anth, browser, site,
                         known=known,
                         model=settings['model'],
                         max_tool_calls=settings['max_tool_calls'],
                         site_timeout_s=settings['site_timeout_s'],
+                        credentials=cred,
+                        code_fetcher=fetcher,
                     )
 
             tasks = [asyncio.create_task(_one(s)) for s in sites]
@@ -337,6 +359,28 @@ def main(config_blob_path: str) -> None:
     oai_key  = _get_secret('openai-api-key')
     anth     = AsyncAnthropic(api_key=anth_key)
 
+    # Per-site login credentials + the shared 2FA mailbox, both from Secret
+    # Manager (read via the API at runtime so an admin's edits take effect
+    # without a redeploy). A Secret Manager / Gmail outage must not abort the
+    # whole sweep — degrade to none and let login-walled sites fail as before.
+    gmail = None
+    try:
+        sm = sc.client_adc()
+        creds_by_id = sc.load_credentials(sm)
+        if creds_by_id:
+            print(f'Loaded login credentials for {len(creds_by_id)} site(s).', flush=True)
+        try:
+            gmail = eo.build_gmail(eo.load_oauth(sm))
+            if gmail is not None:
+                print('2FA mailbox configured — email codes available.', flush=True)
+        except Exception as e:                                # noqa: BLE001
+            print(f'WARNING: could not set up the 2FA mailbox ({e}); email-2FA '
+                  'sites will not complete login.', flush=True)
+    except Exception as e:                                     # noqa: BLE001
+        print(f'WARNING: could not load funding-source credentials ({e}); '
+              'login-walled sites will not be able to sign in.', flush=True)
+        creds_by_id = {}
+
     # Pre-load every seen index up front: the agent needs the known titles
     # before it browses, and 200-odd small JSON reads are far faster in parallel.
     print('Loading seen indexes…', flush=True)
@@ -357,8 +401,15 @@ def main(config_blob_path: str) -> None:
     login_walled: list = []
     dry_previews: list = []
     title_cache: dict = {}        # broad_agency -> set of existing titles
+    # Rolling-deadline liveness: per source swept this run, the seen-keys observed
+    # and whether its sweep completed (did not stop early) — only a complete sweep
+    # may expire a rolling grant it failed to find.
+    swept_seen: dict = {}         # source_id -> set of seen_keys observed
+    swept_complete: dict = {}     # source_id -> bool (sweep did not stop early)
+    swept_agency: dict = {}       # source_id -> broad_agency folder
     counts = {'done': 0, 'ok': 0, 'errored': 0, 'deferred': 0,
-              'found': 0, 'new': 0, 'saved': 0}
+              'found': 0, 'new': 0, 'saved': 0,
+              'rolling_refreshed': 0, 'rolling_expired': 0}
     cost_total = {'usd': 0.0}
     stopped_early = {'reason': None}
 
@@ -380,6 +431,8 @@ def main(config_blob_path: str) -> None:
             'newsletter_checked':  counts.get('newsletter_checked', 0),
             'newsletter_good':     counts.get('newsletter_good', 0),
             'newsletter_failed':   counts.get('newsletter_failed', 0),
+            'rolling_refreshed':   counts.get('rolling_refreshed', 0),
+            'rolling_expired':     counts.get('rolling_expired', 0),
             'gcs_paths':           gcs_paths,
             'api_sites':           api_sites,
             'login_walled':        login_walled,
@@ -424,6 +477,91 @@ def main(config_blob_path: str) -> None:
             sr.upsert_sources(gcs, list(registry_updates.values()))
             registry_updates.clear()
 
+    def _refresh_rolling_liveness() -> None:
+        """Auto-expire rolling opportunities no longer listed on their source.
+
+        For every source swept this run, refresh the last-verified date on its
+        rolling topics still seen, and mark one inactive after `_EXPIRE_MISSES`
+        consecutive clean sweeps that failed to find it. Misses are only counted
+        for a source whose sweep completed (did not stop early), so an agent that
+        ran short of page budget cannot wrongly expire a live grant. The per-key
+        miss counter lives in the seen index; the authoritative state is written
+        onto the stored parquet rows.
+        """
+        if dry_run or not swept_seen:
+            return
+        today = datetime.today().strftime('%Y-%m-%d')
+        by_agency: dict = {}
+        for sid in swept_seen:
+            by_agency.setdefault(
+                swept_agency.get(sid, sr.DEFAULT_BROAD_AGENCY), set()).add(sid)
+        changed_indexes: set = set()
+        for broad_agency, sids in by_agency.items():
+            prefix = f'{_TOPICS_PREFIX}{broad_agency}/'
+            for blob in gcs.list_blobs(_BUCKET, prefix=prefix):
+                if not blob.name.endswith('.parquet'):
+                    continue
+                try:
+                    df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+                except Exception:                                 # noqa: BLE001
+                    continue
+                if 'source_id' not in df.columns or 'is_rolling' not in df.columns:
+                    continue
+                for col, default in (('last_verified_active', ''), ('verify_status', 'active')):
+                    if col not in df.columns:
+                        df[col] = default
+                roll    = df['is_rolling'].fillna(False).astype(bool)
+                notdead = df['verify_status'].fillna('').astype(str) != 'inactive'
+                mask    = df['source_id'].astype(str).isin(sids) & roll & notdead
+                if not mask.any():
+                    continue
+                dirty = False
+                for idx in df.index[mask]:
+                    rsid  = str(df.at[idx, 'source_id'])
+                    seen  = swept_seen.get(rsid, set())
+                    index = seen_by_id.setdefault(rsid, {})
+                    # The ingest key is url-based when the opportunity had its own
+                    # URL, else title-based — but a row with no own URL stored the
+                    # SITE url in `source`, so reconstructing from `source` alone
+                    # would miss. Check both candidate keys; bookkeep misses under
+                    # whichever the index already holds (else the title key).
+                    url_key   = sr.seen_key(rsid, str(df.at[idx, 'source'] or ''), '')
+                    title_key = sr.seen_key(rsid, '', str(df.at[idx, 'title'] or ''))
+                    seen_hit  = url_key in seen or title_key in seen
+                    key       = next((k for k in (url_key, title_key) if k in index), title_key)
+                    entry = index.setdefault(key, {
+                        'title': str(df.at[idx, 'title'] or ''),
+                        'first_seen': today, 'last_verified': '', 'misses': 0})
+                    if seen_hit:
+                        df.at[idx, 'last_verified_active'] = today
+                        df.at[idx, 'verify_status']        = 'active'
+                        entry['last_verified'] = today
+                        entry['misses'] = 0
+                        counts['rolling_refreshed'] += 1
+                        changed_indexes.add(rsid)
+                        dirty = True
+                    elif swept_complete.get(rsid):
+                        entry['misses'] = int(entry.get('misses', 0)) + 1
+                        changed_indexes.add(rsid)
+                        if entry['misses'] >= _EXPIRE_MISSES:
+                            df.at[idx, 'verify_status'] = 'inactive'
+                            counts['rolling_expired'] += 1
+                            dirty = True
+                    # else: sweep stopped early and the item was not seen — leave it.
+                if dirty:
+                    buf = io.BytesIO()
+                    df.to_parquet(buf, index=False)
+                    buf.seek(0)
+                    blob.upload_from_file(buf, content_type='application/octet-stream')
+        for sid in changed_indexes:
+            try:
+                sr.save_seen(gcs, sid, seen_by_id.get(sid, {}))
+            except Exception as e:                                # noqa: BLE001
+                print(f'  seen index write failed for {sid}: {e}', flush=True)
+        if counts['rolling_refreshed'] or counts['rolling_expired']:
+            print(f'Rolling liveness: {counts["rolling_refreshed"]} re-confirmed, '
+                  f'{counts["rolling_expired"]} expired', flush=True)
+
     def _handle(site: dict, result) -> None:
         """Post-process one finished site. Runs on a worker thread."""
         sid   = site['source_id']
@@ -446,6 +584,8 @@ def main(config_blob_path: str) -> None:
         row['has_api']        = bool(result.get('has_api'))
         row['api_note']       = str(result.get('api_evidence') or '')[:500]
         row['requires_login'] = bool(result.get('requires_login'))
+        # Keep the non-secret flag truthful even if the parquet was hand-edited.
+        row['has_credentials'] = sid in creds_by_id
 
         if result.get('has_api'):
             api_sites.append({'source_id': sid, 'name': name, 'url': site.get('url'),
@@ -483,15 +623,26 @@ def main(config_blob_path: str) -> None:
             title_cache[broad_agency] = _existing_titles(gcs, broad_agency)
         known_in_store = title_cache[broad_agency]
 
+        # Record what this sweep saw, for the rolling-liveness refresh after the run.
+        seen_now = swept_seen.setdefault(sid, set())
+        swept_agency[sid]   = broad_agency
+        swept_complete[sid] = not result.get('stopped_early')
+
         fresh = []
         for opp in result.get('opportunities') or []:
             key = sr.seen_key(sid, opp.get('url', ''), opp.get('title', ''))
+            seen_now.add(key)
             if key in index:
+                # Re-seen: a positive liveness signal regardless of sweep depth.
+                index[key]['last_verified'] = today
+                index[key]['misses'] = 0
                 continue
+            entry = {'title': opp.get('title', ''), 'first_seen': today,
+                     'last_verified': today, 'misses': 0}
             if opp.get('title', '').lower().strip() in known_in_store:
-                index[key] = {'title': opp.get('title', ''), 'first_seen': today}
+                index[key] = entry
                 continue
-            index[key] = {'title': opp.get('title', ''), 'first_seen': today}
+            index[key] = entry
             known_in_store.add(opp.get('title', '').lower().strip())
             fresh.append({
                 **opp,
@@ -560,7 +711,8 @@ def main(config_blob_path: str) -> None:
 
     try:
         reason = asyncio.run(
-            _browse_all(anth, sites, seen_by_id, settings, deadline, _on_result)
+            _browse_all(anth, sites, seen_by_id, creds_by_id, gmail, settings,
+                        deadline, _on_result)
         )
         if reason:
             stopped_early['reason'] = reason
@@ -568,6 +720,7 @@ def main(config_blob_path: str) -> None:
         loop_pool.shutdown(wait=True)
 
     _flush()
+    _refresh_rolling_liveness()
 
     if counts['deferred']:
         stopped_early['reason'] = stopped_early['reason'] or 'timeout'

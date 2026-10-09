@@ -51,7 +51,7 @@ import src.modules.aspect_matching as am
 import src.modules.aspect_profile as ap
 import src.modules.pools as pl
 import src.modules.ui_common as uc
-from src.modules.grant_utils import normalize_grant_columns
+from src.modules.grant_utils import normalize_grant_columns, drop_dead_topics
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -121,9 +121,8 @@ def _load_topics(client: storage.Client, agencies: list[str]) -> pd.DataFrame:
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', FutureWarning)
         topics = pd.concat(frames, ignore_index=True)
-    # Notices marked archived by the SAM.gov revision check are no longer live
-    if 'sam_status' in topics.columns:
-        topics = topics[topics['sam_status'].fillna('').astype(str) != 'archived']
+    # Drop archived notices and expired rolling deadlines (verify_status 'inactive')
+    topics = drop_dead_topics(topics)
     topics = normalize_grant_columns(topics.reset_index(drop=True))
     # Stored as float64; halved to float32 here because the whole topic store
     # is held in session state alongside the scoring matrix. This frame is
