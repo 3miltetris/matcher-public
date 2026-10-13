@@ -35,6 +35,10 @@ COPY src/modules/source_registry.py src/modules/source_registry.py
 COPY src/modules/browser_agent.py src/modules/browser_agent.py
 # Per-site login credentials for login-walled sites (Secret Manager map).
 COPY src/modules/source_credentials.py src/modules/source_credentials.py
+# Captured interactive sign-ins (authenticator / SSO / CAPTCHA sites), replayed
+# as Playwright storage_state. steel_client is NOT copied: the job never talks
+# to Steel — Steel is only the live sign-in window in the view.
+COPY src/modules/browser_session.py src/modules/browser_session.py
 # Reads one-time 2FA codes out of the shared mailbox (Gmail API).
 COPY src/modules/email_otp.py src/modules/email_otp.py
 # Newsletter screening of every stored opportunity (verticals + solicitation

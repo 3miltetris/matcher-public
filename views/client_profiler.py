@@ -31,7 +31,7 @@ that's one company and a handful of embeddings.
 
 The Bulk Aspect Match view consumes these profiles.
 
-Deleting is admin-gated (src/modules/access_control.py): section 3 bulk-deletes
+Deleting is admin-gated (src/modules/access_control.py): section 4 bulk-deletes
 profiles for companies we are done with, optionally removing their
 contact rows from the pool as well (archived to
 data/deleted-clients/ first — see src/modules/client_delete.py).
@@ -42,6 +42,7 @@ import time
 import traceback
 from datetime import date, datetime
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from google.cloud import run_v2, storage
@@ -173,10 +174,60 @@ def _build_directory(combined: pd.DataFrame, profiles: pd.DataFrame) -> pd.DataF
     ).reset_index(drop=True)
 
 
+# ── Aspect search ──────────────────────────────────────────────────────────
+
+def _search_profile_aspects(
+    profiles: pd.DataFrame, query_vec, threshold: float
+) -> pd.DataFrame:
+    """Rank a pool's profiles by how well any one of their aspects matches a
+    query embedding — the inverse of Grant Search's technology-description
+    search, scored the same way (ada-002 vectors are unit-norm, so a dot
+    product is cosine). One row per profile, kept to its best-scoring aspect;
+    the aspect vectors sit in the same order as the `aspects` JSON because
+    build_profile_record embeds them together."""
+    q = np.asarray(query_vec, dtype=np.float32)
+    rows = []
+    for _, p in profiles.iterrows():
+        mat = ap.unpack_embeddings(p)               # (n_aspects, dim)
+        if mat.shape[0] == 0:
+            continue
+        aspects = ap.profile_aspects(p)
+        n = min(mat.shape[0], len(aspects))
+        if n == 0:
+            continue
+        scores = mat[:n] @ q
+        best_i = int(np.argmax(scores))
+        best   = float(scores[best_i])
+        if best < threshold:
+            continue
+        hit_idx = [i for i in range(n) if scores[i] >= threshold]
+        rows.append({
+            '_key':            str(p.get('company_key') or ''),
+            'company':         str(p.get('company_name') or '—'),
+            'website':         str(p.get('companyWebsite') or ''),
+            'score':           best,
+            'best_aspect':     str(aspects[best_i].get('label') or ''),
+            'kind':            str(aspects[best_i].get('kind') or ''),
+            'matched':         len(hit_idx),
+            'matched_aspects': ' · '.join(
+                str(aspects[i].get('label') or '') for i in hit_idx
+            ),
+            'markets':         str(p.get('market_labels') or ''),
+            'aspect_text':     str(aspects[best_i].get('text') or ''),
+        })
+    cols = ['_key', 'company', 'website', 'score', 'best_aspect', 'kind',
+            'matched', 'matched_aspects', 'markets', 'aspect_text']
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return (pd.DataFrame(rows)[cols]
+            .sort_values('score', ascending=False)
+            .reset_index(drop=True))
+
+
 # ── Delete report ──────────────────────────────────────────────────────────
 
 def _render_delete_report() -> None:
-    """Outcome of the last bulk delete. Rendered in section 3, and also on the
+    """Outcome of the last bulk delete. Rendered in section 4, and also on the
     'no profiles yet' path — deleting the last profile lands there."""
     report = st.session_state.get('cp_delete_report')
     if not report:
@@ -192,7 +243,8 @@ def _render_delete_report() -> None:
 
 # ── Session state ──────────────────────────────────────────────────────────
 
-for _k in ['cp_frames', 'cp_profiles', 'cp_build_summary', 'cp_active_run']:
+for _k in ['cp_frames', 'cp_profiles', 'cp_build_summary', 'cp_active_run',
+           'cp_aspect_search']:
     if _k not in st.session_state:
         st.session_state[_k] = None
 # Bumped after every build so the picker's checkbox state resets instead of
@@ -218,7 +270,7 @@ st.caption(
 pool = uc.pool_selector(
     'cp_pool',
     clears=('cp_frames', 'cp_profiles', 'cp_build_summary', 'cp_sel_key',
-            'cp_del_keys', 'cp_delete_report'),
+            'cp_del_keys', 'cp_delete_report', 'cp_aspect_search'),
     help='Clients are the companies we write proposals for. Prospects are '
          'targets we are pursuing — same profiles, same matching, separate '
          'store.',
@@ -621,7 +673,7 @@ if st.session_state.get('cp_build_summary'):
                 'These scored close but below the merge threshold. Measurement '
                 'showed cosine does not reliably separate a genuine repeat from '
                 'two facets of one platform, so nothing was merged automatically '
-                '— edit the profile in section 2 to combine any that are.'
+                '— edit the profile in section 3 to combine any that are.'
             )
             for company, pair in summary['near_pairs']:
                 st.markdown(f'- **{company}** · `{pair}`')
@@ -629,10 +681,105 @@ if st.session_state.get('cp_build_summary'):
         st.session_state.cp_build_summary = None
         st.rerun()
 
-# ── Section 2 · Review & edit ──────────────────────────────────────────────
+# ── Section 2 · Search aspects ─────────────────────────────────────────────
+# The inverse of Grant Search's technology-description search: type a
+# capability and rank THIS pool's profiles by how well any one of their
+# aspects matches it. One embedding of the query, scored against every aspect
+# vector already in the store — the same cosine method, pointed at profiles
+# instead of grant topics.
 
 st.divider()
-st.subheader('2 · Review & edit a profile')
+st.subheader(f'2 · Find a capability across {_NOUN}s')
+
+if profiles.empty:
+    st.info('No profiles in this pool yet — build some above to search them.')
+else:
+    st.caption(
+        f'Describe a capability, technology, product or domain and rank the '
+        f'{len(profiles):,} profiled {_NOUN} companies by how closely any one of '
+        'their aspects matches it. Each company keeps its single best-matching '
+        'aspect; the score is that aspect’s cosine similarity to your text.'
+    )
+
+    sc_l, sc_r = st.columns([3, 1])
+    aspect_query = sc_l.text_input(
+        'Capability to search for',
+        key='cp_aspect_query',
+        placeholder='e.g. radiation-hardened FPGA design, mRNA lipid '
+                    'nanoparticle delivery, autonomous maritime navigation…',
+    )
+    aspect_threshold = sc_r.slider(
+        'Threshold', 0.60, 0.95, 0.78, 0.01, key='cp_aspect_threshold',
+        help='Minimum cosine similarity for an aspect to count as a match.',
+    )
+
+    if st.button('🔎 Search aspects', type='primary',
+                 disabled=not aspect_query.strip()):
+        try:
+            tp = TextProcessor(api_key=st.secrets['openai_api_key'])
+            with st.spinner('Embedding the query…'):
+                qvec = tp.get_embedding(aspect_query.strip())
+            with st.spinner(f'Scoring {len(profiles):,} profiles…'):
+                hits = _search_profile_aspects(
+                    profiles, qvec, float(aspect_threshold)
+                )
+            st.session_state.cp_aspect_search = {
+                'df':        hits,
+                'query':     aspect_query.strip(),
+                'threshold': float(aspect_threshold),
+                'searched':  len(profiles),
+            }
+        except Exception as e:
+            st.error(f'Search failed: {e}')
+            st.code(traceback.format_exc())
+
+    _asearch = st.session_state.get('cp_aspect_search')
+    if _asearch:
+        hits = _asearch['df']
+        if hits.empty:
+            st.warning(
+                f'No aspect scored ≥ {_asearch["threshold"]:.2f} for '
+                f'“{_asearch["query"]}”. Lower the threshold or rephrase.'
+            )
+        else:
+            st.success(
+                f'**{len(hits):,}** of {_asearch["searched"]:,} {_NOUN}s have an '
+                f'aspect matching “{_asearch["query"]}”.'
+            )
+            _show = hits.drop(columns=['_key'])
+            st.dataframe(
+                _show, hide_index=True, use_container_width=True,
+                column_config={
+                    'company':         st.column_config.TextColumn(
+                        pl.label(pool).rstrip('s')),
+                    'website':         st.column_config.TextColumn('Website'),
+                    'score':           st.column_config.NumberColumn(
+                        'Best score', format='%.4f'),
+                    'best_aspect':     st.column_config.TextColumn(
+                        'Best-matching aspect', width='medium'),
+                    'kind':            st.column_config.TextColumn(
+                        'Kind', width='small'),
+                    'matched':         st.column_config.NumberColumn(
+                        'Aspects ≥ thr', format='%d'),
+                    'matched_aspects': st.column_config.TextColumn(
+                        'All matched aspects', width='large'),
+                    'markets':         st.column_config.TextColumn(
+                        'Markets', width='medium'),
+                    'aspect_text':     st.column_config.TextColumn(
+                        'Aspect text', width='large'),
+                },
+            )
+            st.download_button(
+                '⬇ Download CSV',
+                _show.to_csv(index=False).encode('utf-8'),
+                file_name=f'aspect_search_{datetime.now():%Y-%m-%d_%H-%M-%S}.csv',
+                mime='text/csv',
+            )
+
+# ── Section 3 · Review & edit ──────────────────────────────────────────────
+
+st.divider()
+st.subheader('3 · Review & edit a profile')
 
 profiles = st.session_state.cp_profiles
 if profiles.empty:
@@ -990,10 +1137,10 @@ with del_col:
         ac.admin_only_notice('Deleting a profile')
 
 
-# ── Section 3 · Delete profiles & clients (admin only) ─────────────────────
+# ── Section 4 · Delete profiles & clients (admin only) ─────────────────────
 
 st.divider()
-st.subheader('3 · Delete profiles')
+st.subheader('4 · Delete profiles')
 
 _render_delete_report()
 

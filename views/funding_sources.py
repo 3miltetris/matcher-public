@@ -30,10 +30,13 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from google.cloud import storage
 
 import src.modules.access_control as ac
+import src.modules.browser_session as bs
 import src.modules.email_otp as eo
+import src.modules.steel_client as steel
 import src.modules.source_credentials as sc
 import src.modules.source_registry as sr
 import src.modules.ui_common as uc
@@ -154,8 +157,9 @@ def _render_login_credentials(registry: pd.DataFrame, digest: dict) -> None:
             'the password is filled straight into the page — it is never shown to the model '
             'or written to logs. A site with **email 2FA** is supported if its code emails are '
             'forwarded to the team mailbox (set the code sender below and follow the forwarding '
-            'steps). SMS / authenticator-app codes, SSO (Google / Microsoft) and CAPTCHA logins '
-            'cannot be automated — leave those for manual checking.'
+            'steps). For SMS / authenticator-app codes, SSO (Google / Microsoft) or CAPTCHA '
+            'logins, use **🖥 Interactive sign-in** below instead: sign in once by hand and '
+            'the agent reuses that session.'
         )
 
         try:
@@ -340,6 +344,268 @@ def _render_login_credentials(registry: pd.DataFrame, digest: dict) -> None:
                         st.success('Mailbox reachable.')
                 except Exception as e:                        # noqa: BLE001
                     st.error(f'Mailbox check failed: {e}')
+
+
+_STEEL_STATE_KEY = 'fsrc_steel'   # {id, debug_url, source_id, login_url, user_agent, started}
+
+
+def _steel_key() -> str:
+    try:
+        return str(st.secrets.get('steel_api_key') or '')
+    except Exception:                                         # noqa: BLE001
+        return ''
+
+
+def _end_steel_window(api_key: str) -> None:
+    live = st.session_state.get(_STEEL_STATE_KEY)
+    if live:
+        steel.release(api_key, live['id'])
+    st.session_state[_STEEL_STATE_KEY] = None
+
+
+def _render_session_capture(registry: pd.DataFrame) -> None:
+    """Interactive sign-in: an admin signs in to a site by hand inside an
+    embedded remote browser (Steel), and the authenticated session is saved so
+    the agent starts that site already signed in.
+
+    This is the path for walls nothing can automate — authenticator-app or SMS
+    codes, SSO, CAPTCHA. The state is stored in Secret Manager
+    (``browser_session``), never in the bucket; the registry only mirrors
+    ``has_session`` / ``session_status``. Sessions expire after days or weeks;
+    the job then marks the site ``needs_reauth`` and skips it until someone
+    signs in here again.
+    """
+    has_cols = {'has_session', 'session_status'} <= set(registry.columns)
+    with_session = registry[registry['has_session']] if has_cols else registry.iloc[0:0]
+    expired = (with_session[with_session['session_status'] == 'expired']
+               if has_cols else with_session)
+
+    # ── Non-admins: read-only ────────────────────────────────────────────────
+    if not ac.is_admin():
+        if len(with_session):
+            with st.expander(f'🖥 Sites with a saved sign-in ({len(with_session)}'
+                             + (f', {len(expired)} expired' if len(expired) else '') + ')'):
+                st.dataframe(with_session[['name', 'url', 'session_status',
+                                           'session_captured_at']],
+                             use_container_width=True, hide_index=True)
+                if len(expired):
+                    st.caption('Expired sign-ins are skipped by every run until an admin '
+                               'signs in again.')
+        return
+
+    api_key = _steel_key()
+    live    = st.session_state.get(_STEEL_STATE_KEY)
+
+    title = (f'🖥 Interactive sign-in — authenticator / SSO / CAPTCHA sites '
+             f'({len(with_session)} saved'
+             + (f', ⚠️ {len(expired)} expired' if len(expired) else '') + ')')
+    with st.expander(title, expanded=bool(live) or bool(len(expired))):
+        st.caption(
+            'For sites whose login cannot be automated. Open a live browser window here, '
+            'sign in by hand — including the authenticator-app / SMS code, SSO or CAPTCHA — '
+            'then save. The signed-in session (cookies + site storage) is kept in Secret '
+            'Manager and the agent reuses it, so it never has to log in itself. Sessions '
+            'last days to weeks; when one expires the site shows **needs_reauth** and is '
+            'skipped until someone signs in here again.')
+
+        if len(expired):
+            st.warning('**Sign-in expired — skipped until re-authenticated:** '
+                       + ', '.join(str(n) for n in expired['name'].fillna(expired['url'])))
+
+        if not api_key:
+            st.error('No Steel API key configured — add `steel_api_key` to the app '
+                     'secrets (`streamlit-secrets`) and redeploy.')
+            return
+
+        try:
+            sm       = _get_sm_client()
+            sess_map = bs.load_sessions(sm)
+        except Exception as e:                                # noqa: BLE001
+            st.error(f'Could not read the session store: {e}')
+            st.caption('One-time setup may be required: the Secret Manager secret '
+                       '`funding-source-sessions` must exist and `matcher-app@` needs '
+                       '`secretVersionManager` + `secretAccessor` on it (see deploy notes).')
+            return
+
+        name_by_id = dict(zip(registry['source_id'], registry['name']))
+        status_by_id = (dict(zip(registry['source_id'], registry['session_status']))
+                        if has_cols else {})
+
+        # ── Saved sessions ───────────────────────────────────────────────────
+        summary = bs.safe_summary(sess_map)
+        if summary:
+            used = bs.store_bytes(sess_map)
+            st.markdown(f'**{len(summary)} saved sign-in(s)** · store '
+                        f'{used / 1024:.1f} of {bs.MAX_SECRET_BYTES / 1024:.0f} KB used')
+            st.dataframe(pd.DataFrame([{
+                'Site':     name_by_id.get(r['source_id']) or r['source_id'],
+                'Status':   {'expired': '⚠️ expired', 'active': '✅ working'}.get(
+                                status_by_id.get(r['source_id'], ''), 'not yet used'),
+                'Captured': (r['captured_at'] or '')[:16].replace('T', ' '),
+                'By':       r['captured_by'],
+                'Hosts':    ', '.join(r['hosts'][:4]) + (' …' if len(r['hosts']) > 4 else ''),
+            } for r in summary]), use_container_width=True, hide_index=True)
+
+        # ── An open sign-in window ──────────────────────────────────────────
+        if live:
+            status = steel.session_status(api_key, live['id'])
+            if status and status != 'live':
+                st.session_state[_STEEL_STATE_KEY] = None
+                st.info('The sign-in window closed (it times out after '
+                        f'{steel.SESSION_TIMEOUT_MS // 60000} minutes). Open a new one.')
+                st.rerun()
+
+            site_name = name_by_id.get(live['source_id']) or live['source_id']
+            left = max(0, int(steel.SESSION_TIMEOUT_MS / 1000 - (time.time() - live['started'])))
+            st.markdown(f'**Signing in to {site_name}** — `{live["login_url"]}` · '
+                        f'window closes in ~{left // 60} min')
+            st.caption('Click into the window and sign in as you normally would. When you '
+                       'can see the members-only listing, press **Save sign-in**. Password '
+                       'managers on your own machine cannot fill this window — paste instead.')
+            # The live-view URL is unauthenticated (only the session id guards it),
+            # so it is rendered here, inside the admin-only IAP page, and nowhere else.
+            components.html(
+                f'<iframe src="{steel.live_view_url(live["debug_url"])}" '
+                'style="width:100%;height:820px;border:1px solid #ccc;border-radius:6px" '
+                'allow="clipboard-read; clipboard-write; autoplay; fullscreen"></iframe>',
+                height=840,
+            )
+
+            force = st.checkbox(
+                'Save even if no cookies for this site were found', key='fsrc_sess_force',
+                help='Normally a save is refused when the browser holds nothing for the '
+                     "site's own domain — the usual sign that the sign-in did not finish.")
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button('✅ Save sign-in', type='primary', key='fsrc_sess_save'):
+                    try:
+                        site_row = registry[registry['source_id'] == live['source_id']]
+                        site_url = site_row.iloc[0]['url'] if not site_row.empty else ''
+                        keep = [site_url, live['login_url']]
+                        state = bs.steel_context_to_storage_state(
+                            steel.get_context(api_key, live['id']))
+                        site_domains = {bs.registrable_domain(u) for u in keep if u}
+                        has_site_state = any(bs.registrable_domain(h) in site_domains
+                                             for h in bs.state_hosts(state))
+                        if not has_site_state and not force:
+                            st.warning(
+                                'The browser holds nothing for '
+                                + ', '.join(sorted(d for d in site_domains if d))
+                                + ' yet — it does not look signed in. Finish signing in '
+                                  'and try again, or tick the box above to save anyway.')
+                        else:
+                            state, trimmed = bs.prepare_state(state, keep)
+                            bs.set_session(sm, live['source_id'], state,
+                                           user_agent=live.get('user_agent', ''),
+                                           actor=st.session_state.get('user_email', ''))
+                            if not site_row.empty:
+                                row = site_row.iloc[0].to_dict()
+                                row.update({
+                                    'has_session': True, 'session_status': 'active',
+                                    'session_captured_at': datetime.utcnow().strftime(
+                                        '%Y-%m-%dT%H:%M:%SZ'),
+                                    'enabled': True, 'consecutive_failures': 0,
+                                    'last_error': '',
+                                })
+                                if str(row.get('cadence')) == 'paused':
+                                    row['cadence'] = 'weekly'
+                                sr.upsert_sources(_get_storage_client(), [row])
+                            _end_steel_window(api_key)
+                            st.session_state.fsrc_registry = None
+                            st.success(f'Sign-in saved for **{site_name}**'
+                                       + (' (trimmed to the site\'s own domains to fit).'
+                                          if trimmed else '.')
+                                       + ' The next run will browse it signed in.')
+                            st.rerun()
+                    except bs.SessionTooLarge as e:
+                        st.error(f'Could not save: {e}. Remove an unused saved sign-in, '
+                                 'or ask to move sessions to one secret per site.')
+                    except Exception as e:                    # noqa: BLE001
+                        st.error(f'Could not save the sign-in: {e}')
+                        st.code(traceback.format_exc())
+            with b2:
+                if st.button('↻ Reload login page', key='fsrc_sess_reload'):
+                    try:
+                        steel.open_url(api_key, live['id'], live['login_url'])
+                    except Exception as e:                    # noqa: BLE001
+                        st.error(str(e))
+                    st.rerun()
+            with b3:
+                if st.button('✖ Cancel', key='fsrc_sess_cancel'):
+                    _end_steel_window(api_key)
+                    st.rerun()
+            return
+
+        # ── Start a sign-in ─────────────────────────────────────────────────
+        st.markdown('**Sign in to a site**')
+        expired_ids = set(expired['source_id'])
+        walled_ids  = set(registry.loc[registry['requires_login'], 'source_id'])
+        saved_ids   = bs.configured_ids(sess_map)
+        ranked = registry.copy()
+        ranked['_rank'] = ranked['source_id'].map(
+            lambda s: 0 if s in expired_ids else 1 if s in walled_ids
+            else 2 if s in saved_ids else 3)
+        ranked = ranked.sort_values(['_rank', 'name'])
+
+        def _label(r) -> str:
+            sid = r['source_id']
+            flag = ('  (⚠️ expired)' if sid in expired_ids else
+                    '  (🔒 walled)' if sid in walled_ids else
+                    '  (🖥 saved)' if sid in saved_ids else '')
+            return f"{r['name'] or r['url']}{flag}"
+
+        options = {_label(r): r for _, r in ranked.iterrows()}
+        chosen  = st.selectbox('Site', list(options), key='fsrc_sess_site')
+        site    = options.get(chosen)
+        if site is None:
+            return
+        # Prefer the login page an admin stored with the site's password, if any.
+        try:
+            stored_login = (sc.load_credentials(sm).get(site['source_id'], {})
+                            .get('login_url', ''))
+        except Exception:                                     # noqa: BLE001
+            stored_login = ''
+        login_url = st.text_input(
+            'Start the window at', value=stored_login or site['url'],
+            key=f"fsrc_sess_url_{site['source_id']}",
+            help="The site's login page, or any page that leads to it.")
+
+        o1, o2 = st.columns([1, 1])
+        with o1:
+            if st.button('🖥 Open sign-in window', type='primary', key='fsrc_sess_open'):
+                url = sr.normalize_url(login_url)
+                if not url:
+                    st.warning('Enter a URL to start at.')
+                else:
+                    created = None
+                    try:
+                        with st.spinner('Starting a remote browser…'):
+                            created = steel.create_session(api_key)
+                            ua = steel.open_url(api_key, created['id'], url)
+                        st.session_state[_STEEL_STATE_KEY] = {
+                            'id': created['id'], 'debug_url': created['debug_url'],
+                            'source_id': site['source_id'], 'login_url': url,
+                            'user_agent': ua, 'started': time.time(),
+                        }
+                        st.rerun()
+                    except Exception as e:                    # noqa: BLE001
+                        if created:
+                            steel.release(api_key, created['id'])
+                        st.error(f'Could not open the sign-in window: {e}')
+        with o2:
+            if site['source_id'] in saved_ids:
+                if st.button('🗑 Remove saved sign-in', key='fsrc_sess_del'):
+                    try:
+                        bs.delete_session(sm, site['source_id'])
+                        row = site.drop(labels=['_rank'], errors='ignore').to_dict()
+                        row.update({'has_session': False, 'session_status': '',
+                                    'session_captured_at': ''})
+                        sr.upsert_sources(_get_storage_client(), [row])
+                        st.session_state.fsrc_registry = None
+                        st.success('Saved sign-in removed.')
+                        st.rerun()
+                    except Exception as e:                    # noqa: BLE001
+                        st.error(f'Could not remove: {e}')
 
 
 # ── Page ──────────────────────────────────────────────────────────────────
@@ -639,7 +905,7 @@ def render():
         view[['due', 'name', 'url', 'cadence', 'broad_agency', 'sub_agency',
               'enabled', 'max_pages', 'instructions', 'last_checked', 'last_status',
               'consecutive_failures', 'has_api', 'requires_login', 'has_credentials',
-              'notes', 'source_id']],
+              'has_session', 'notes', 'source_id']],
         use_container_width=True,
         hide_index=True,
         num_rows='dynamic',
@@ -675,6 +941,11 @@ def render():
             'has_credentials': st.column_config.CheckboxColumn(
                 '🔑', disabled=True, width='small',
                 help='A team login is stored for this site (manage it in section 3 · Flags).'),
+            'has_session': st.column_config.CheckboxColumn(
+                '🖥', disabled=True, width='small',
+                help='A saved interactive sign-in is stored for this site (section 3 · '
+                     'Flags → Interactive sign-in). Its Last result reads needs_reauth '
+                     'once it expires.'),
             'notes':          st.column_config.TextColumn('Notes', width='medium'),
             'source_id':      st.column_config.TextColumn('ID', disabled=True, width='small'),
         },
@@ -884,6 +1155,7 @@ def render():
         st.caption('No sites flagged as having an API yet.')
 
     _render_login_credentials(registry, digest)
+    _render_session_capture(registry)
 
     if digest['paused']:
         with st.expander(f"⏸️ Auto-paused after repeated failures ({len(digest['paused'])})"):

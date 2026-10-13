@@ -63,6 +63,7 @@ from anthropic import AsyncAnthropic
 from google.cloud import storage
 from openai import OpenAI
 
+from src.modules import browser_session as bs
 from src.modules import email_otp as eo
 from src.modules import newsletter as nl
 from src.modules import source_credentials as sc
@@ -248,7 +249,8 @@ def _select_sites(registry: pd.DataFrame, config: dict) -> pd.DataFrame:
 # -- The run ----------------------------------------------------------------
 
 async def _browse_all(anth, sites: list, seen_by_id: dict, creds_by_id: dict,
-                      gmail, settings: dict, deadline: float, on_result) -> str:
+                      gmail, settings: dict, deadline: float, on_result,
+                      sessions_by_id: dict = None) -> str:
     """Browse every site, calling `on_result(site, result)` as each finishes."""
     # Imported here rather than at module scope so the job module can be
     # imported (and its pure helpers tested) in an environment without Chromium.
@@ -284,6 +286,9 @@ async def _browse_all(anth, sites: list, seen_by_id: dict, creds_by_id: dict,
                         site_timeout_s=settings['site_timeout_s'],
                         credentials=cred,
                         code_fetcher=fetcher,
+                        # A captured interactive sign-in, decoded only here,
+                        # per site, at the moment its context is created.
+                        session=bs.session_for(sessions_by_id or {}, site['source_id']),
                     )
 
             tasks = [asyncio.create_task(_one(s)) for s in sites]
@@ -347,11 +352,25 @@ def main(config_blob_path: str) -> None:
 
     page_override = config.get('max_pages')
     sites = []
+    # A site whose captured sign-in has expired cannot get past its wall until a
+    # human signs in again, so browsing it would only spend budget and flag it
+    # a second time. Skipped here, before any secret is read, and reported. An
+    # explicit `ids` pick still runs it — the operator override, as with paused.
+    reauth_skipped = []
+    explicit = config.get('select') == 'ids'
     for _, row in picked.iterrows():
         site = row.to_dict()
+        if (not explicit and bool(site.get('has_session'))
+                and str(site.get('session_status') or '') == 'expired'):
+            reauth_skipped.append(site)
+            continue
         if page_override:
             site['max_pages'] = int(page_override)
         sites.append(site)
+    if reauth_skipped:
+        print(f'Skipping {len(reauth_skipped)} site(s) whose saved sign-in expired: '
+              + ', '.join(str(s.get('name') or s.get('url')) for s in reauth_skipped),
+              flush=True)
     total = len(sites)
     print(f'{total} site(s) selected; concurrency={settings["concurrency"]}', flush=True)
 
@@ -381,6 +400,21 @@ def main(config_blob_path: str) -> None:
               'login-walled sites will not be able to sign in.', flush=True)
         creds_by_id = {}
 
+    # Captured interactive sign-ins (authenticator / SSO / CAPTCHA sites). Kept
+    # in its own try: a failure here must not cost the password logins, and
+    # `sessions_loaded` stops an outage from rewriting every site's
+    # `has_session` mirror to False in the registry.
+    sessions_by_id, sessions_loaded = {}, False
+    try:
+        sessions_by_id  = bs.load_sessions(sc.client_adc())
+        sessions_loaded = True
+        if sessions_by_id:
+            print(f'Loaded saved sign-in sessions for {len(sessions_by_id)} site(s).',
+                  flush=True)
+    except Exception as e:                                     # noqa: BLE001
+        print(f'WARNING: could not load saved sign-in sessions ({e}); those sites '
+              'will be browsed signed out.', flush=True)
+
     # Pre-load every seen index up front: the agent needs the known titles
     # before it browses, and 200-odd small JSON reads are far faster in parallel.
     print('Loading seen indexes…', flush=True)
@@ -399,6 +433,14 @@ def main(config_blob_path: str) -> None:
     gcs_paths: list = []
     api_sites: list = []
     login_walled: list = []
+    # Sites a human must sign in to again: skipped up front as already expired,
+    # plus any whose session the agent found expired during this run.
+    reauth_needed: list = [
+        {'source_id': s['source_id'], 'name': s.get('name') or s.get('url'),
+         'url': s.get('url'), 'captured_at': s.get('session_captured_at', ''),
+         'when': 'previously'}
+        for s in reauth_skipped
+    ]
     dry_previews: list = []
     title_cache: dict = {}        # broad_agency -> set of existing titles
     # Rolling-deadline liveness: per source swept this run, the seen-keys observed
@@ -436,6 +478,8 @@ def main(config_blob_path: str) -> None:
             'gcs_paths':           gcs_paths,
             'api_sites':           api_sites,
             'login_walled':        login_walled,
+            'reauth_needed':       reauth_needed,
+            'sites_reauth_skipped': len(reauth_skipped),
             'results':             results[:_MAX_RESULT_ROWS],
             'dry_run_preview':     dry_previews,
             'cost_usd':            round(cost_total['usd'], 4),
@@ -586,6 +630,26 @@ def main(config_blob_path: str) -> None:
         row['requires_login'] = bool(result.get('requires_login'))
         # Keep the non-secret flag truthful even if the parquet was hand-edited.
         row['has_credentials'] = sid in creds_by_id
+        if sessions_loaded:
+            row['has_session'] = sid in sessions_by_id
+
+        # A saved sign-in was injected and the agent still met a wall: the
+        # session expired. Only the agent's own verdict counts (see
+        # browser_agent: the regex backstop also fires on footer "Sign in"
+        # links). Flag it for a human, and do NOT count it toward auto-pause —
+        # the site is fine, the session is stale, and the skip above keeps later
+        # runs off it until someone signs in again.
+        session_expired = bool(result.get('session_used')
+                               and result.get('agent_requires_login'))
+        if result.get('session_used'):
+            row['session_status'] = 'expired' if session_expired else (
+                'active' if result.get('ok') else row.get('session_status') or 'active')
+        if session_expired:
+            reauth_needed.append({
+                'source_id': sid, 'name': name, 'url': site.get('url'),
+                'captured_at': site.get('session_captured_at', ''), 'when': 'this run'})
+            print(f'  {name}: saved sign-in has expired — needs re-authentication',
+                  flush=True)
 
         if result.get('has_api'):
             api_sites.append({'source_id': sid, 'name': name, 'url': site.get('url'),
@@ -660,8 +724,10 @@ def main(config_blob_path: str) -> None:
             buffers.setdefault(broad_agency, []).extend(fresh)
 
         row['last_checked']         = today
-        row['last_status']          = sr.STATUS_OK if fresh else sr.STATUS_NOTHING_FOUND
-        row['last_error']           = ''
+        row['last_status']          = (sr.STATUS_REAUTH if session_expired else
+                                       sr.STATUS_OK if fresh else sr.STATUS_NOTHING_FOUND)
+        row['last_error']           = ('saved sign-in expired — sign in again from the '
+                                       'Funding Sources view' if session_expired else '')
         row['consecutive_failures'] = 0
         registry_updates[sid]       = row
 
@@ -712,7 +778,7 @@ def main(config_blob_path: str) -> None:
     try:
         reason = asyncio.run(
             _browse_all(anth, sites, seen_by_id, creds_by_id, gmail, settings,
-                        deadline, _on_result)
+                        deadline, _on_result, sessions_by_id=sessions_by_id)
         )
         if reason:
             stopped_early['reason'] = reason

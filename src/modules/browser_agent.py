@@ -330,7 +330,8 @@ _SYSTEM_BLOCKS = [{
 
 def _build_user_message(site: dict, known: list, max_tool_calls: int,
                         credentials: dict = None,
-                        has_code_fetcher: bool = False) -> str:
+                        has_code_fetcher: bool = False,
+                        has_session: bool = False) -> str:
     parts = [
         f"Site: {site.get('name') or site.get('url')}",
         f"Starting URL: {site.get('url')}",
@@ -342,7 +343,20 @@ def _build_user_message(site: dict, known: list, max_tool_calls: int,
             '\nSite-specific instructions from the team — follow these closely:\n'
             + instructions
         )
-    if credentials:
+    if has_session:
+        # A human signed in interactively (authenticator / SSO / CAPTCHA) and the
+        # session was captured; the context is seeded with it. Typing into a
+        # login form here could only end that session, so the agent is told not
+        # to — and a wall it still meets means the session has expired, which
+        # the job turns into a re-authentication flag.
+        parts.append(
+            '\nThis browser is already signed in to the site with the team\'s saved '
+            'session. Go straight to the member listing. Do NOT fill in or submit a '
+            'login form. If a login page or members-only wall still blocks the '
+            'listing, the saved session has expired: set requires_login true, say so '
+            'in notes, and finish.'
+        )
+    elif credentials:
         # Login guidance lives in the per-site user message, never in _SYSTEM, so
         # the system/tools cache entry stays byte-identical across every site.
         login_url = str(credentials.get('login_url') or '').strip()
@@ -706,29 +720,68 @@ class PageSession:
                     'email may not have forwarded to the team mailbox, or the '
                     'sender/pattern is misconfigured.')
 
+        code_str = str(code).strip()
+
+        # Segmented OTP inputs — one box per digit — are the norm on modern SPAs.
+        # A plain .fill() puts the whole code in box 1, so the verify button stays
+        # disabled and the submit click then times out. Detect the box group and
+        # TYPE the code instead: real keystrokes fire the per-key handlers that
+        # advance focus across the boxes and populate the widget's hidden
+        # aggregator, which is what enables the Verify button. Detect by the
+        # one-time-code / numeric group, NOT by maxlength: verified against
+        # gocolosseum's Ark PinInput, whose 6 boxes carry maxlength=None (only the
+        # hidden aggregator has maxlength="6"). A single field falls through to
+        # .fill() with a typed fallback if the value does not take.
         try:
-            await otp.fill(str(code), timeout=10_000)
+            boxes = page.locator(
+                'input[autocomplete="one-time-code"], input[inputmode="numeric"], '
+                'input[maxlength="1"]')
+            n_boxes = await boxes.count()
+        except Exception:                                     # noqa: BLE001
+            n_boxes = 0
+        try:
+            if n_boxes >= 2:
+                await boxes.first.click(timeout=10_000)
+                await page.keyboard.type(code_str, delay=90)
+            else:
+                await otp.fill(code_str, timeout=10_000)
+                try:
+                    if (await otp.input_value()) != code_str:
+                        await otp.click(timeout=5_000)
+                        await page.keyboard.type(code_str, delay=60)
+                except Exception:                             # noqa: BLE001
+                    pass
         except Exception as e:                                # noqa: BLE001
             return f'ERROR: found a code but could not enter it ({type(e).__name__}).'
 
-        submitted = await _first(
-            page.locator('button[type="submit"]').first,
-            page.locator('input[type="submit"]').first,
-        )
+        # Many segmented widgets auto-submit on the final digit. Give that a beat
+        # before forcing a button, and treat a failed submit as non-fatal — the
+        # code may already have gone through, so let the capture show the result
+        # rather than returning an ERROR over a login that actually succeeded.
+        url_before = page.url
         try:
-            if submitted is not None:
-                await submitted.click(timeout=10_000)
-            else:
-                btn = page.get_by_role(
-                    'button',
-                    name=re.compile(r'verif|submit|continue|log\s*in|sign\s*in', re.I),
-                ).first
-                if await btn.count():
-                    await btn.click(timeout=10_000)
+            await page.wait_for_load_state('networkidle', timeout=4_000)
+        except Exception:                                     # noqa: BLE001
+            pass
+        if page.url == url_before:
+            submitted = await _first(
+                page.locator('button[type="submit"]').first,
+                page.locator('input[type="submit"]').first,
+            )
+            try:
+                if submitted is not None:
+                    await submitted.click(timeout=10_000)
                 else:
-                    await otp.press('Enter', timeout=10_000)
-        except Exception as e:                                # noqa: BLE001
-            return f'ERROR: entered the code but could not submit it ({type(e).__name__}).'
+                    btn = page.get_by_role(
+                        'button',
+                        name=re.compile(r'verif|submit|continue|log\s*in|sign\s*in', re.I),
+                    ).first
+                    if await btn.count():
+                        await btn.click(timeout=10_000)
+                    else:
+                        await otp.press('Enter', timeout=10_000)
+            except Exception:                                 # noqa: BLE001
+                pass
 
         try:
             await page.wait_for_load_state('domcontentloaded', timeout=NAV_TIMEOUT_MS)
@@ -822,6 +875,12 @@ def _blank_result(site: dict) -> dict:
         'has_api':        False,
         'api_evidence':   '',
         'requires_login': False,
+        # The agent's own verdict, before the regex backstop below. Only this is
+        # trusted to declare a saved session expired: the backstop also fires on
+        # footer "Sign in" links, and a false expiry would stop the site being
+        # scraped until someone re-signed in for no reason.
+        'agent_requires_login': False,
+        'session_used':   False,
         'notes':          '',
         'pages_visited':  0,
         'tool_calls':     0,
@@ -879,6 +938,7 @@ async def research_site(
     site_timeout_s: int = DEFAULT_SITE_TIMEOUT_S,
     credentials: dict = None,
     code_fetcher=None,
+    session: dict = None,
 ) -> dict:
     """Walk one site and return what was found. Never raises.
 
@@ -890,6 +950,10 @@ async def research_site(
     `code_fetcher`, when given, is a callable `(login_ts) -> code|None` for a
     site with email 2FA — used only by `get_email_code`; the code never enters
     the conversation or logs either.
+    `session`, when given, is `{storage_state, user_agent}` from
+    `browser_session.session_for` — a sign-in a human completed interactively.
+    The context is created already holding it, so the agent never logs in; like
+    the password, the state never enters the conversation or logs.
     `browser` is a live Playwright Browser; a fresh context is created and
     disposed of here so sites cannot share cookies or state.
     """
@@ -902,21 +966,33 @@ async def research_site(
         return result
 
     context = None
-    session = None
+    page_session = None
     try:
-        context = await browser.new_context(
-            user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                        '(KHTML, like Gecko) Chrome/124.0 Safari/537.36 MatcherBot/1.0'),
-            viewport={'width': 1440, 'height': 900},
-            ignore_https_errors=True,
-        )
-        session = PageSession(context, int(site.get('max_pages') or DEFAULT_MAX_PAGES),
-                              credentials=credentials, code_fetcher=code_fetcher)
+        has_session = bool(session and session.get('storage_state'))
+        context_kwargs = {
+            'user_agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                           '(KHTML, like Gecko) Chrome/124.0 Safari/537.36 MatcherBot/1.0'),
+            'viewport': {'width': 1440, 'height': 900},
+            'ignore_https_errors': True,
+        }
+        if has_session:
+            context_kwargs['storage_state'] = session['storage_state']
+            # Replay the UA the session was issued to — some sites bind a session
+            # to it, and a bot-flagged UA is a reason to end one.
+            if session.get('user_agent'):
+                context_kwargs['user_agent'] = session['user_agent']
+            result['session_used'] = True
+        context = await browser.new_context(**context_kwargs)
+        # The browser session object is named `page_session` here: `session` is
+        # the captured sign-in above.
+        page_session = PageSession(context, int(site.get('max_pages') or DEFAULT_MAX_PAGES),
+                                   credentials=credentials, code_fetcher=code_fetcher)
 
         messages = [{
             'role': 'user',
             'content': _build_user_message(site, known, max_tool_calls, credentials,
-                                           has_code_fetcher=code_fetcher is not None),
+                                           has_code_fetcher=code_fetcher is not None,
+                                           has_session=has_session),
         }]
 
         calls_used = 0
@@ -925,12 +1001,12 @@ async def research_site(
             out_of_budget = (
                 remaining <= 1
                 or time.monotonic() > deadline
-                or session.pages_seen >= session.max_pages
+                or page_session.pages_seen >= page_session.max_pages
             )
             if out_of_budget and result['stopped_early'] is None:
                 result['stopped_early'] = (
                     'timeout' if time.monotonic() > deadline else
-                    'page_budget' if session.pages_seen >= session.max_pages else
+                    'page_budget' if page_session.pages_seen >= page_session.max_pages else
                     'tool_budget'
                 )
 
@@ -980,10 +1056,11 @@ async def research_site(
             if terminal is not None:
                 payload = terminal.input if isinstance(terminal.input, dict) else {}
                 result['opportunities']  = _clean_opportunities(
-                    payload.get('opportunities'), session.url or start_url)
+                    payload.get('opportunities'), page_session.url or start_url)
                 result['has_api']        = bool(payload.get('has_api'))
                 result['api_evidence']   = str(payload.get('api_evidence') or '')[:500]
                 result['requires_login'] = bool(payload.get('requires_login'))
+                result['agent_requires_login'] = result['requires_login']
                 result['notes']          = str(payload.get('notes') or '')[:1000]
                 result['ok']             = True
                 break
@@ -994,23 +1071,23 @@ async def research_site(
                 args = call.input if isinstance(call.input, dict) else {}
                 try:
                     if call.name == 'open_page':
-                        out = await session.open_page(str(args.get('url') or ''))
+                        out = await page_session.open_page(str(args.get('url') or ''))
                     elif call.name == 'click':
-                        out = await session.click(
+                        out = await page_session.click(
                             link_number=args.get('link_number'),
                             text=str(args.get('text') or ''),
                         )
                     elif call.name == 'go_back':
-                        out = await session.go_back()
+                        out = await page_session.go_back()
                     elif call.name == 'find_on_page':
-                        out = session.find_on_page(str(args.get('query') or ''))
+                        out = page_session.find_on_page(str(args.get('query') or ''))
                     elif call.name == 'log_in':
-                        out = await session.log_in(
+                        out = await page_session.log_in(
                             username_field_hint=str(args.get('username_field_hint') or ''),
                             password_field_hint=str(args.get('password_field_hint') or ''),
                         )
                     elif call.name == 'get_email_code':
-                        out = await session.get_email_code(
+                        out = await page_session.get_email_code(
                             otp_field_hint=str(args.get('otp_field_hint') or ''),
                         )
                     else:
@@ -1031,7 +1108,7 @@ async def research_site(
         # Deterministic backstop for the two site-level flags: the agent is
         # asked to judge them, but a page it could not read still leaves
         # evidence in the text.
-        page_text = session.text or ''
+        page_text = page_session.text or ''
         if not result['has_api'] and _API_HINTS.search(page_text):
             result['has_api']      = True
             result['api_evidence'] = (result['api_evidence']
@@ -1040,17 +1117,17 @@ async def research_site(
                 and _LOGIN_HINTS.search(page_text):
             result['requires_login'] = True
 
-        result['pages_visited'] = session.pages_seen
+        result['pages_visited'] = page_session.pages_seen
 
     except asyncio.CancelledError:
         raise
     except Exception as e:                                   # noqa: BLE001
         result['error'] = f'{type(e).__name__}: {e}'
-        if session is not None:
-            result['pages_visited'] = session.pages_seen
+        if page_session is not None:
+            result['pages_visited'] = page_session.pages_seen
     finally:
-        if session is not None:
-            await session.close()
+        if page_session is not None:
+            await page_session.close()
         if context is not None:
             try:
                 await context.close()

@@ -71,13 +71,19 @@ COLUMN_DEFAULTS: dict = {
     'api_note':             '',
     'requires_login':       False,
     'has_credentials':      False,
+    # A captured interactive sign-in (browser_session). Non-secret mirrors of the
+    # Secret Manager store, so the view and job can tell which sites have one —
+    # and whether the job has since seen it expire — without reading the secret.
+    'has_session':          False,
+    'session_status':       '',      # '' | 'active' | 'expired'
+    'session_captured_at':  '',
     'notes':                '',
     'added_at':             '',
     'added_by':             '',
 }
 COLUMNS = list(COLUMN_DEFAULTS)
 
-_BOOL_COLS = ('enabled', 'has_api', 'requires_login', 'has_credentials')
+_BOOL_COLS = ('enabled', 'has_api', 'requires_login', 'has_credentials', 'has_session')
 _INT_COLS  = ('max_pages', 'consecutive_failures')
 
 # Outcome codes written to `last_status` by the job.
@@ -86,6 +92,7 @@ STATUS_NOTHING_FOUND = 'no_opportunities'
 STATUS_LOGIN         = 'needs_login'
 STATUS_ERROR         = 'error'
 STATUS_DEFERRED      = 'deferred'
+STATUS_REAUTH        = 'needs_reauth'   # captured sign-in expired; a human must redo it
 
 
 # -- URL handling -----------------------------------------------------------
