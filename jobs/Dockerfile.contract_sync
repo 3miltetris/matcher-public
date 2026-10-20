@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.contract_sync_job.txt .
+RUN pip install --no-cache-dir -r requirements.contract_sync_job.txt
+
+COPY jobs/contract_sync_job.py jobs/contract_sync_job.py
+
+# Shared streamlit-free modules (explicit COPY list — never COPY . .)
+COPY src/__init__.py src/__init__.py
+COPY src/modules/__init__.py src/modules/__init__.py
+COPY src/modules/contract_sync.py src/modules/contract_sync.py
+COPY src/modules/folder_match.py src/modules/folder_match.py
+COPY src/modules/drive_client.py src/modules/drive_client.py
+COPY src/modules/doc_extract.py src/modules/doc_extract.py
+# drive_folder (the Drive-write primitives) lives in the intake package
+COPY src/modules/intake/__init__.py src/modules/intake/__init__.py
+COPY src/modules/intake/drive_folder.py src/modules/intake/drive_folder.py
+
+ENV PYTHONPATH=/app
+
+# Fail the build if the import chain or CLI is broken (argparse --help exits 0)
+RUN python jobs/contract_sync_job.py --help > /dev/null
+
+ENTRYPOINT ["python", "jobs/contract_sync_job.py"]

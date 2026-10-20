@@ -459,6 +459,12 @@ def _render_session_capture(registry: pd.DataFrame) -> None:
             left = max(0, int(steel.SESSION_TIMEOUT_MS / 1000 - (time.time() - live['started'])))
             st.markdown(f'**Signing in to {site_name}** — `{live["login_url"]}` · '
                         f'window closes in ~{left // 60} min')
+            if live.get('nav_warning'):
+                # The window still opened — a site that will not load (or loads
+                # slowly) is no reason to deny the admin the browser.
+                st.warning(f'The page did not load cleanly: {live["nav_warning"]}. The '
+                           'window is open anyway — wait for it, or go to another address '
+                           'below.')
             st.caption('Click into the window and sign in as you normally would. When you '
                        'can see the members-only listing, press **Save sign-in**. Password '
                        'managers on your own machine cannot fill this window — paste instead.')
@@ -524,9 +530,13 @@ def _render_session_capture(registry: pd.DataFrame) -> None:
                         st.error(f'Could not save the sign-in: {e}')
                         st.code(traceback.format_exc())
             with b2:
-                if st.button('↻ Reload login page', key='fsrc_sess_reload'):
+                go_url = st.text_input('Go to', value=live['login_url'],
+                                       key='fsrc_sess_goto', label_visibility='collapsed')
+                if st.button('➜ Go to address', key='fsrc_sess_reload'):
                     try:
-                        steel.open_url(api_key, live['id'], live['login_url'])
+                        nav = steel.open_url(api_key, live['id'], sr.normalize_url(go_url))
+                        live['nav_warning'] = nav['warning']
+                        st.session_state[_STEEL_STATE_KEY] = live
                     except Exception as e:                    # noqa: BLE001
                         st.error(str(e))
                     st.rerun()
@@ -581,11 +591,12 @@ def _render_session_capture(registry: pd.DataFrame) -> None:
                     try:
                         with st.spinner('Starting a remote browser…'):
                             created = steel.create_session(api_key)
-                            ua = steel.open_url(api_key, created['id'], url)
+                            nav = steel.open_url(api_key, created['id'], url)
                         st.session_state[_STEEL_STATE_KEY] = {
                             'id': created['id'], 'debug_url': created['debug_url'],
                             'source_id': site['source_id'], 'login_url': url,
-                            'user_agent': ua, 'started': time.time(),
+                            'user_agent': nav['user_agent'], 'started': time.time(),
+                            'nav_warning': nav['warning'],
                         }
                         st.rerun()
                     except Exception as e:                    # noqa: BLE001

@@ -27,6 +27,7 @@ Streamlit-free; the API key is passed in by the caller (``st.secrets``).
 """
 
 import concurrent.futures
+import re
 
 import requests
 
@@ -38,7 +39,11 @@ CONNECT_URL = 'wss://connect.steel.dev'
 SESSION_TIMEOUT_MS = 15 * 60 * 1000
 VIEWPORT           = {'width': 1280, 'height': 800}
 _HTTP_TIMEOUT_S    = 60
-_NAV_TIMEOUT_MS    = 45_000
+_CONNECT_TIMEOUT_MS = 45_000
+# Navigation waits only for the first response ('commit'): the human watches the
+# rest of the page load in the live view, and a slow .mil page used to hold the
+# admin at a spinner for the full timeout and then fail.
+_NAV_TIMEOUT_MS    = 25_000
 
 
 class SteelError(RuntimeError):
@@ -80,40 +85,96 @@ def live_view_url(debug_url: str) -> str:
     return f'{debug_url}{sep}interactive=true&showControls=true'
 
 
-def _open_url_sync(api_key: str, session_id: str, url: str) -> str:
+def _redact(text) -> str:
+    """Strip the API key out of anything that may echo the CDP connect URL."""
+    return re.sub(r'(apiKey=)[^&\s"\']+', r'\1***', str(text))
+
+
+def _reason(exc: Exception) -> str:
+    """One readable line from a Playwright error, key redacted."""
+    first = _redact(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    return re.sub(r'^(Page|BrowserType)\.\w+:\s*', '', first)[:240]
+
+
+# A goto "interrupted by another navigation" means the site redirected while
+# loading — LinkedIn and lift.technology bounce straight to their own login
+# wall. The browser did land somewhere, so it is a success, not an error.
+_REDIRECTED = 'interrupted by another navigation'
+
+
+def _user_agent(browser) -> str:
+    """The UA the browser actually sends, read at browser level.
+
+    Not ``page.evaluate('navigator.userAgent')``: evaluate has no timeout and
+    waits for an execution context, so on a page still loading after a goto
+    timeout it hung the sign-in window for 271s (jacks.jpeocbrnd.army.mil).
+    Not the ``userAgent`` field of Steel's session API either: measured
+    2026-10-13 it reports Chrome/128 while the browser sends Chrome/154, and
+    replaying the wrong one presents a different browser to the site.
+    ``Browser.getVersion`` matched ``navigator.userAgent`` exactly.
+    """
+    try:
+        return browser.new_browser_cdp_session().send('Browser.getVersion').get(
+            'userAgent', '')
+    except Exception:                                         # noqa: BLE001
+        return ''
+
+
+def _open_url_sync(api_key: str, session_id: str, url: str) -> dict:
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
+        # Only a failed connect is fatal — without it there is no browser to show.
         browser = p.chromium.connect_over_cdp(
             f'{CONNECT_URL}?apiKey={api_key}&sessionId={session_id}',
-            timeout=_NAV_TIMEOUT_MS)
+            timeout=_CONNECT_TIMEOUT_MS)
         try:
             ctx  = browser.contexts[0] if browser.contexts else browser.new_context()
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            page.goto(url, timeout=_NAV_TIMEOUT_MS, wait_until='domcontentloaded')
+            warning = ''
+            try:
+                page.goto(url, timeout=_NAV_TIMEOUT_MS, wait_until='commit')
+            except Exception as e:                            # noqa: BLE001
+                # Navigation is best-effort: a redirect, a slow page, a dead DNS
+                # name or a reset must not cost the admin the window — they can
+                # carry on from wherever the browser is, or go elsewhere.
+                if _REDIRECTED not in str(e):
+                    warning = _reason(e)
             # The job replays the state with this same user agent: some sites
             # tie a session to the UA it was issued to.
-            return page.evaluate('navigator.userAgent') or ''
+            return {'user_agent': _user_agent(browser),
+                    'url': page.url, 'warning': warning}
         finally:
             # Disconnects only — the remote session (and the page) stay up for
             # the human in the live view.
             browser.close()
 
 
-def open_url(api_key: str, session_id: str, url: str) -> str:
-    """Navigate the session to ``url``; returns the browser's user agent.
+def open_url(api_key: str, session_id: str, url: str) -> dict:
+    """Point the session at ``url``. Returns ``{user_agent, url, warning}``.
+
+    Never raises for a navigation problem — those come back as ``warning`` (and
+    ``url`` is where the browser actually is) so the window still opens. Raises
+    ``SteelError`` only when the remote browser cannot be reached at all.
 
     Run on a worker thread: Playwright's sync API refuses to start inside a
     thread that already has a running asyncio loop, and Streamlit's script
     thread is not guaranteed not to.
     """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        try:
-            return ex.submit(_open_url_sync, api_key, session_id, url).result(
-                timeout=_NAV_TIMEOUT_MS / 1000 + 30)
-        except Exception as e:                                # noqa: BLE001
-            # Never echo the connect URL — it carries the API key.
-            raise SteelError(f'could not open the login page in the remote browser '
-                             f'({type(e).__name__})') from None
+    # Not a `with` block: its exit joins the worker, so a stuck worker would
+    # hold the page past the timeout below. A worker abandoned here unsticks
+    # itself — the caller releases the session, which drops its CDP socket.
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(_open_url_sync, api_key, session_id, url).result(
+            timeout=(_CONNECT_TIMEOUT_MS + _NAV_TIMEOUT_MS) / 1000 + 15)
+    except concurrent.futures.TimeoutError:
+        raise SteelError('the remote browser did not respond in time') from None
+    except Exception as e:                                    # noqa: BLE001
+        # The reason is shown, with the key redacted — the bare class name
+        # ("Error") this used to show was undiagnosable.
+        raise SteelError(f'could not reach the remote browser: {_reason(e)}') from None
+    finally:
+        ex.shutdown(wait=False)
 
 
 def get_context(api_key: str, session_id: str) -> dict:

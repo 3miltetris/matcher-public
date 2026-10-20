@@ -1,0 +1,10 @@
+requests>=2.31.0
+google-cloud-storage>=2.0.0
+google-auth>=2.0.0
+google-api-python-client>=2.100.0
+tldextract>=5.0.0
+# pymupdf + pandas/numpy are only here because drive_client imports doc_extract
+# at module load; contract_sync never extracts document text itself.
+pymupdf>=1.27.0
+pandas>=2.0.0
+numpy>=1.26.0
