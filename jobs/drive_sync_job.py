@@ -64,6 +64,7 @@ from openai import OpenAI
 
 import src.modules.anthropic_utils as au
 from src.modules import doc_extract, drive_client
+from src.modules import gcs_write as gw
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -520,19 +521,25 @@ def main(config_blob_path: str) -> None:
     results: list[dict] = []
     skipped_files: list[dict] = []
     proposals: list[dict] = []
-    touched_blobs: set[str] = set()
+    # pending[blob_name][client_key] = {column: value} — the per-company column
+    # updates this run has produced but not yet flushed. At each checkpoint they
+    # are re-applied onto a FRESHLY re-read copy of each parquet under a
+    # generation guard (gcs_write.read_modify_write), so fathom-sync-job's
+    # client_meetings_* columns written concurrently are never clobbered — the
+    # old whole-file rewrite from the start-of-run snapshot did exactly that.
+    pending: dict[str, dict[str, dict]] = {}
     files_scanned = files_changed = 0
     clients_updated = clients_unchanged = clients_errored = 0
 
     def _checkpoint(state_label: str, done: int, total: int) -> None:
         if not dry_run:
-            for blob_name in touched_blobs:
-                buf = io.BytesIO()
-                frames[blob_name].to_parquet(buf, index=False)
-                buf.seek(0)
-                gcs.bucket(_BUCKET).blob(blob_name).upload_from_file(
-                    buf, content_type='application/octet-stream')
-            touched_blobs.clear()
+            for blob_name, updates in list(pending.items()):
+                blob = gcs.bucket(_BUCKET).blob(blob_name)
+                gw.read_modify_write(
+                    blob,
+                    lambda df, u=updates: gw.apply_column_updates(df, u, _group_mask),
+                )
+            pending.clear()
             sync_state['updated_at'] = datetime.now(timezone.utc).isoformat()
             _save_json_blob(gcs, _SYNC_STATE_BLOB, sync_state)
         _write_status(gcs, run_id, {
@@ -681,20 +688,24 @@ def main(config_blob_path: str) -> None:
                         # cannot mix float32 and float64 ndarrays in one column
                         new_emb = np.array(emb, dtype=np.float64)
 
+                cols: dict = {
+                    'client_docs_data':    docs_data,
+                    'client_docs_summary': digest,
+                    'docs_updated_at':     today,
+                }
+                if new_emb is not None:
+                    cols['summary']    = new_summary
+                    cols['embeddings'] = new_emb
+
                 found = False
                 for blob_name, df in frames.items():
-                    mask = _group_mask(df, client_key)
-                    if not mask.any():
+                    # The start-of-run snapshot tells us which blob holds the
+                    # client's rows; the mask is re-derived on the fresh frame at
+                    # flush time by apply_column_updates.
+                    if not _group_mask(df, client_key).any():
                         continue
                     found = True
-                    df.loc[mask, 'client_docs_data']    = docs_data
-                    df.loc[mask, 'client_docs_summary'] = digest
-                    df.loc[mask, 'docs_updated_at']     = today
-                    if new_emb is not None:
-                        df.loc[mask, 'summary'] = new_summary
-                        for idx in df.index[mask]:
-                            df.at[idx, 'embeddings'] = new_emb
-                    touched_blobs.add(blob_name)
+                    pending.setdefault(blob_name, {})[client_key] = cols
                 if not found:
                     outcome['outcome'] = 'error'
                     outcome['note']    = 'no client rows matched client_key'
@@ -865,18 +876,48 @@ if __name__ == '__main__':
         print('Usage: python jobs/drive_sync_job.py <config_blob_path>', file=sys.stderr)
         sys.exit(1)
 
-    run_id_fallback = sys.argv[1].split('/')[-1].replace('.json', '')
+    config_path     = sys.argv[1]
+    run_id_fallback = config_path.split('/')[-1].replace('.json', '')
+    _gcs_client     = _gcs()
+
+    # Run lock: one drive-sync-job execution at a time. A second run (scheduled
+    # or a manual trigger) exits cleanly as skipped_locked rather than racing
+    # the parquet writes. ttl = the run's own task timeout + 15 min, so a run
+    # killed without releasing is taken over by the next after it could only
+    # still be alive. The lock key is the job name, not the run_id.
+    _cfg = {}
     try:
-        main(sys.argv[1])
+        _cfg = json.loads(
+            _gcs_client.bucket(_BUCKET).blob(config_path).download_as_text())
+    except Exception:
+        pass
+    _run_id = _cfg.get('run_id', run_id_fallback)
+    _ttl = max(_MIN_TASK_TIMEOUT_S,
+               min(int(_cfg.get('task_timeout_s', _DEFAULT_TASK_TIMEOUT_S)),
+                   _MAX_TASK_TIMEOUT_S)) + 900
+    _lock = gw.acquire_lock(_gcs_client.bucket(_BUCKET), 'drive-sync-job', _run_id, _ttl)
+    if _lock is None:
+        print('Another drive-sync-job run holds the lock — exiting cleanly.', flush=True)
+        try:
+            _write_status(_gcs_client, _run_id,
+                          {'run_id': _run_id, 'state': 'skipped_locked', 'error': None})
+        except Exception:
+            pass
+        sys.exit(0)
+
+    try:
+        main(config_path)
     except Exception:
         tb = traceback.format_exc()
         print(tb, file=sys.stderr, flush=True)
         try:
             _write_status(
-                _gcs(),
+                _gcs_client,
                 run_id_fallback,
                 {'run_id': run_id_fallback, 'state': 'error', 'error': tb},
             )
         except Exception:
             pass
         sys.exit(1)
+    finally:
+        gw.release_lock(_lock)

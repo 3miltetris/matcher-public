@@ -66,6 +66,7 @@ from google.cloud import storage
 
 import src.modules.anthropic_utils as au
 from src.modules import fathom_client as fc
+from src.modules import gcs_write as gw
 import src.modules.pools as pl
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -507,7 +508,11 @@ def main(config_blob_path: str) -> None:
     # ── Phase 2: per-client ingest ────────────────────────────────────────────
     client_order = sorted(per_client, key=lambda k: identities.get(k, k).lower())
     results: list[dict] = []
-    touched_blobs: set[str] = set()
+    # pending[blob_name][client_key] = {column: value} — re-applied onto a
+    # freshly re-read copy of each parquet under a generation guard at flush
+    # time, so drive-sync-job's client_docs_* columns written concurrently are
+    # never clobbered by a whole-file rewrite from the start-of-run snapshot.
+    pending: dict[str, dict[str, dict]] = {}
     index_rows: list[dict] = []
     dry_previews: list[dict] = []
     meetings_ingested = 0
@@ -516,13 +521,13 @@ def main(config_blob_path: str) -> None:
 
     def _checkpoint(state_label: str, done: int, total: int) -> None:
         if not dry_run:
-            for blob_name in touched_blobs:
-                buf = io.BytesIO()
-                frames[blob_name].to_parquet(buf, index=False)
-                buf.seek(0)
-                gcs.bucket(_BUCKET).blob(blob_name).upload_from_file(
-                    buf, content_type='application/octet-stream')
-            touched_blobs.clear()
+            for blob_name, updates in list(pending.items()):
+                blob = gcs.bucket(_BUCKET).blob(blob_name)
+                gw.read_modify_write(
+                    blob,
+                    lambda df, u=updates: gw.apply_column_updates(df, u, _group_mask),
+                )
+            pending.clear()
             _upsert_index(gcs, index_rows)
             index_rows.clear()
             sync_state['updated_at'] = datetime.now(timezone.utc).isoformat()
@@ -674,16 +679,19 @@ def main(config_blob_path: str) -> None:
                 'last_run':  run_id,
             }, ensure_ascii=False)
 
+            cols = {
+                'client_meetings_data':    meetings_data,
+                'client_meetings_summary': digest,
+                'meetings_updated_at':     today,
+            }
             found = False
             for blob_name, df in frames.items():
-                mask = _group_mask(df, client_key)
-                if not mask.any():
+                # The start-of-run snapshot locates the client's blob; the mask
+                # is re-derived on the fresh frame at flush time.
+                if not _group_mask(df, client_key).any():
                     continue
                 found = True
-                df.loc[mask, 'client_meetings_data']    = meetings_data
-                df.loc[mask, 'client_meetings_summary'] = digest
-                df.loc[mask, 'meetings_updated_at']     = today
-                touched_blobs.add(blob_name)
+                pending.setdefault(blob_name, {})[client_key] = cols
             if not found:
                 outcome['outcome'] = 'error'
                 outcome['note']    = 'no client rows matched client_key'
@@ -777,18 +785,37 @@ if __name__ == '__main__':
         sys.exit(2)
     cfg_path = sys.argv[1]
     run_id_fallback = cfg_path.split('/')[-1].replace('.json', '')
+    _client = _gcs()
+
+    # Run lock: one fathom-sync-job execution at a time (see drive-sync-job for
+    # the rationale). ttl = the run's task timeout + 15 min; the lock key is the
+    # job name, not the run_id.
+    _cfg0  = _load_json_blob(_client, cfg_path) or {}
+    _run_id = _cfg0.get('run_id') or run_id_fallback
+    _ttl = max(_MIN_TASK_TIMEOUT_S,
+               min(int(_cfg0.get('task_timeout_s') or _DEFAULT_TASK_TIMEOUT_S),
+                   _MAX_TASK_TIMEOUT_S)) + 900
+    _lock = gw.acquire_lock(_client.bucket(_BUCKET), 'fathom-sync-job', _run_id, _ttl)
+    if _lock is None:
+        print('Another fathom-sync-job run holds the lock — exiting cleanly.', flush=True)
+        try:
+            _write_status(_client, _run_id,
+                          {'run_id': _run_id, 'state': 'skipped_locked', 'error': None})
+        except Exception:
+            pass
+        sys.exit(0)
+
     try:
         main(cfg_path)
     except Exception:
         tb = traceback.format_exc()
         print(tb, flush=True)
         try:
-            client = _gcs()
-            cfg    = _load_json_blob(client, cfg_path) or {}
-            _write_status(client, cfg.get('run_id') or run_id_fallback, {
-                'run_id': cfg.get('run_id') or run_id_fallback,
-                'state': 'error', 'error': tb,
+            _write_status(_client, _run_id, {
+                'run_id': _run_id, 'state': 'error', 'error': tb,
             })
         except Exception as inner:
             print(f'Could not write error status: {inner}', flush=True)
         sys.exit(1)
+    finally:
+        gw.release_lock(_lock)

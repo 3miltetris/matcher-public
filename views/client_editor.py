@@ -27,6 +27,7 @@ from google.oauth2 import service_account
 
 import src.modules.access_control as ac
 import src.modules.client_delete as cd
+from src.modules import gcs_write as gw
 import src.modules.pool_transfer as ptr
 import src.modules.pools as pl
 import src.modules.ui_common as uc
@@ -231,6 +232,12 @@ if save_btn:
 
     bm = BucketManager(_BUCKET, client=_get_storage_client())
 
+    # One company_key, two columns. Written under a generation guard so a
+    # concurrent drive-sync / fathom-sync run cannot be clobbered by a stale
+    # whole-file rewrite — the frames here are session-cached and can be
+    # arbitrarily old. read_modify_write re-reads each blob fresh and re-applies
+    # only these two columns by key.
+    updates = {selected_key: {'summary': new_summary.strip(), 'embeddings': embedding}}
     rows_updated  = 0
     files_written = []
     for blob_name in group_rows['_blob'].unique():
@@ -238,11 +245,12 @@ if save_btn:
         mask = _group_mask(df, selected_key)
         if not mask.any():
             continue
-        df.loc[mask, 'summary'] = new_summary.strip()
-        for idx in df.index[mask]:
-            df.at[idx, 'embeddings'] = embedding
+        gw.apply_column_updates(df, updates, _group_mask)  # keep the UI's frame in step
         try:
-            bm.upload_file(blob_name, df)
+            gw.read_modify_write(
+                bm.bucket.blob(blob_name),
+                lambda d, u=updates: gw.apply_column_updates(d, u, _group_mask),
+            )
         except Exception as e:
             st.error(f'Failed to write {blob_name}: {e}')
             st.stop()

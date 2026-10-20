@@ -20,6 +20,8 @@ COPY src/modules/aspect_profile.py src/modules/aspect_profile.py
 COPY src/modules/finance_research.py src/modules/finance_research.py
 COPY src/modules/tech_research.py src/modules/tech_research.py
 COPY src/modules/GoogleBucketManager/bucket_manager.py src/modules/GoogleBucketManager/bucket_manager.py
+# Generation-guarded parquet writes + run lock (Phase 1.2).
+COPY src/modules/gcs_write.py src/modules/gcs_write.py
 
 ENV PYTHONPATH=/app
 

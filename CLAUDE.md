@@ -78,10 +78,23 @@ src/
                               #   the "glad I read this" prompt, Opus 5.5 structured-output call with
                               #   Haiku refusal fallback, tag_frame() used by every ingest path,
                               #   write_back() for the view's backfill + review saves
-    ui_common.py              # Shared Streamlit-side plumbing — BUCKET + path prefixes, get_credentials/
-                              #   get_storage_client, list_prefixes, load_parquets_from_prefix, and the
-                              #   Cloud Run write_job_config/trigger_job/poll_status trio. Streamlit-only;
-                              #   deliberately NOT imported by aspect_profile.py (which the jobs import)
+    ui_common.py              # Shared Streamlit-side plumbing — path prefixes, get_credentials/
+                              #   get_storage_client, list_prefixes, load_parquets_from_prefix. Streamlit-only;
+                              #   deliberately NOT imported by aspect_profile.py (which the jobs import).
+                              #   RE-EXPORTS the Cloud Run write_job_config/trigger_job/poll_status/job_name
+                              #   trio + BUCKET from job_control.py, so views are unchanged
+    job_control.py            # Streamlit-free Cloud Run job control (Stage 11.5) — write_job_config/
+                              #   trigger_job/poll_status/job_name + the BUCKET constant. Extracted from
+                              #   ui_common.py so jobs (and the future MCP server) can trigger jobs without
+                              #   Streamlit; trigger_job takes an optional jobs_client for a job triggering
+                              #   another job over ADC (mirrors intake/profile_trigger.py)
+    gcs_write.py              # Streamlit-free generation-guarded parquet writes + the job run lock
+                              #   (Stage 11.5). read_modify_write(blob, mutate_fn) re-reads each blob at
+                              #   write time and writes under if_generation_match, retrying the 412, so
+                              #   drive-sync and fathom-sync rewriting the SAME clients/*.parquet no longer
+                              #   clobber each other's columns; apply_column_updates re-applies {company_key:
+                              #   {col: val}} onto the fresh frame; acquire_lock/release_lock own
+                              #   locks/{job}.json (if_generation_match=0, stale/released takeover)
     access_control.py         # Admin gating for destructive actions — SUPER_ADMINS code constant + admin-config/admins.json; is_admin()/require_admin() (Streamlit-only)
     client_delete.py          # Streamlit-free client deletion — archive removed rows → rewrite/delete clients parquets → drop profile → park Drive assignment; shared by Client Editor + Client Profiles
     doc_extract.py            # Streamlit-free document text extraction (PDF/DOCX/XLSX/TXT/CSV) — shared by Drive Sync view + drive-sync-job
@@ -694,6 +707,9 @@ cc-matcher-bucket-jeg-v1/
   aspect-match-results/                 # Bulk Aspect Match runs (written from Streamlit, no job)
     aspect_match_2026-08-18_15-30-00/
       results.csv
+  locks/                                # job run locks (gcs_write.acquire_lock) — one per job
+    drive-sync-job.json                 # {run_id, acquired_at, expires_at, released}; if_generation_match=0
+    fathom-sync-job.json                #   create-only; a released or expired lock may be taken over
   job-configs/                          # matching-job configs
     2026-04-16_10-30-00_ag-DOD-HHS_src-apollo.json
   matching-results/
@@ -1621,6 +1637,8 @@ The job resolves `folder_ids → client_key` through `drive-sync-configs/assignm
 
 `state: "running"` payloads are written at every 10-client checkpoint (`clients_done`/`clients_total`) and after **every** proposal (`proposals_done`/`proposals_total` + accumulated `new_client_proposals`) so the UI shows progress and a mid-run kill never loses completed proposal work; `files_skipped` is capped at 200 entries. `stopped_early: "timeout"` + `outcome: "deferred"` rows / `proposals_deferred` mean the time budget or proposal cap hit — re-running the same selection continues where it left off (already-synced files are skipped via `sync_state.json`). **Permanently unextractable files** (image-only PDFs, oversized exports, 404 shortcut targets — reasons matching `_PERMANENT_SKIP_MARKERS`) are marked synced with a `skip_reason` so they stop burning budget on every run; a Full re-scan retries them.
 
+**Concurrency (Phase 1.2, `gcs_write.py`):** the job takes a run lock (`locks/drive-sync-job.json`) in `__main__` before `main()` runs; a second execution (scheduled or a manual trigger) writes `{state: "skipped_locked"}` and exits 0 rather than racing. The lock ttl is this run's `task_timeout_s + 15 min`, so a killed run is taken over by the next; it is released in a `finally`. Parquet writes no longer rewrite the whole start-of-run snapshot — each checkpoint accumulates `{company_key: {col: val}}` and flushes via `gcs_write.read_modify_write`, which re-reads each blob fresh and writes under `if_generation_match`, so `fathom-sync-job`'s `client_meetings_*` columns written to the same file concurrently are preserved. `fathom-sync-job` has the identical lock + RMW treatment.
+
 #### One-time setup (run once — skip if job already exists)
 
 ```bash
@@ -1705,9 +1723,11 @@ nothing except `status.json`.
 
 #### Status schema (`fathom-jobs/{run_id}/status.json`)
 
+A `skipped_locked` state (just `{run_id, state, error}`) is written when another run holds `locks/fathom-sync-job.json` — see the drive-sync concurrency note (Phase 1.2); this job shares the identical run-lock + `gcs_write.read_modify_write` treatment.
+
 ```json
 {
-  "run_id": "...", "state": "running|complete|error", "dry_run": false,
+  "run_id": "...", "state": "running|complete|error|skipped_locked", "dry_run": false,
   "stopped_early": null, "note": "", "created_after": "2026-06-11T00:00:00Z",
   "meetings_swept": 412, "meetings_new": 37, "meetings_ingested": 33,
   "meetings_deferred": 4,

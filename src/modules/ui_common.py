@@ -15,18 +15,26 @@ intended end state, down from fourteen.
 """
 
 import io
-import json
 
 import pandas as pd
 import streamlit as st
-from google.cloud import run_v2, storage
+from google.cloud import storage
 from google.oauth2 import service_account
 
 import src.modules.pools as pl
 
-# ── Constants ──────────────────────────────────────────────────────────────
+# The Cloud Run job trio lives in the Streamlit-free job_control.py so jobs and
+# the MCP server can trigger jobs too; re-exported here so views keep calling
+# uc.write_job_config / uc.trigger_job / uc.poll_status / uc.job_name unchanged.
+from src.modules.job_control import (  # noqa: F401
+    BUCKET,
+    job_name,
+    poll_status,
+    trigger_job,
+    write_job_config,
+)
 
-BUCKET          = 'cc-matcher-bucket-jeg-v1'
+# ── Constants ──────────────────────────────────────────────────────────────
 
 TOPICS_PREFIX   = 'data/all-topics/processed/'
 AWARDS_PREFIX   = 'data/all-topics/awards/'
@@ -34,17 +42,6 @@ CONTACTS_PREFIX = 'data/all-contacts/'
 CLIENTS_PREFIX  = 'data/all-contacts/clients/'
 PROSPECTS_PREFIX = pl.PROSPECTS_PREFIX
 RESUMES_PREFIX  = 'data/resumes/'
-
-_JOB_PARENT = 'projects/cc-matcher-v1/locations/us-central1/jobs/'
-
-
-def job_name(job: str) -> str:
-    """'sam-gov-job' -> the fully-qualified Cloud Run Jobs resource name.
-
-    An already-qualified name is returned unchanged, so callers that still
-    hold a full 'projects/.../jobs/x' constant can pass it straight through.
-    """
-    return job if job.startswith('projects/') else f'{_JOB_PARENT}{job}'
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────
@@ -168,45 +165,5 @@ def load_parquets_from_prefix(
     return pd.concat(frames, ignore_index=True)
 
 
-# ── Cloud Run job plumbing ─────────────────────────────────────────────────
-
-def write_job_config(
-    client: storage.Client, cfg_prefix: str, config: dict
-) -> str:
-    """Stage a job config blob and return its path (the job's only argv)."""
-    blob_path = f"{cfg_prefix}{config['run_id']}.json"
-    client.bucket(BUCKET).blob(blob_path).upload_from_string(
-        json.dumps(config), content_type='application/json'
-    )
-    return blob_path
-
-
-def trigger_job(credentials, job: str, config_blob_path: str) -> None:
-    """Execute a Cloud Run Job with the config blob path as its argument.
-
-    `job` is the short name ('drive-sync-job'). This uses runWithOverrides,
-    which requires roles/run.admin on the job for matcher-app@ — plain
-    roles/run.invoker is not enough.
-    """
-    run_v2.JobsClient(credentials=credentials).run_job(
-        request=run_v2.RunJobRequest(
-            name=job_name(job),
-            overrides=run_v2.RunJobRequest.Overrides(
-                container_overrides=[
-                    run_v2.RunJobRequest.Overrides.ContainerOverride(
-                        args=[config_blob_path]
-                    )
-                ]
-            ),
-        )
-    )
-
-
-def poll_status(
-    client: storage.Client, status_prefix: str, run_id: str
-) -> dict | None:
-    """The job's status.json, or None if it has not been written yet."""
-    blob = client.bucket(BUCKET).blob(f'{status_prefix}{run_id}/status.json')
-    if not blob.exists():
-        return None
-    return json.loads(blob.download_as_text())
+# Cloud Run job plumbing (write_job_config / trigger_job / poll_status /
+# job_name) is imported from src.modules.job_control at the top of this file.
