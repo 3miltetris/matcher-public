@@ -112,6 +112,30 @@ BRIEFING = (
 
 
 # ── The one real tool our process executes (Drive read, ADC) ─────────────────
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+
+def _drive_credentials():
+    """Prefer the matcher-app@ service account from .streamlit/secrets.toml (a
+    viewer of the client shared drive, exactly as drive-sync-job uses it), since
+    user ADC with the Drive scope is often blocked by org policy. Fall back to
+    ADC if the secrets file is absent."""
+    import pathlib
+    import tomllib
+
+    from google.oauth2 import service_account
+
+    p = pathlib.Path(".streamlit/secrets.toml")
+    if p.exists():
+        sa = tomllib.load(open(p, "rb")).get("gcp_service_account")
+        if sa:
+            return service_account.Credentials.from_service_account_info(
+                dict(sa), scopes=DRIVE_SCOPES)
+    from google.auth import default as adc_default
+    creds, _ = adc_default(scopes=DRIVE_SCOPES)
+    return creds
+
+
 def list_folder(folder_id: str) -> str:
     """Return a compact JSON listing of a real Drive folder's direct children.
 
@@ -119,11 +143,9 @@ def list_folder(folder_id: str) -> str:
     calls Drive v3 directly so it has no repo import and stays throwaway. Emails
     are reduced to their domain, matching the Phase 3 tool contract (never leak
     a person's address to the model)."""
-    from google.auth import default as adc_default
     from googleapiclient.discovery import build
 
-    creds, _ = adc_default(scopes=["https://www.googleapis.com/auth/drive.readonly"])
-    svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+    svc = build("drive", "v3", credentials=_drive_credentials(), cache_discovery=False)
     resp = svc.files().list(
         q=f"'{folder_id}' in parents and trashed = false",
         fields="files(name,mimeType,modifiedTime,lastModifyingUser/emailAddress)",
@@ -267,13 +289,28 @@ def main(folder_id: str) -> None:
         findings["questions"]["Q7_event_types_seen"] = event_types_seen
 
     finally:
-        # Q6: delete the session (and its container + history). Done in finally
-        # so a mid-run failure still cleans up — the Phase 3 orchestrator does
-        # the same, plus a startup sweep of stale sessions.
+        # Q6: delete the session (and its container + history). FINDING: a
+        # session that is still `running` cannot be deleted (400 "Cannot delete
+        # session while it is running"), so interrupt first and wait until it is
+        # no longer running, THEN delete. Done in finally so a mid-run failure
+        # still cleans up — the Phase 3 orchestrator does the same, plus a
+        # startup sweep of stale sessions.
+        try:
+            client.beta.sessions.events.send(
+                session_id=session.id, events=[{"type": "user.interrupt"}])
+        except Exception:
+            pass
+        for _ in range(8):
+            try:
+                if client.beta.sessions.retrieve(session_id=session.id).status != "running":
+                    break
+            except Exception:
+                break
+            time.sleep(3)
         try:
             client.beta.sessions.delete(session_id=session.id)
             print(f"[cleanup] deleted session {session.id}", flush=True)
-            findings["questions"]["Q6_delete"] = "client.beta.sessions.delete(session_id) ok"
+            findings["questions"]["Q6_delete"] = "interrupt -> wait !running -> sessions.delete ok"
         except Exception as e:
             print(f"[cleanup] session delete failed: {e}", flush=True)
             findings["questions"]["Q6_delete"] = f"FAILED: {e}"

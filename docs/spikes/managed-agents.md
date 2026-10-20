@@ -19,7 +19,9 @@ we answer custom-tool calls with results.
 whose `client.beta` has **no** `agents` / `sessions` / `environments` / `vaults`
 namespaces — Managed Agents is absent. That version is also below the repo's own
 `anthropic>=1.3.0,<2` pin (CLAUDE.md "SDK version pins"). Managed Agents (beta
-`managed-agents-2026-04-01`) needs a newer SDK still. So before running the spike:
+`managed-agents-2026-04-01`) needs a newer SDK still — **`anthropic 1.15.0`
+exposes it** (`agents`/`sessions`/`environments` all present; measured
+2026-10-20 in a throwaway venv). So before running the spike:
 ```
 pip install -U anthropic
 python -c "import anthropic;c=anthropic.Anthropic(api_key='x');print(anthropic.__version__, hasattr(c.beta,'agents'), hasattr(c.beta,'sessions'))"
@@ -41,6 +43,44 @@ The script prints a `FINDINGS` JSON block at the end — paste the runtime cells
 **Exit criterion:** one custom tool runs against a real Drive folder, a dummy
 proposal is submitted via the terminal tool, usage is reported, the session is
 deleted. The script does all of this and prints each result.
+
+---
+
+## Run 1 — 2026-10-20 (real session, folder `1KJdX2io…`)
+
+**The Managed Agents beta IS enabled on the matcher's Anthropic key** —
+`agents.create` / `environments.create` / `sessions.create` all succeeded
+(`agent_018ji…` v1, `env_01VA7…`, `sesn_01FHL…`). This was the biggest Phase 3
+risk; it is retired. The full path ran: the agent took its turn, called the
+`list_folder` custom tool, we executed it in-process, it called the terminal
+`submit_proposal`, we captured the structured proposal, read `usage`, and
+deleted the session. **list cost: $0.01**, active 8.7s.
+
+Two caveats from Run 1, both since resolved:
+1. **Drive read failed with a reauth error** — the custom-tool *round-trip*
+   worked, but user ADC was stale/under-scoped. Org policy then **blocked**
+   `gcloud auth application-default login` with the Drive scope entirely, so the
+   spike's `list_folder` now uses the **`matcher-app@` service-account key from
+   `.streamlit/secrets.toml`** (already a shared-drive viewer, as drive-sync-job
+   uses it) — no ADC, no org block.
+2. **`sessions.delete` 400'd on a running session** — see Q6. Fixed (interrupt →
+   wait → delete).
+
+## Run 2 — 2026-10-20 (real Drive read, end-to-end PASS)
+
+With the service-account Drive path, the agent read the folder's 7 files and
+returned the **correct, grounded** decision — the Phase 3 job working for real:
+```json
+{"decision": "existing_client", "company_name": "Cell X Technologies",
+ "confidence": "high",
+ "evidence": ["Two subfolders named after the company ...", "A 'Contracts' folder ...",
+              "NIH SBIR Phase I proposal materials ...", "Consistent Apr–Jun 2026 timestamps ..."]}
+```
+Every exit-criterion item met: custom tool ran against a **real** Drive folder,
+structured proposal submitted, usage reported (`list_cost` $0.02, active 13.7s),
+and the session **self-deleted** (`deleted session sesn_01YXgn…`). Only built-in
+events were `agent.custom_tool_use` (Q2 holds — no bash/files/web). Leftover
+`agent_019J9k…` / `env_01LzX7…` are harmless reusable config.
 
 ---
 
@@ -67,10 +107,12 @@ _Runtime check:_ confirm the agent never emits `agent.tool_use` (built-in) event
 **Confirmed (docs) + runtime.** A terminal custom tool `submit_proposal` whose
 `input_schema` **is** the proposal schema. When the agent calls it, `event.input`
 is the structured proposal — captured directly, no parsing of free text.
-_Runtime cell — the captured proposal:_
+_Runtime cell (Run 1) — the captured proposal, exactly as `submit_proposal` input:_
+```json
+{"confidence": "low", "decision": "unsure",
+ "evidence": ["list_folder ... failed with a reauthentication error. No ... could be retrieved."]}
 ```
-<paste findings.questions.Q3_structured_output>
-```
+Confirmed: the terminal tool's `input` arrives as the structured proposal object, no text parsing.
 
 ### Q4 — Budgets
 **Confirmed (docs).** Two independent caps:
@@ -90,20 +132,31 @@ totals, `server_tool_use` counts, `active_seconds`, and **`list_cost`**
 (`{amount, currency}`, minor units, list-price — not the contracted price).
 Per-turn detail is on `span.model_request_end.model_usage`. Phase 3 writes
 `list_cost` into `status.json` like every other job's `cost_usd`.
-_Runtime cell — reported usage:_
+_Runtime cell (Run 1) — reported usage object:_
 ```
-<paste findings.questions.Q5_usage>
+BetaManagedAgentsSessionUsage(active_seconds=8.745,
+  cache_creation=BetaManagedAgentsCacheCreationUsage(ephemeral_1h_input_tokens=0, ephemeral_5m_input_tokens=1600),
+  cache_read_input_tokens=1425, input_tokens=4, output_tokens=381,
+  list_cost=BetaMonetaryAmount(amount='1', currency='USD'),   # '1' = 1 cent = $0.01
+  server_tool_use=BetaManagedAgentsServerToolUsage(web_fetch_requests=0, web_search_requests=0))
 ```
+`list_cost.amount` is minor units (cents) as a string, same shape as the budget. Write this to `status.json`.
 
 ### Q6 — Deletion
-**Confirmed (docs).** `client.beta.sessions.delete(session_id)` permanently
-deletes the session, its event history, container, and checkpoints — this is what
-decision 0.1(a) requires. Files the agent wrote are listed via
-`client.beta.files.list(scope_id=session.id, betas=["managed-agents-2026-04-01"])`
-and deleted via the Files API. Agents/environments are reusable and are
-**archived, not deleted** (archive is permanent, no unarchive — confirm with a
-human; never as routine cleanup). The spike deletes the session in a `finally`.
-_Runtime cell:_ `<paste findings.questions.Q6_delete>`
+**Confirmed + refined by Run 1.** `client.beta.sessions.delete(session_id)`
+permanently deletes the session, its event history, container, and checkpoints —
+what decision 0.1(a) requires. **FINDING: you cannot delete a `running` session**
+— Run 1 got `400 invalid_request_error: "Cannot delete session while it is
+running. Send an interrupt event or wait for the session to complete."` So the
+correct teardown is **`user.interrupt` → poll until `status != "running"` →
+`delete`** (verified: interrupt → status `idle` → `SESSION DELETED`). The spike's
+`finally` now does exactly this; the Phase 3 orchestrator must too, and its
+startup stale-session sweep should interrupt-then-delete as well. Files the agent
+wrote are listed via `client.beta.files.list(scope_id=session.id,
+betas=["managed-agents-2026-04-01"])` and deleted via the Files API.
+Agents/environments are reusable and are **archived, not deleted** (archive is
+permanent, no unarchive — confirm with a human; never routine cleanup).
+_Runtime cell (Run 1):_ `interrupt -> wait !running -> sessions.delete ok`
 
 ### Q7 — Refusals (the one genuinely empirical question)
 **Not documented explicitly — must be observed.** Errors surface as
@@ -116,12 +169,20 @@ biologics — see the Inaedis note in CLAUDE.md) and record what appears:
 - does a `session.error` fire? with what body?
 - what is `session.status_idle.stop_reason.type` on a decline?
 - is there an `agent.message` refusal, or empty content?
-_Runtime cell — event types seen (and on the biologics re-run):_
+_Runtime cell (Run 1 — clean folder, NO refusal) — the full event taxonomy:_
 ```
-<paste findings.questions.Q7_event_types_seen for a normal folder AND a biologics folder>
+session.thread_status_running(1), user.message(1), span.model_request_start(2),
+agent.thinking(2), agent.message(2), agent.custom_tool_use(2),
+span.model_request_end(2), session.thread_status_idle(2), session.usage(2),
+session.status_idle(2)
 ```
-Phase 3's fallback (3.7) — decline → end session → one-shot Haiku path — keys off
-whatever this run shows, so fill it in before building 3.7.
+- A normal "done / waiting" idle carries `stop_reason` type **`requires_action`**
+  (`BetaManagedAgentsSessionRequiresAction`) when blocked on a custom-tool result.
+- No `session.error` and no built-in `agent.tool_use` fired (confirms Q2).
+- **Still TODO: the biologics re-run.** This clean run gives the baseline; re-run
+  against the Inaedis-type trigger material and diff the event types + the idle
+  `stop_reason.type` to capture what a decline looks like. Phase 3's fallback
+  (3.7) keys off that, so capture it before building 3.7.
 
 ---
 
