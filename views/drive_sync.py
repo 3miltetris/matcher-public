@@ -30,7 +30,7 @@ import streamlit as st
 from google.cloud import storage
 from google.oauth2 import service_account
 
-from src.modules import drive_client, folder_match
+from src.modules import drive_client, drive_scan, folder_match
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 import src.modules.ui_common as uc
@@ -341,76 +341,19 @@ def render():
 
         if st.button('🔍 Scan sections & auto-assign', key='ds_scan_btn') and picked:
             section_by_name = {s['name']: s['id'] for s in sections}
-            n_new_auto = n_new_unassigned = n_seen = 0
+            section_list = [{'id': section_by_name[n], 'name': n} for n in picked]
             try:
-                svc = _get_drive_service()
-                prog = st.progress(0.0)
-                newly_matched: dict[str, list[tuple[str, str, float, dict]]] = {}
-                for i, sec_name in enumerate(picked):
-                    prog.progress((i + 1) / len(picked), text=f'Scanning {sec_name}…')
-                    folders = drive_client.list_child_folders(
-                        svc, drive_id, section_by_name[sec_name])
-                    for folder in folders:
-                        fid = folder['id']
-                        n_seen += 1
-                        if (fid in assign_doc['assignments']
-                                or fid in assign_doc['skipped']):
-                            continue
-                        key, tier, score = _match_folder(
-                            _normalize(folder['name']), client_norms)
-                        if key:
-                            newly_matched.setdefault(key, []).append(
-                                (fid, tier, score,
-                                 {'folder_name': folder['name'], 'section': sec_name}))
-                        elif fid not in assign_doc['unassigned']:
-                            assign_doc['unassigned'][fid] = {
-                                'folder_name': folder['name'],
-                                'section':     sec_name,
-                                'first_seen':  date.today().isoformat(),
-                                'note':        f'no match >= {_FUZZY_THRESHOLD} (best {score:.2f})',
-                            }
-                            n_new_unassigned += 1
-                prog.empty()
-
-                # Collision rule: multiple new folders matching one client are all
-                # kept only when every match is exact; otherwise best score wins
-                # and the rest go to review. A non-exact match to a client that
-                # already has a folder assigned goes to review too.
-                for key, matches in newly_matched.items():
-                    already_assigned = any(
-                        a.get('client_key') == key
-                        for a in assign_doc['assignments'].values())
-                    all_exact = all(t == 'exact' for _, t, _, _ in matches)
-                    if all_exact:
-                        keep = matches
-                    elif already_assigned:
-                        keep = []
-                    else:
-                        keep = [max(matches, key=lambda m: m[2])]
-                    kept_ids = {m[0] for m in keep}
-                    for fid, tier, score, meta in matches:
-                        if fid in kept_ids:
-                            assign_doc['assignments'][fid] = {
-                                **meta,
-                                'client_key':  key,
-                                'match_type':  'auto',
-                                'assigned_at': date.today().isoformat(),
-                            }
-                            assign_doc['unassigned'].pop(fid, None)
-                            n_new_auto += 1
-                        else:
-                            assign_doc['unassigned'][fid] = {
-                                **meta,
-                                'first_seen': date.today().isoformat(),
-                                'note': f'{tier} match ({score:.2f}) to already-matched '
-                                        f'client — review',
-                            }
-                            n_new_unassigned += 1
-
-                _save_assignments(gcs, assign_doc)
+                # Streamlit-free core, shared with the scheduled drive-sync-job.
+                with st.spinner(f'Scanning {len(section_list)} section(s)…'):
+                    result = drive_scan.scan_and_assign(
+                        _get_drive_service(), drive_id, section_list,
+                        assign_doc, client_norms)
+                _save_assignments(gcs, result.assignments)
                 st.success(
-                    f'Scanned {n_seen} folders — {n_new_auto} newly auto-assigned, '
-                    f'{n_new_unassigned} sent to review. Existing assignments untouched.'
+                    f'Scanned {result.folders_seen} folders — '
+                    f'{len(result.new_auto)} newly auto-assigned, '
+                    f'{len(result.new_unassigned)} sent to review. '
+                    f'Existing assignments untouched.'
                 )
                 st.rerun()
             except Exception as e:

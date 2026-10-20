@@ -63,8 +63,9 @@ from google.cloud import storage
 from openai import OpenAI
 
 import src.modules.anthropic_utils as au
-from src.modules import doc_extract, drive_client
+from src.modules import attention, doc_extract, drive_client, drive_scan
 from src.modules import gcs_write as gw
+from src.modules import job_control as jc
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -208,6 +209,21 @@ def _group_mask(df: pd.DataFrame, key: str) -> pd.Series:
     names    = df.get('company_name', pd.Series('', index=df.index)).fillna('').astype(str).str.strip()
     websites = df.get('companyWebsite', pd.Series('', index=df.index)).fillna('').astype(str).str.strip()
     return (names == name) & (websites == website)
+
+
+def _name_by_key(frames: dict[str, pd.DataFrame]) -> dict[str, str]:
+    """{company_key: company_name} across all client frames — the input to
+    drive_scan's name matching (scheduled mode)."""
+    out: dict[str, str] = {}
+    for df in frames.values():
+        if 'company_name' not in df.columns or 'companyWebsite' not in df.columns:
+            continue
+        names = df['company_name'].fillna('').astype(str).str.strip()
+        sites = df['companyWebsite'].fillna('').astype(str).str.strip()
+        for name, site in zip(names, sites):
+            if name or site:
+                out.setdefault(f'{name}||{site}', name)
+    return out
 
 
 # ── Embedding ──────────────────────────────────────────────────────────────────
@@ -456,6 +472,8 @@ def main(config_blob_path: str) -> None:
     config = json.loads(gcs.bucket(_BUCKET).blob(config_blob_path).download_as_text())
 
     run_id       = config['run_id']
+    if run_id == 'daily':   # Cloud Scheduler sentinel — stamp a real id per run
+        run_id = datetime.now(timezone.utc).strftime('drive_sync_%Y-%m-%d_%H-%M-%S')
     drive_id     = config['drive_id']
     folder_ids   = config.get('folder_ids', [])
     new_folders  = config.get('new_client_folder_ids', [])
@@ -465,6 +483,15 @@ def main(config_blob_path: str) -> None:
     char_cap     = int(config.get('per_client_char_cap', 150_000))
     max_props    = int(config.get('max_proposals', _DEFAULT_MAX_PROPOSALS))
     model        = config.get('model', _DEFAULT_MODEL)
+
+    # Scheduled mode (Phase 2.2): scan sections -> auto-assign -> sync EVERY
+    # assigned client -> attention queue -> chain profile rebuilds. Defaults keep
+    # manual behaviour: a config without `mode` runs exactly as before.
+    mode             = config.get('mode', 'manual')
+    scheduled        = (mode == 'scheduled')
+    scan_sections    = config.get('scan_sections', [])
+    chain_profiles   = bool(config.get('chain_profiles', True))
+    onboard_unmatched = bool(config.get('onboard_unmatched', True))
 
     task_timeout_s = max(_MIN_TASK_TIMEOUT_S,
                          min(int(config.get('task_timeout_s',
@@ -507,6 +534,27 @@ def main(config_blob_path: str) -> None:
     print('Loading client frames…', flush=True)
     frames = _load_client_frames(gcs)
     print(f'  {len(frames)} parquet files', flush=True)
+
+    scan_counts = {'seen': 0, 'auto': 0, 'review': 0}
+    if scheduled:
+        # Discover + auto-assign new folders, then sync EVERY assigned client.
+        norms = drive_scan.client_norms(_name_by_key(frames))
+        section_list = [{'id': s, 'name': s} for s in scan_sections]
+        if section_list and not dry_run:
+            try:
+                res = drive_scan.scan_and_assign(
+                    svc, drive_id, section_list, assignments_doc, norms)
+                _save_json_blob(gcs, _ASSIGN_BLOB, assignments_doc)
+                scan_counts = {'seen': res.folders_seen, 'auto': len(res.new_auto),
+                               'review': len(res.new_unassigned)}
+                print(f'  scan: {scan_counts["seen"]} seen, {scan_counts["auto"]} '
+                      f'auto-assigned, {scan_counts["review"]} to review', flush=True)
+            except Exception as e:
+                print(f'  WARN scheduled scan failed: {e}', flush=True)
+        assignments = assignments_doc.get('assignments', {})
+        unassigned  = assignments_doc.get('unassigned', {})
+        folder_ids  = list(assignments.keys())   # sync all assigned clients
+        new_folders = []                          # scheduled runs make no one-shot proposals
 
     # Group assigned folders by client_key
     groups: dict[str, list[dict]] = {}
@@ -845,12 +893,72 @@ def main(config_blob_path: str) -> None:
             'error': None,
         })
 
+    # ── Scheduled mode: attention queue (2.5) + profile chaining (2.3) ─────────
+    profile_run_id = None
+    attention_written = 0
+    if scheduled and not dry_run:
+        items = []
+        if onboard_unmatched:
+            # Until the Phase 3 onboarding agent exists, unmatched folders land
+            # in the attention queue instead of generating one-shot proposals.
+            for fid, u in assignments_doc.get('unassigned', {}).items():
+                items.append({
+                    'kind': 'drive_unmatched_folder', 'subject_key': fid,
+                    'subject_label': u.get('folder_name', ''),
+                    'source_job': 'drive-sync-job', 'run_id': run_id,
+                    'detail': {'section': u.get('section', ''), 'note': u.get('note', '')},
+                })
+        for r in results:
+            ck = r.get('client_key', '')
+            if not ck:
+                continue
+            if r.get('outcome') == 'deferred':
+                items.append({'kind': 'drive_deferred', 'subject_key': ck,
+                              'subject_label': ck.split('||', 1)[0],
+                              'source_job': 'drive-sync-job', 'run_id': run_id,
+                              'detail': {'note': r.get('note', '')}})
+            elif r.get('outcome') == 'error':
+                items.append({'kind': 'drive_extract_failed', 'subject_key': ck,
+                              'subject_label': ck.split('||', 1)[0],
+                              'source_job': 'drive-sync-job', 'run_id': run_id,
+                              'detail': {'note': r.get('note', '')}})
+        try:
+            attention_written = attention.enqueue(gcs, items)
+        except Exception as e:
+            print(f'  WARN attention enqueue failed: {e}', flush=True)
+
+        # Chain a profile rebuild for clients whose material changed this run.
+        changed_keys = sorted({r.get('client_key') for r in results
+                               if r.get('outcome') == 'updated' and r.get('client_key')})
+        if chain_profiles and changed_keys:
+            try:
+                from google.cloud import run_v2
+                profile_run_id = datetime.now(timezone.utc).strftime(
+                    'client_profile_%Y-%m-%d_%H-%M-%S_drivechain')
+                path = jc.write_job_config(gcs, 'client-profile-configs/', {
+                    'run_id': profile_run_id, 'pool': 'clients',
+                    'company_keys': changed_keys,
+                    'sources': ['website', 'drive', 'technology'],
+                    'target_aspects': 4, 'max_markets': 4,
+                    'assess_defense': True, 'assess_unexplored': True,
+                    'max_unexplored': 3, 'model': _DEFAULT_MODEL,
+                    'concurrency': 4, 'dry_run': False,
+                })
+                jc.trigger_job(None, 'client-profile-job', path,
+                               jobs_client=run_v2.JobsClient())
+                print(f'  chained client-profile-job {profile_run_id} for '
+                      f'{len(changed_keys)} client(s)', flush=True)
+            except Exception as e:
+                profile_run_id = None
+                print(f'  WARN profile chaining failed: {e}', flush=True)
+
     # ── Final checkpoint + status ─────────────────────────────────────────────
     _checkpoint('running', total_groups, total_groups)
     _write_status(gcs, run_id, {
         'run_id':            run_id,
         'state':             'complete',
         'dry_run':           dry_run,
+        'mode':              mode,
         'stopped_early':     stopped_early,
         'task_timeout_s':    task_timeout_s,
         'max_proposals':     max_props,
@@ -864,6 +972,9 @@ def main(config_blob_path: str) -> None:
         'results':           results,
         'new_client_proposals': proposals,
         'proposals_deferred':   proposals_deferred,
+        'scan':              scan_counts,
+        'attention_written': attention_written,
+        'profile_run_id':    profile_run_id,
         'error':             None,
     })
     print(f'\nDone. {clients_updated} updated, {clients_unchanged} unchanged, '

@@ -88,6 +88,17 @@ src/
                               #   ui_common.py so jobs (and the future MCP server) can trigger jobs without
                               #   Streamlit; trigger_job takes an optional jobs_client for a job triggering
                               #   another job over ADC (mirrors intake/profile_trigger.py)
+    attention.py              # Attention queue (Phase 2.5) — Streamlit-free store at
+                              #   data/attention/queue.parquet for anything a scheduled job
+                              #   can't resolve (unmatched Drive folder, unattributed Fathom
+                              #   domain, profile error, deferred client). enqueue (dedup on
+                              #   (kind, subject_key) among OPEN rows, via gcs_write), resolve,
+                              #   load, open_counts (Home 'Needs attention' panel)
+    drive_scan.py             # Drive scan + fuzzy auto-assign (Phase 2.1) — lifted out of
+                              #   views/drive_sync.py so the scheduled drive-sync-job can
+                              #   discover folders too. scan_and_assign(svc, drive_id, sections,
+                              #   assign_doc, norms) with the view's exact collision rule;
+                              #   shared by the view + the job (one implementation)
     gcs_write.py              # Streamlit-free generation-guarded parquet writes + the job run lock
                               #   (Stage 11.5). read_modify_write(blob, mutate_fn) re-reads each blob at
                               #   write time and writes under if_generation_match, retrying the 412, so
@@ -687,6 +698,8 @@ cc-matcher-bucket-jeg-v1/
       prospect_profiles.parquet         # the same schema for the prospect pool — a separate blob, not a `pool` column (see Stage 11)
     deleted-clients/                    # backups written before any client deletion — restore source if a delete was a mistake
       deleted_2026-08-19_a3f9c1.parquet # the removed rows + _deleted_from / _deleted_at / _deleted_by columns
+    attention/                          # Phase 2.5 — the attention queue
+      queue.parquet                     # id, kind, source_job, run_id, subject_key, subject_label, detail, created_at, status, resolved_by, resolved_at (dedup on open (kind,subject_key))
   admin-config/
     admins.json                         # {admins: [email], updated_at, updated_by, history: [{at, by, note}]} — super admins are NOT in here (code constant)
     intake_allowlist.json               # {domains, emails, updated_at, updated_by, history} — who may open the DD intake form (Stage 14)
@@ -1610,9 +1623,22 @@ gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=co
   "per_client_char_cap":   150000,
   "max_proposals":         40,
   "task_timeout_s":        14400,
-  "model":                 "claude-sonnet-4-6"
+  "model":                 "claude-sonnet-4-6",
+
+  "mode":                  "manual",
+  "scan_sections":         ["<section folder ids to scan, scheduled mode>"],
+  "chain_profiles":        true,
+  "onboard_unmatched":     true
 }
 ```
+
+**Scheduled mode (Phase 2.2–2.5).** `mode: "scheduled"` makes the job self-driving (the Cloud Scheduler config is `drive-sync-configs/daily_schedule.json` with the `"run_id": "daily"` sentinel, stamped to a timestamp at runtime like sam-gov/deep-research): it runs `drive_scan.scan_and_assign` over `scan_sections` (auto-assigning new `{Client}_INTERNAL` folders, same rules as the view), then syncs **every** assigned client, then (2.5) writes unmatched folders / deferred clients / extract failures to the **attention queue** (`data/attention/queue.parquet`) instead of generating the one-shot proposals, then (2.3) if `chain_profiles` triggers **`client-profile-job`** (`pool: clients`, the clients whose material changed — `outcome: updated`) and records `profile_run_id` in the status. A config without `mode` keeps the exact manual behaviour. Status gains `mode`, `scan` (`{seen, auto, review}`), `attention_written`, `profile_run_id`. **Chaining needs IAM + image deps:** the drive-sync image now COPYs `job_control.py` / `attention.py` / `drive_scan.py` / `folder_match.py` and `requirements.drive_sync_job.txt` adds `google-cloud-run`; grant the trigger once:
+```
+gcloud run jobs add-iam-policy-binding client-profile-job --region us-central1 \
+  --member="serviceAccount:matching-job@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/run.admin" --project cc-matcher-v1
+```
+`fathom-sync-job` has the mirror treatment (`mode: "scheduled"`, `daily` sentinel): it writes unattributed domains to the attention queue (`fathom_unmatched_domain`, deduped so skipped domains are never re-offered) and never triggers another job. Both jobs are protected by the Phase 1 run lock. Cloud Scheduler entries (nightly, `America/Chicago`, drive-sync earlier than fathom to reduce contention) follow the `sam-gov-daily` / `deep-research-daily` pattern — the Scheduler OAuth SA (`matching-job@`) needs `roles/run.admin` on each job because the trigger body carries `containerOverrides`.
 
 The job resolves `folder_ids → client_key` through `drive-sync-configs/assignments.json` and groups multi-folder clients into one unit of work. `full_resync` bypasses the `sync_state.json` modifiedTime diff; `dry_run` reports outcomes without touching parquets or sync_state. **Time budget:** `task_timeout_s` (chosen in the view's "Time budget" selector — 1 h to 24 h, default 4 h; clamped to 900–86 400 s in the job) sets the window, and the job stops gracefully ~10 min before it (`stopped_early: "timeout"`), deferring remaining clients/proposals to the next run — a hard timeout kill would lose un-checkpointed work and leave no status file. The Cloud Run job is deployed with `--task-timeout 86400` (Cloud Run's 24 h maximum), so any selectable budget is safe; **never set `task_timeout_s` above the deployed task timeout**. When proposal candidates exist, the client phase gets a tighter deadline (90s reserved per planned proposal, capped at half the budget) so a heavy client sweep can't starve the proposals phase. **Proposal cap + rotation:** at most `max_proposals` new-client proposals per run (each ≈1 min: folder download + Claude call) — the view now sets it to the number of folders the user explicitly picked, so only the time budget can defer them; when it does bite, candidates are ordered never-proposed-first then least-recently-proposed via the `proposed` cursor in `sync_state.json` (advanced on non-dry runs only), so a large unassigned backlog drains across successive runs instead of re-proposing the same chunk.
 

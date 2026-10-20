@@ -15,8 +15,12 @@ COPY src/modules/doc_extract.py src/modules/doc_extract.py
 COPY src/modules/drive_client.py src/modules/drive_client.py
 # Generation-guarded parquet writes + run lock (Phase 1.2).
 COPY src/modules/gcs_write.py src/modules/gcs_write.py
-# job_control.py (+ google-cloud-run in requirements) lands here in Phase 2.3,
-# when scheduled mode triggers client-profile-job for changed clients.
+# Scheduled mode (Phase 2): scan/auto-assign, attention queue, and job_control
+# for chaining client-profile-job (needs google-cloud-run in requirements).
+COPY src/modules/attention.py src/modules/attention.py
+COPY src/modules/drive_scan.py src/modules/drive_scan.py
+COPY src/modules/folder_match.py src/modules/folder_match.py
+COPY src/modules/job_control.py src/modules/job_control.py
 
 ENV PYTHONPATH=/app
 

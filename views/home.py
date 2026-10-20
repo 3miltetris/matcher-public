@@ -14,8 +14,21 @@ repo caches by hand everywhere; there is no st.cache_data in views/).
 import streamlit as st
 
 import src.modules.aspect_profile as ap
+import src.modules.attention as attn
 import src.modules.pools as pl
 import src.modules.ui_common as uc
+
+# Attention kinds → (label, page to resolve them on). Resolution happens in the
+# existing page; this panel only surfaces the counts.
+_ATTENTION_PAGES = {
+    'drive_unmatched_folder':    ('Unmatched Drive folders', 'views/client_sync.py'),
+    'drive_onboarding_proposal': ('Onboarding proposals', 'views/client_sync.py'),
+    'drive_extract_failed':      ('Drive extraction failures', 'views/client_sync.py'),
+    'drive_deferred':            ('Deferred Drive clients', 'views/client_sync.py'),
+    'fathom_unmatched_domain':   ('Unattributed Fathom domains', 'views/client_sync.py'),
+    'profile_build_error':       ('Profile build errors', 'views/client_profiler.py'),
+    'profile_refusal_fallback':  ('Profile refusal fallbacks', 'views/client_profiler.py'),
+}
 
 # ── Pipeline map ───────────────────────────────────────────────────────────
 # (section, icon, page path, title, one-line description)
@@ -114,6 +127,36 @@ st.caption(
     'and companies come in on the left, get embedded, matched and re-ranked, '
     'and go out to HubSpot.'
 )
+
+st.divider()
+
+with st.expander('🔔 Needs attention', expanded=False):
+    st.caption(
+        'Items the scheduled Drive / Fathom jobs could not resolve on their own. '
+        'Reads one small parquet, so it is behind this button.'
+    )
+    if st.button('Check queue', key='home_attn'):
+        try:
+            st.session_state.home_attention = attn.open_counts(uc.get_storage_client())
+        except Exception as e:
+            st.session_state.home_attention = {'_error': str(e)}
+
+    counts = st.session_state.get('home_attention')
+    if counts is None:
+        st.info('Not checked yet.')
+    elif '_error' in counts:
+        st.warning(f'Could not read the attention queue: {counts["_error"]}')
+    elif not counts:
+        st.success('Nothing needs attention.')
+    else:
+        for kind, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            label, page = _ATTENTION_PAGES.get(kind, (kind, None))
+            link, cnt = st.columns([3, 1])
+            if page:
+                link.page_link(page, label=label, icon='⚠️')
+            else:
+                link.write(f'⚠️ {label}')
+            cnt.metric('open', n, label_visibility='collapsed')
 
 st.divider()
 

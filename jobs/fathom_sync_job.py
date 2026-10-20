@@ -65,6 +65,7 @@ from anthropic import Anthropic
 from google.cloud import storage
 
 import src.modules.anthropic_utils as au
+from src.modules import attention
 from src.modules import fathom_client as fc
 from src.modules import gcs_write as gw
 import src.modules.pools as pl
@@ -361,6 +362,10 @@ def main(config_blob_path: str) -> None:
         raise RuntimeError(f'Config blob not found: {config_blob_path}')
 
     run_id         = config['run_id']
+    if run_id == 'daily':   # Cloud Scheduler sentinel — stamp a real id per run
+        run_id = datetime.now(timezone.utc).strftime('fathom_%Y-%m-%d_%H-%M-%S')
+    mode           = config.get('mode', 'manual')
+    scheduled      = (mode == 'scheduled')
     wanted_keys    = [k for k in (config.get('client_keys') or []) if k]
     lookback_days  = max(1, int(config.get('lookback_days') or _DEFAULT_LOOKBACK_DAYS))
     created_after  = str(config.get('created_after') or '').strip()
@@ -737,8 +742,26 @@ def main(config_blob_path: str) -> None:
 
     _checkpoint('running', total, total)
 
+    # Scheduled mode (Phase 2.4): unattributed domains go to the attention queue
+    # (one entry per domain; dedup never repeats them, and skipped domains never
+    # reach `unmatched`, so they are never offered). Not an agent — a human
+    # triages them in the Fathom Meetings view.
+    attention_written = 0
+    if scheduled and not dry_run and unmatched:
+        try:
+            attention_written = attention.enqueue(gcs, [{
+                'kind': 'fathom_unmatched_domain', 'subject_key': dom,
+                'subject_label': dom, 'source_job': 'fathom-sync-job', 'run_id': run_id,
+                'detail': {'meeting_count': e.get('meeting_count', 0),
+                           'sample_titles': (e.get('sample_titles') or [])[:3],
+                           'crm_companies': (e.get('crm_companies') or [])[:3]},
+            } for dom, e in unmatched.items()])
+        except Exception as e:
+            print(f'  WARN attention enqueue failed: {e}', flush=True)
+
     _write_status(gcs, run_id, {
         'run_id': run_id, 'state': 'complete', 'dry_run': dry_run,
+        'mode': mode, 'attention_written': attention_written,
         'stopped_early': stopped_early, 'note': sweep_note,
         'created_after': created_after,
         'meetings_swept': swept, 'meetings_new': new_attributed,
