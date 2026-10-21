@@ -629,6 +629,13 @@ def main(config_blob_path: str) -> None:
                 for f in drive_client.list_files_recursive(svc, drive_id, g['id']):
                     listed.append({**f, 'top_folder': g['id']})
             listed = [f for f in listed if drive_client.is_extractable(f)]
+            # Skip files an onboarding approval excluded (Phase 3.8). The field
+            # is backward-compatible: assignments without it exclude nothing.
+            excluded_here = set()
+            for g in group_folders:
+                excluded_here.update(g.get('excluded_file_ids') or [])
+            if excluded_here:
+                listed = [f for f in listed if f['id'] not in excluded_here]
             files_scanned += len(listed)
 
             listed_ids = {f['id'] for f in listed}

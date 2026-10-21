@@ -31,6 +31,8 @@ from google.cloud import storage
 from google.oauth2 import service_account
 
 from src.modules import drive_client, drive_scan, folder_match
+from src.modules import onboarding as ob
+from src.modules import onboarding_apply as oa
 from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 import src.modules.ui_common as uc
@@ -44,6 +46,8 @@ _STATUS_PREFIX   = 'drive-sync-jobs/'
 _ASSIGN_BLOB     = 'drive-sync-configs/assignments.json'
 _SYNC_STATE_BLOB = 'drive-sync-configs/sync_state.json'
 _JOB_NAME        = 'projects/cc-matcher-v1/locations/us-central1/jobs/drive-sync-job'
+_ONBOARD_JOB     = 'drive-onboard-job'
+_ONBOARD_CFG     = 'drive-onboard-configs/'
 _POLL_INTERVAL   = 10
 _SYNC_MODEL      = 'claude-sonnet-4-6'
 
@@ -455,6 +459,88 @@ def render():
                             }
                 _save_assignments(gcs, assign_doc)
                 st.success('Assignments saved.')
+                st.rerun()
+
+    # ── 3b · Onboarding proposals (Phase 3) ────────────────────────────────────
+
+    st.divider()
+    unmatched_fids = list(assign_doc['unassigned'].keys())
+    try:
+        onboard_props = ob.list_proposals(gcs, status='open')
+    except Exception:
+        onboard_props = []
+
+    oc1, oc2 = st.columns([3, 1])
+    oc1.subheader(f'🤖 Onboarding proposals ({len(onboard_props)})')
+    with oc2:
+        if unmatched_fids and st.button('🔎 Investigate unmatched', key='ds_onboard_run',
+                                        help='Run the onboarding agent on unmatched folders'):
+            try:
+                oid = datetime.now(timezone.utc).strftime('drive_onboard_%Y-%m-%d_%H-%M-%S')
+                uc.write_job_config(gcs, _ONBOARD_CFG, {
+                    'run_id': oid, 'select': 'ids', 'folder_ids': unmatched_fids,
+                    'drive_id': drive_id, 'max_folders': 10, 'dry_run': False})
+                uc.trigger_job(_get_credentials(), _ONBOARD_JOB, f'{_ONBOARD_CFG}{oid}.json')
+                st.success(f'Onboarding agent started on {len(unmatched_fids)} folder(s). '
+                           'Proposals appear here when it finishes (~7 min each).')
+            except Exception as e:
+                st.error(f'Could not start onboarding: {e}')
+
+    if not onboard_props:
+        st.caption('No open proposals. Investigate unmatched folders to generate some.')
+    for p in onboard_props:
+        fid = p.get('folder_id', '')
+        with st.expander(f"{p.get('folder_name') or fid} — "
+                         f"{p.get('decision')} ({p.get('confidence')})", expanded=False):
+            if p.get('outcome') != 'proposed':
+                st.warning(f"outcome: {p.get('outcome')} — {p.get('validation_errors')}")
+            if p.get('conflicts'):
+                st.caption('⚠️ Conflicts: ' + ' · '.join(p['conflicts']))
+            ev = p.get('evidence') or []
+            if ev:
+                st.markdown('\n'.join(
+                    f"- {e.get('claim', '')} _({e.get('source', '')})_" for e in ev))
+
+            edited_docs = p.get('documents') or []
+            if edited_docs:
+                ddf = pd.DataFrame([{'include': bool(d.get('include', True)),
+                                     'name': d.get('name', ''),
+                                     'category': d.get('category', ''),
+                                     'file_id': d.get('file_id', '')} for d in edited_docs])
+                edited_docs = st.data_editor(
+                    ddf, key=f'ds_docs_{fid}', hide_index=True,
+                    column_config={'file_id': st.column_config.TextColumn('file_id', disabled=True)}
+                ).to_dict('records')
+
+            default_key = p.get('company_key', '')
+            override_key = st.text_input('Target company_key (override)',
+                                         value=default_key, key=f'ds_key_{fid}')
+            c_app, c_dis = st.columns(2)
+            if c_app.button('✅ Approve & assign', key=f'ds_app_{fid}',
+                            disabled=p.get('decision') == 'unsure'):
+                overrides = {'excluded_file_ids': [d['file_id'] for d in edited_docs
+                                                   if not d.get('include', True)]}
+                if override_key and override_key != default_key:
+                    overrides['company_key'] = override_key
+                res = oa.apply(gcs, fid, overrides=overrides,
+                               actor=st.session_state.get('user_email', ''))
+                if res.get('ok'):
+                    try:
+                        sid = datetime.now(timezone.utc).strftime('drive_sync_%Y-%m-%d_%H-%M-%S')
+                        uc.write_job_config(gcs, _CFG_PREFIX, {
+                            'run_id': sid, 'drive_id': drive_id, 'folder_ids': [fid],
+                            'new_client_folder_ids': [], 'model': _SYNC_MODEL})
+                        uc.trigger_job(_get_credentials(), 'drive-sync-job',
+                                       f'{_CFG_PREFIX}{sid}.json')
+                    except Exception as e:
+                        st.warning(f'Assigned, but could not auto-trigger the sync: {e}')
+                    st.success(f'Approved — {res.get("client_key") or res.get("action")}.')
+                    st.rerun()
+                else:
+                    st.error('; '.join(res.get('errors') or ['apply failed']))
+            if c_dis.button('🚫 Dismiss', key=f'ds_dis_{fid}'):
+                p['review_status'] = 'dismissed'
+                ob.save_proposal(gcs, p)
                 st.rerun()
 
     # ── 4 · Sync ───────────────────────────────────────────────────────────────

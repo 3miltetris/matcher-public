@@ -381,6 +381,18 @@ Replaces the HubSpot due-diligence form with a public intake flow (`DD_INTAKE_PL
 - **Abuse limits:** Cloudflare Turnstile on link requests; in-memory rate limits (`--max-instances 2`): 20 link requests/IP/day, 5/email/hour, 10 new sessions/email/day, 60 writes/session/minute. `INTAKE_DEV=1` skips Turnstile when no secret is set, signs cookies with a throwaway key when `INTAKE_AUTH_SECRET` is unset, and logs the sign-in link instead of emailing it when SMTP is unset — never set it on the deployed service.
 - **Logs and alerts carry session ids, company names and step names only**, never answers or document text.
 
+**Stage 15 — Drive onboarding agent** (unmatched Drive folder → which company it belongs to)
+
+When the scheduled scan (Stage 7) can't tie a `{Company}_INTERNAL` folder to a client, a **Claude Managed Agents** agent investigates it and proposes the company + a document include/exclude list; a human approves in the Drive Sync view. Chosen data-handling (plan decision 0.1a): sessions are **deleted after each proposal is harvested**, plus a startup sweep of any session older than 24 h — nothing lingers.
+
+- **Agent-as-code** (`agents/drive_onboard/`): `system_prompt.md`, `tools.py` (the schemas the agent sees), `agent.py` (`python -m agents.drive_onboard.agent sync` creates/updates the agent + environment idempotently and stores their ids + a `prompt_version` hash in `drive-onboard/agent.json`). Model `claude-sonnet-4-6`. The agent has **only** custom tools — no bash/files/web.
+- **Tools** are host-side custom tools our process runs, so GCP/Drive creds never leave the job. Implementations live in `src/modules/tools/` (`drive_read.py`: list_folder / read_document / folder_domain_signals; `company_lookup.py`: search_companies / get_company) so the future MCP server reuses them. All read-only; emails are reduced to their **domain** before the model sees them.
+- **Proposal schema + validation** (`src/modules/onboarding.py`): the terminal `submit_proposal` tool's input **is** the proposal. The orchestrator re-checks every claim before saving — `company_key` must exist in the named pool, each evidence file id and each proposed document id must have been returned by a tool this session, and a `new_client` website must be a domain the tools surfaced (**never invented**); a failing proposal is saved `outcome: "error"`.
+- **`drive-onboard-job`** (`jobs/onboard_job.py`): batch over up to `max_folders` (default 10), oldest-first from the `drive_unmatched_folder` attention items (or explicit `select: "ids"` from the view's "🔎 Investigate unmatched" button). Per folder: create a session (budget `$1`), stream tool calls, enforce orchestrator budgets (`max_tool_calls` 30, `max_docs_read` 12, `max_chars_total` 120k, 6-min wall clock — a hit nudges the agent to submit), validate, write `drive-onboard/proposals/{folder_id}.json` + a `drive_onboarding_proposal` attention item, record `drive-onboard/state.json` (`proposed_at`/`attempts`, 30-day retry gate), and **delete the session** (interrupt → wait → delete). Config `drive-onboard-configs/{run_id}.json`, status `drive-onboard-jobs/{run_id}/status.json`.
+- **Review + approve** (Drive Sync view → "🤖 Onboarding proposals"; logic in Streamlit-free `src/modules/onboarding_apply.py`, reused by the view and later the MCP server): edit the document table, optionally override the target `company_key`, Approve. `existing_client` → assignment (`match_type: "agent_confirmed"` + `excluded_file_ids`); `existing_prospect` → `pool_transfer` promote then assign; `new_client` → a minimal client row (profile built by the next sync) + assign; `not_a_client` → `skipped`; `unsure` → left for manual. Approval triggers a per-folder `drive-sync-job` and resolves the attention item. `drive_sync_job` skips `excluded_file_ids` when collecting a client's documents (backward-compatible — assignments without the field exclude nothing).
+- **Shadow eval is the go-live gate** (`scripts/eval/onboard_shadow.py`): run the agent on already-assigned folders with each folder's true client hidden from `has_drive_assignment`, compare to ground truth. **Measured 2026-10-21 (N=10): wrong-company 0, wrong-at-high-confidence 0, 9/10 correct, 1 conservative `unsure` — go-live bar met.** Cost **~$0.28/folder**, latency **p50 ~6 min / p90 ~12 min** (so the nightly batch of 10 is ~$2.80 and ~1–1.5 h, inside the 4 h task timeout). The one miss was `unsure`, never a wrong attribution — the intended failure mode.
+- **Ops:** `jobs/Dockerfile.onboard` (COPYs the whole `src/` + `agents/`; no Chromium), `requirements.onboard_job.txt` (**`anthropic>=1.15.0,<2`** — Managed Agents needs ≥1.15, above the repo-wide 1.3 pin; verify `client.beta.agents` exists before bumping), `cloudbuild.onboard.yaml`. Build: `gcloud builds submit --config cloudbuild.onboard.yaml --project cc-matcher-v1 .` then `gcloud run jobs update drive-onboard-job --image …/drive-onboard-job:latest --region us-central1`. IAM: `matcher-app@` (the view's trigger) and `matching-job@` (drive-sync chaining, future) hold `roles/run.admin` on `drive-onboard-job`; secret `ANTHROPIC_API_KEY=anthropic-api-key:latest`.
+
 
 ---
 
@@ -760,6 +772,13 @@ cc-matcher-bucket-jeg-v1/
   drive-sync-jobs/                      # drive-sync-job completion status
     drive_sync_2026-08-11_15-30-00/
       status.json
+  drive-onboard/                        # Stage 15 — Drive onboarding agent
+    agent.json                          # synced Managed Agents agent_id/version, env_id, prompt_version
+    state.json                          # folder_id -> {proposed_at, attempts} (30-day retry gate)
+    proposals/{folder_id}.json          # one proposal per folder (decision, evidence, documents, review_status)
+    shadow/{run_id}/report.json         # shadow-eval results (go-live gate) — never the live store
+  drive-onboard-configs/{run_id}.json   # drive-onboard-job trigger configs
+  drive-onboard-jobs/{run_id}/status.json  # drive-onboard-job progress + completion
   deep-research-configs/                # Funding Source Watch state + job configs
     sources.parquet                   # the master list — one row per site (overwritten in place, not versioned)
     daily_schedule.json               # persistent daily-run config (`run_id: "daily"` sentinel)
@@ -1112,6 +1131,7 @@ Two Cloud Run Jobs run the heavy pipeline work so Streamlit never hits memory or
 | `fathom-sync-job` | `jobs/fathom_sync_job.py` | `jobs/Dockerfile.fathom_sync` | `requirements.fathom_sync_job.txt` | Fathom Meetings view |
 | `client-profile-job` | `jobs/client_profile_job.py` | `jobs/Dockerfile.client_profile` | `requirements.client_profile_job.txt` | Client Profiles view |
 | `deep-research-job` | `jobs/deep_research_job.py` | `jobs/Dockerfile.deep_research` | `requirements.deep_research_job.txt` | Funding Sources view + Cloud Scheduler (daily) |
+| `drive-onboard-job` | `jobs/onboard_job.py` | `jobs/Dockerfile.onboard` | `requirements.onboard_job.txt` | Drive Sync view ("Investigate unmatched") + drive-sync chaining (Stage 15) |
 
 ### `matching-job` config schema (`job-configs/{run_id}.json`)
 

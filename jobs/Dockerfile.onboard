@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.onboard_job.txt .
+RUN pip install --no-cache-dir -r requirements.onboard_job.txt
+
+COPY jobs/onboard_job.py jobs/onboard_job.py
+
+# The onboarding agent touches many shared modules (tools layer, pools +
+# aspect_profile, doc_extract, drive_client, onboarding, attention, gcs_write)
+# plus the agent-as-code package. Copy the whole src/ + agents/ tree rather than
+# an explicit list — the job imports only the Streamlit-free modules, so the
+# Streamlit-only ones (ui_common, access_control) simply ride along unused.
+# No Chromium: this job has no bash/file/web agent tools.
+COPY src/ src/
+COPY agents/ agents/
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "jobs/onboard_job.py"]
