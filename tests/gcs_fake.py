@@ -40,6 +40,9 @@ class FakeBlob:
         data = self.store[self.name]['data']
         return data if start is None else data[start:end + 1]
 
+    def download_as_text(self, encoding='utf-8'):
+        return self.download_as_bytes().decode(encoding)
+
     def exists(self):
         return self.name in self.store
 

@@ -33,31 +33,75 @@ connector is added? What redirect URI must the server allow? Identity provider
 is **Google**; accept a caller only if the verified ID-token `email` ends in
 `@bwcoconsulting.com` **and** `email_verified` is true, checked server-side (the
 `hd` hint is a convenience, not a control — same rule as `services/intake_web`).
-_Answer:_
+_Answer (2026-10-22, from current docs):_ claude.ai supports **all three** OAuth-client
+identification modes, chosen in the "Add connector → Authentication → OAuth client"
+dialog: **Claude's published identity** (a Client ID Metadata Document Anthropic
+hosts), **Register automatically** (OAuth 2.0 **Dynamic Client Registration**,
+RFC 7591), or a **pre-registered client id** the owner enters. On connect, claude.ai
+first fetches `GET /.well-known/oauth-protected-resource` (RFC 9728) and follows its
+`authorization_servers`. **Our design:** the server is its own Authorization Server
+via FastMCP's **`GoogleProvider`** (an `OAuthProxy`): it presents a DCR-compliant
+`/register` to Claude and bridges to **Google** using a *pre-registered Google OAuth
+client* (one `GOOGLE_CLIENT_ID`/`SECRET`), runs the Google login, and issues the
+server's own JWT (never passing Google's token through). So in the claude.ai dialog
+choose **Register automatically**. **Redirect URI to allow in the Google Cloud OAuth
+client:** the proxy's own fixed callback, `{MCP_BASE_URL}/auth/callback` (FastMCP's
+`redirect_path` default); Claude's own dynamic callback is stored and forwarded by the
+proxy, so Google only ever sees the proxy's. The BW&CO/`email_verified` gate is layered
+on in `services/matcher_mcp/auth.py` (GoogleProvider alone admits any Google account).
 
 ### 2 — Transport + protocol version
 Which MCP transport and protocol version does claude.ai expect? (Streamable HTTP
 is assumed; the scaffold serves `/mcp`.) Record the exact protocol version string.
-_Answer:_
+_Answer (2026-10-22):_ **Streamable HTTP** — confirmed the expected remote transport
+(the older HTTP+SSE transport is legacy). FastMCP serves it at `/mcp`
+(`server.run(transport="streamable-http")`). The **protocol version is negotiated**
+per connection via the `MCP-Protocol-Version` header during `initialize`; the SDK
+sends the current revision, so there is no version string to hard-code. **Record the
+negotiated version printed on the first real connect** when the connector is added.
 
 ### 3 — Org-wide install + plugin packaging
 Can an org owner add the connector once for the whole organization? Can it be
 packaged in a plugin alongside the `bwco-matcher` skill (plan §5.7), or must the
 connector and skill be added separately?
-_Answer:_
+_Answer (2026-10-22):_ On Team/Enterprise plans an **organization admin/owner** adds a
+custom connector org-wide (Settings → Connectors / admin console), so individuals need
+not each add it. There is **no single "connector + skill" bundle** to add in one click
+in the connector dialog — the connector (remote MCP URL) and the `bwco-matcher` skill
+are added as **separate** artifacts. **Confirm the exact admin path and whether the
+plan allows org-wide custom connectors on first install** (needs the org owner — plan
+open question #5). The skill ships separately (plan §5.7).
 
 ### 4 — Response-size limits per tool result
 What is the max size of a single tool result claude.ai will accept? This sets the
 hard cap for every Phase 5 tool's output (plan §5.4 assumes a ~20k-char default,
 truncate-middle-out).
-_Answer:_
+_Answer (2026-10-22):_ No single published hard byte-limit for a tool result; the
+practical constraint is the model's context budget, so **keep results small**. We
+adopt the plan's **20,000-char cap** (`src/modules/tools/_common.MAX_RESULT_CHARS`),
+cap every free-text field middle-out, and **paginate** large sets with an opaque
+cursor — never return a whole parquet. `services/matcher_mcp/main._emit` enforces the
+20k ceiling on the serialized result as a backstop. Revisit if a real connector
+rejects a result under this cap.
 
 ### 5 — MCP Python SDK version to pin
 Which `mcp` SDK version should we pin? Per CLAUDE.md **"SDK version pins"**, pin
 `mcp>=<x.y>,<<x+1>` with an explicit upper bound before adding it to any
 `requirements*.txt`, and record the signature check used (the same discipline as
 the `anthropic`/`openai` pins).
-_Answer:_
+_Answer (2026-10-22):_ Pin the **standalone `fastmcp>=3.3.0,<4`** (not the mcp SDK's
+bundled FastMCP 1.x) — it carries `GoogleProvider` / `OAuthProxy`, which the OAuth
+bridge needs. Latest is 3.3.1 (May 2026). `requirements.matcher_mcp.txt` has the pin.
+**Signature check before any version bump / first deploy** (the house rule — verify,
+don't deploy-and-hope):
+```python
+import inspect
+from fastmcp.server.auth.providers.google import GoogleProvider
+from fastmcp.server.dependencies import get_access_token  # claims integration point
+print(sorted(inspect.signature(GoogleProvider.__init__).parameters))  # client_id/secret/base_url
+```
+Confirm the `GoogleProvider` kwargs in `main._build_auth` and the token-claims shape
+`main._current_claims` reads (it tries `claims`/`extra`/`user`/direct `email`).
 
 ---
 

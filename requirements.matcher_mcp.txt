@@ -1,0 +1,13 @@
+# matcher-mcp (public MCP server for the claude.ai custom connector) —
+# see services/matcher_mcp/. SDK upper bounds follow CLAUDE.md "SDK version pins":
+# fastmcp has GoogleProvider/OAuthProxy since v2; pin <4 and verify the
+# GoogleProvider kwargs + the auth-dependency claims shape against the installed
+# version on first deploy (the house 'check the signature before trusting it' rule).
+fastmcp>=3.3.0,<4
+openai>=3.7.0,<4
+pandas>=2.0.0
+numpy>=1.26.0
+pyarrow>=14.0.0
+google-cloud-storage>=2.0.0
+google-cloud-run>=0.10.0
+google-auth>=2.0.0

@@ -116,8 +116,10 @@ src/
                               #   sessions, signed-URL uploads, prospect rows, Drive folder + Doc, HubSpot upsert, submit pipeline
 services/
   intake_web/                 # Stage 14 — public FastAPI app (routes only) + static wizard + Dockerfile (explicit COPY list)
+  matcher_mcp/                # Stage 16 — public MCP server for the claude.ai custom connector (Tier 1 read-only): main.py (12 tools) + auth.py (BW&CO Google-OAuth gate) + audit.py + Dockerfile. Thin wrapper over src/modules/tools/
 scripts/intake/pull_hubspot_form.py # one-off: dump the HubSpot DD form definition (needs the `forms` token scope)
 tests/intake/                 # pytest — the repo's first test suite (in-memory GCS fake in conftest.py)
+tests/mcp/                    # pytest — Matcher MCP Tier-1 tool layer + auth gate + audit (GCS fake)
 
 jobs/
   matching_job.py             # Cloud Run Job — scoring, AI validation, email pre-write
@@ -1658,7 +1660,26 @@ gcloud run jobs add-iam-policy-binding client-profile-job --region us-central1 \
   --member="serviceAccount:matching-job@cc-matcher-v1.iam.gserviceaccount.com" \
   --role="roles/run.admin" --project cc-matcher-v1
 ```
-`fathom-sync-job` has the mirror treatment (`mode: "scheduled"`, `daily` sentinel): it writes unattributed domains to the attention queue (`fathom_unmatched_domain`, deduped so skipped domains are never re-offered) and never triggers another job. Both jobs are protected by the Phase 1 run lock. Cloud Scheduler entries (nightly, `America/Chicago`, drive-sync earlier than fathom to reduce contention) follow the `sam-gov-daily` / `deep-research-daily` pattern — the Scheduler OAuth SA (`matching-job@`) needs `roles/run.admin` on each job because the trigger body carries `containerOverrides`.
+`fathom-sync-job` has the mirror treatment (`mode: "scheduled"`, `daily` sentinel): it writes unattributed domains to the attention queue (`fathom_unmatched_domain`, deduped so skipped domains are never re-offered) and never triggers another job. Both jobs are protected by the Phase 1 run lock. The Scheduler OAuth SA (`matching-job@`) needs `roles/run.admin` on each job because the trigger body carries `containerOverrides` — it holds this **project-wide** (verified 2026-10-22), so no job-level grant was needed.
+
+**LIVE since 2026-10-22 (Phase 2 switched on).** Two Cloud Scheduler entries now exist (`America/Chicago`, same pattern as `sam-gov-daily` / `deep-research-daily`), staggered before the 5 AM sam-gov / 6 AM deep-research runs so nightly jobs don't pile up:
+- **`drive-sync-daily`** — `0 1 * * *` (1 AM Central) → `drive-sync-job` with `args:["drive-sync-configs/daily_schedule.json"]`.
+- **`fathom-sync-daily`** — `0 4 * * *` (4 AM Central) → `fathom-sync-job` with `args:["fathom-configs/daily_schedule.json"]`.
+
+The drive-sync daily config scans **5 client sections only** (`scan_sections`): `_Clients A - H and Numbers` (`1MXdF55dO95z3X0ocLktR07rSCGo7TALU`), `_Clients I - P` (`1HaC3VFjagZNj7o-saAmMiUDKNvbUg0X_`), `_Clients Q - Z` (`1apRDR9Ai3Xo8KzqlfnhFSAkOYH_qVWIA`), `_Nonprofit & NonRD Business` (`1ob4Clg9D9XC7LDVkrBqRDXU2RmKt4tUT`), `__Folders Created by PMs` (`1ujpJ_vNL6HEKooSOzDgXrNz71aNqABPy`), all under shared drive `0AH579d6JZ6cfUk9PVA`. Deliberately **excluded** from the nightly scan: `_BW&CO Internal Projects` (not clients), `Submitted Forms` (the DD intake service already creates rows + profiles there — scanning it would double-onboard intake companies), and `Uncategorized-Contracts` (not `{Client}_INTERNAL` folders). To scan more sections, add their folder ids to the `scan_sections` array in the blob — no redeploy. The fathom daily config sweeps a 90-day window over **all** clients/prospects with assigned domains. Create/update the two entries with:
+```
+gcloud scheduler jobs create http drive-sync-daily --schedule="0 1 * * *" \
+  --uri="https://run.googleapis.com/v2/projects/cc-matcher-v1/locations/us-central1/jobs/drive-sync-job:run" \
+  --message-body='{"overrides":{"containerOverrides":[{"args":["drive-sync-configs/daily_schedule.json"]}]}}' \
+  --oauth-service-account-email=matching-job@cc-matcher-v1.iam.gserviceaccount.com \
+  --location=us-central1 --time-zone="America/Chicago" --project cc-matcher-v1
+gcloud scheduler jobs create http fathom-sync-daily --schedule="0 4 * * *" \
+  --uri="https://run.googleapis.com/v2/projects/cc-matcher-v1/locations/us-central1/jobs/fathom-sync-job:run" \
+  --message-body='{"overrides":{"containerOverrides":[{"args":["fathom-configs/daily_schedule.json"]}]}}' \
+  --oauth-service-account-email=matching-job@cc-matcher-v1.iam.gserviceaccount.com \
+  --location=us-central1 --time-zone="America/Chicago" --project cc-matcher-v1
+```
+The **first scheduled drive-sync run is a one-time burst**: its scan auto-assigns every folder that now fuzzy-matches an existing client (the validation run of 2026-10-22 auto-assigned 50 and sent 17 to review), and `onboard_unmatched` enqueues one `drive_unmatched_folder` attention item per still-unassigned folder (~130 on the first night). Dedup on `(kind, subject_key)` means later runs don't repeat them; triaging that queue once from the Home "Needs attention" panel is the expected first-run workflow.
 
 The job resolves `folder_ids → client_key` through `drive-sync-configs/assignments.json` and groups multi-folder clients into one unit of work. `full_resync` bypasses the `sync_state.json` modifiedTime diff; `dry_run` reports outcomes without touching parquets or sync_state. **Time budget:** `task_timeout_s` (chosen in the view's "Time budget" selector — 1 h to 24 h, default 4 h; clamped to 900–86 400 s in the job) sets the window, and the job stops gracefully ~10 min before it (`stopped_early: "timeout"`), deferring remaining clients/proposals to the next run — a hard timeout kill would lose un-checkpointed work and leave no status file. The Cloud Run job is deployed with `--task-timeout 86400` (Cloud Run's 24 h maximum), so any selectable budget is safe; **never set `task_timeout_s` above the deployed task timeout**. When proposal candidates exist, the client phase gets a tighter deadline (90s reserved per planned proposal, capped at half the budget) so a heavy client sweep can't starve the proposals phase. **Proposal cap + rotation:** at most `max_proposals` new-client proposals per run (each ≈1 min: folder download + Claude call) — the view now sets it to the number of folders the user explicitly picked, so only the time budget can defer them; when it does bite, candidates are ordered never-proposed-first then least-recently-proposed via the `proposed` cursor in `sync_state.json` (advanced on non-dry runs only), so a large unassigned backlog drains across successive runs instead of re-proposing the same chunk.
 
@@ -2084,6 +2105,18 @@ gcloud run deploy intake-web \
 ```
 
 Local: `INTAKE_DEV=1 uvicorn services.intake_web.main:app --port 8080` (ADC credentials). Tests: `python -m pytest tests/intake`. Finish a failed submission: `python -m src.modules.intake.submit_pipeline resume <session_id>`.
+
+---
+
+### `matcher-mcp` (public MCP server for the claude.ai connector) — Stage 16, Phase 5 Tier 1
+
+Lets the team use the Matcher **from claude.ai** as a custom connector (search grants/companies, check what the scheduled pipeline produced, review onboarding proposals) without opening Streamlit. **Built + tested; not yet deployed.** Full operator guide — Google OAuth client, `matcher-mcp@` SA + IAM, build/deploy, connector registration — is in **`docs/matcher-in-claude.md`**; the researched OAuth/connector answers are in `docs/spikes/mcp-connector.md`.
+
+- **Tier 1 is READ-ONLY.** 12 tools: `search_grants`, `search_companies`, `get_company`, `get_profile`, `search_resumes`, `list_runs`, `get_run_status`, `get_match_results`, `whats_new`, `list_attention`, `list_onboarding_proposals`, `get_onboarding_proposal`. Tiers 2 (job triggers behind a confirm token) and 3 (staged writes via `onboarding_apply.py`) are later PRs; admin ops stay out of MCP.
+- **The tool LOGIC is `src/modules/tools/`** (`_common`, `runs`, `attention`, `onboarding`, `search` + the Phase-3 `company_lookup`/`drive_read`) — transport-agnostic, Streamlit-free, JSON-serialisable, unit-tested in `tests/mcp/`. The two embedding searches take an **injected `embed_query` callable** (the server builds it from the OpenAI key; tests pass a fake) so they stay testable. `services/matcher_mcp/main.py` is the thin wiring; `fastmcp` + `openai` are imported **lazily** so the module (and tests) load without them.
+- **Auth** (`services/matcher_mcp/auth.py`): public service (claude.ai calls from Anthropic infra, so IAP can't gate it). FastMCP **`GoogleProvider`** (OAuthProxy) bridges Google (no DCR) ↔ Claude (expects DCR), runs the Google login, issues the server's own JWT. On top, a verified **`@bwcoconsulting.com` + `email_verified`** gate (`require_actor`) — GoogleProvider alone admits any Google account; the `hd` hint is never the control (same rule as intake-web). `MCP_DEV=1` returns a fixed dev identity for the MCP Inspector; **never set it on the deployed service**.
+- **Every tool call**: gate on the actor → run the shared function → cap output at **20k chars** (`_common.MAX_RESULT_CHARS`, middle-out per field; `main._emit` as a serialized backstop) and paginate large sets with an **opaque cursor** → append one line to `mcp-audit/{date}.jsonl` (`services/matcher_mcp/audit.py`) with the **args hashed, never stored** (they can carry client material).
+- **Pin:** `requirements.matcher_mcp.txt` → **`fastmcp>=3.3.0,<4`** (standalone fastmcp has `GoogleProvider`/`OAuthProxy`; the mcp SDK's bundled FastMCP 1.x does not). Per "SDK version pins", signature-check `GoogleProvider.__init__` + the `get_access_token` claims shape before any bump/deploy (the integration point `main._current_claims` reads). Image: `services/matcher_mcp/Dockerfile` (explicit COPY — `src/modules/` wholesale + `services/matcher_mcp/`, never `COPY . .`, so no repo-root secrets ship in a public image), `cloudbuild.matcher_mcp.yaml`. Tests: `python -m pytest tests/mcp`.
 
 ---
 
