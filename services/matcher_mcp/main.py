@@ -75,6 +75,13 @@ def _build_auth():
         client_id=os.environ['GOOGLE_CLIENT_ID'],
         client_secret=os.environ['GOOGLE_CLIENT_SECRET'],
         base_url=os.environ['MCP_BASE_URL'],  # the server's own public URL
+        # GoogleProvider requests NO user info by default — without the email
+        # scope the email claim is absent and the BW&CO gate fails closed on
+        # every caller. openid + userinfo.email are the minimum the gate needs.
+        required_scopes=['openid', 'https://www.googleapis.com/auth/userinfo.email'],
+        # The OAuth callback path the Google client must list as its authorized
+        # redirect URI: {MCP_BASE_URL}/auth/callback.
+        redirect_path='/auth/callback',
     )
 
 
@@ -274,6 +281,9 @@ def build_server():
 
 if __name__ == '__main__':
     server = build_server()
-    os.environ.setdefault('FASTMCP_PORT', os.environ.get('PORT', '8080'))
-    os.environ.setdefault('FASTMCP_HOST', '0.0.0.0')
-    server.run(transport='streamable-http')
+    # FastMCP 3.x takes host/port as run() kwargs (forwarded into
+    # transport_kwargs); it does NOT read FASTMCP_HOST/PORT here, so Cloud Run
+    # needs them passed explicitly — bind 0.0.0.0:$PORT, not the 127.0.0.1:8000
+    # default (which fails the Cloud Run startup probe).
+    server.run(transport='streamable-http', host='0.0.0.0',
+               port=int(os.environ.get('PORT', '8080')))

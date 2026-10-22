@@ -31,7 +31,16 @@ answers.
 
 ---
 
-## One-time setup (not yet done — needs an owner)
+## DEPLOYED 2026-10-22
+
+- **Service URL:** `https://matcher-mcp-998055288572.us-central1.run.app` (Cloud Run gave the new service the newer `-<projectNumber>.<region>.run.app` URL format, **not** the `-76zevaohwa-uc` format the older services use — so the URL could not be predicted; it was read off the first deploy).
+- **MCP endpoint (connector URL):** `https://matcher-mcp-998055288572.us-central1.run.app/mcp`
+- **Google OAuth redirect URI:** `https://matcher-mcp-998055288572.us-central1.run.app/auth/callback`
+- Public via **`--no-invoker-iam-check`** (`run.googleapis.com/invoker-iam-disabled: true`), because the org's Domain-Restricted-Sharing policy blocks an `allUsers` IAM binding — the same mechanism `intake-web` uses.
+- Deployed revision serves OAuth discovery correctly (`/.well-known/oauth-protected-resource/mcp` → 200, scopes `openid`+`userinfo.email`; `/mcp` → 401 with the `WWW-Authenticate` resource_metadata pointer).
+- **Remaining to use it:** (1) set the Google OAuth client's redirect URI to the one above, (2) an org owner adds the connector in claude.ai (URL `…/mcp`, "Register automatically").
+
+## One-time setup (reference — mostly done 2026-10-22)
 
 ### 1. Google OAuth client (identity)
 In the `cc-matcher-v1` Google Cloud console → **APIs & Services → Credentials →
@@ -67,12 +76,22 @@ gcloud run deploy matcher-mcp \
   --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matcher-mcp:latest \
   --region us-central1 --project cc-matcher-v1 \
   --service-account matcher-mcp@cc-matcher-v1.iam.gserviceaccount.com \
-  --allow-unauthenticated --max-instances 2 --memory 1Gi \
+  --no-invoker-iam-check --max-instances 2 --memory 1Gi \
   --set-secrets=OPENAI_API_KEY=openai-api-key:latest,GOOGLE_CLIENT_ID=mcp-google-client-id:latest,GOOGLE_CLIENT_SECRET=mcp-google-client-secret:latest \
-  --set-env-vars=MCP_BASE_URL=https://<the-cloud-run-url>
+  --set-env-vars=MCP_BASE_URL=https://matcher-mcp-998055288572.us-central1.run.app
 ```
-`MCP_BASE_URL` must equal the service's own public URL (chicken-and-egg: deploy once to
-learn the URL, then redeploy with it set, or front it with a stable custom domain).
+Two gotchas learned on the first deploy:
+- **Public access:** `--allow-unauthenticated` tries an `allUsers` IAM binding, which the
+  DRS org policy **refuses**. Use **`--no-invoker-iam-check`** instead (sets
+  `invoker-iam-disabled: true`), the same mechanism `intake-web` uses.
+- **`MCP_BASE_URL`** must equal the service's own public URL, and the URL is **not
+  predictable** (new services get the `-<projectNumber>` format). Deploy once, read the
+  `Service URL` off the output, then `gcloud run services update matcher-mcp
+  --set-env-vars=MCP_BASE_URL=<that url>` and set the Google redirect URI to
+  `<that url>/auth/callback`.
+- **Port:** the server binds `0.0.0.0:$PORT` via `run(..., host=..., port=...)` — FastMCP
+  3.x ignores `FASTMCP_HOST/PORT`, so a container that only sets those env vars binds
+  `127.0.0.1:8000` and fails the Cloud Run startup probe.
 
 ### 4. Verify the fastmcp signatures (house rule — before trusting a deploy)
 ```python

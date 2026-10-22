@@ -22,7 +22,10 @@ def test_claims_to_actor():
     # string "true" (some IdPs send strings)
     assert auth.claims_to_actor({'email': 'x@bwcoconsulting.com',
                                  'email_verified': 'true'}).allowed
-    # hd alone is NOT enough — email_verified must be true
+    # Google's userinfo-v2 field name `verified_email` is also accepted
+    assert auth.claims_to_actor({'email': 'x@bwcoconsulting.com',
+                                 'verified_email': True}).allowed
+    # hd alone is NOT enough — the verified flag must be true
     assert not auth.claims_to_actor({'email': 'x@bwcoconsulting.com',
                                      'hd': 'bwcoconsulting.com'}).allowed
     assert not auth.claims_to_actor(None).allowed

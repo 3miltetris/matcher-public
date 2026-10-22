@@ -46,9 +46,13 @@ def claims_to_actor(claims: dict | None) -> Actor:
     claims — fail closed."""
     claims = claims or {}
     email = str(claims.get('email', '') or '')
+    # Google surfaces the verified flag as `email_verified` (OIDC ID token) or
+    # `verified_email` (the older userinfo v2 shape) depending on the path taken.
     verified = claims.get('email_verified')
-    verified = bool(verified) if not isinstance(verified, str) \
-        else verified.strip().lower() == 'true'
+    if verified is None:
+        verified = claims.get('verified_email')
+    verified = (verified.strip().lower() == 'true') if isinstance(verified, str) \
+        else bool(verified)
     return Actor(email=email, verified=verified)
 
 
