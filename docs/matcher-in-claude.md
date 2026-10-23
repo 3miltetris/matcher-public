@@ -4,7 +4,9 @@ The **Matcher MCP server** (`services/matcher_mcp/`) lets the BW&CO team use the
 Matcher from **claude.ai** as a custom connector: searching grants and companies,
 checking what last night's scheduled runs produced, and reviewing onboarding
 proposals — without opening Streamlit. **Tier 1 is read-only** (no triggers, no
-writes, no admin). Tiers 2–3 (triggers, staged writes) are later PRs.
+writes, no admin). **Tier 2 (job triggers, behind a two-step confirm token +
+per-user daily spend cap) is built and tested — see the Tier 2 section below for
+the IAM + secret it needs before it works.** Tier 3 (staged writes) is a later PR.
 
 This is the project's **second public endpoint** (after `intake-web`): claude.ai
 calls it from Anthropic's infrastructure, so IAP cannot gate it — auth is OAuth on
@@ -28,6 +30,21 @@ answers.
 **Tier 1 tools:** `search_grants`, `search_companies`, `get_company`, `get_profile`,
 `search_resumes`, `list_runs`, `get_run_status`, `get_match_results`, `whats_new`,
 `list_attention`, `list_onboarding_proposals`, `get_onboarding_proposal`.
+
+**Tier 2 tools (triggers):** `run_matching`, `build_profiles`, `sync_drive`,
+`sync_fathom`, `run_onboarding_agent`. Each is **two-step**: calling it without a
+`confirm_token` validates the arguments and returns `{estimate, confirm_token}`
+with no side effect; calling it again with the SAME arguments plus that token
+starts the Cloud Run job. The token is an HMAC over `(tool, normalized args,
+email, 10-min expiry)` — a changed argument, a different caller or an expired
+token all fail closed (`src/modules/tools/triggers.py`). Three caps no token can
+bypass, enforced in code: a per-call unit limit per tool (`build_profiles` ≤ 25
+companies, `run_onboarding_agent` ≤ 10 folders, the syncs ≤ 50, matching = 1
+run), a **per-user daily spend cap** (default $25, `admin-config/mcp_limits.json`,
+tracked in `mcp-spend/{date}.json`), and the existing job **run lock** (an
+already-running job returns `{already_running, run_id}` instead of a duplicate).
+The committed estimate is written to the spend ledger **before** the job is
+triggered, and the audit line records the per-call `cost_usd`.
 
 ---
 
@@ -65,8 +82,8 @@ gcloud projects add-iam-policy-binding cc-matcher-v1 \
   --member="serviceAccount:matcher-mcp@cc-matcher-v1.iam.gserviceaccount.com" \
   --role="roles/secretmanager.secretAccessor"
 ```
-(Tier 2 will add `roles/run.admin` on the specific jobs it triggers; Tier 3 adds write
-on `drive-sync-configs/assignments.json` + the clients prefix. Not needed for Tier 1.)
+(Tier 3 will add write on `drive-sync-configs/assignments.json` + the clients prefix.
+Tier 2's `roles/run.admin` grants + HMAC secret are in the **Tier 2 setup** section below.)
 
 ### 3. Build + deploy
 ```
@@ -93,6 +110,40 @@ Two gotchas learned on the first deploy:
   3.x ignores `FASTMCP_HOST/PORT`, so a container that only sets those env vars binds
   `127.0.0.1:8000` and fails the Cloud Run startup probe.
 
+### 3b. Tier 2 setup (triggers) — needed before the trigger tools work
+
+Tier 2 is in the image as of this PR, but the trigger tools stay disabled until the
+service account can run the jobs and the confirm secret is mounted.
+
+```
+# (a) the HMAC key the confirm tokens are signed with. One stable secret so a token
+#     minted on one Cloud Run instance verifies on another (max-instances 2).
+python -c "import secrets; print(secrets.token_urlsafe(48))" \
+  | tr -d '\n' | gcloud secrets create mcp-confirm-secret --data-file=- --project cc-matcher-v1
+
+# (b) run.admin on each triggerable job (runWithOverrides needs run.admin, not invoker —
+#     the same rule the views' matcher-app@ grants follow).
+for J in matching-job client-profile-job drive-sync-job fathom-sync-job drive-onboard-job; do
+  gcloud run jobs add-iam-policy-binding "$J" --region us-central1 --project cc-matcher-v1 \
+    --member="serviceAccount:matcher-mcp@cc-matcher-v1.iam.gserviceaccount.com" \
+    --role="roles/run.admin"
+done
+
+# (c) OPTIONAL — override the $25/day default or a user's cap. Omit the blob for defaults.
+#     {"default_daily_cap_usd":25,"user_daily_cap_usd":{"x@bwcoconsulting.com":50},
+#      "unit_caps":{"build_profiles":25}}
+
+# (d) redeploy mounting the new secret (keep the existing --set-secrets + --set-env-vars).
+gcloud run services update matcher-mcp --region us-central1 --project cc-matcher-v1 \
+  --update-secrets=MCP_CONFIRM_SECRET=mcp-confirm-secret:latest
+```
+
+If `MCP_CONFIRM_SECRET` is unset the trigger tools refuse with a clear "server
+misconfigured" message rather than running uncapped — fail closed. Without the
+`run.admin` grants the config is still staged but the `run_job` call 403s, and the
+tool reports "triggered spend but the job failed to start" (so re-grant, then the
+same run_id can be re-triggered).
+
 ### 4. Verify the fastmcp signatures (house rule — before trusting a deploy)
 ```python
 import inspect
@@ -108,7 +159,18 @@ Settings → Connectors → **Add custom connector** → URL `https://<url>/mcp`
 Authentication → OAuth client → **Register automatically** (DCR). Sign in with a
 BW&CO Google account; the first connect negotiates the MCP protocol version (record
 it) and `whoami`-equivalent access is gated to `@bwcoconsulting.com`. Then add the
-`bwco-matcher` skill separately (§5.7).
+`bwco-matcher` skill separately (below).
+
+### 6. The `bwco-matcher` skill
+The connector exposes the tools; the **`bwco-matcher` skill** (`skills/bwco-matcher/
+SKILL.md`) teaches the team which tool to use for each workflow ("what grants fit
+client X", reading match scores, working an onboarding proposal) and what still has
+to be done in Streamlit. The connector and skill are **separate** artifacts in
+claude.ai (no single bundle — spike Q3). Add the skill via claude.ai **Settings →
+Capabilities → Skills → Upload** (or package it into an org plugin alongside the
+connector if/when that path is confirmed). The per-tool detail lives in each tool's
+own description, so the skill stays short; update it whenever a Tier-2/3 tool ships
+(the "what this connector can't do yet" list).
 
 ---
 
