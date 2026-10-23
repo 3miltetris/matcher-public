@@ -63,3 +63,6 @@ local-data/
 # The playbooks and knowledge base live in GCS under strategy-playbooks/ —
 # see src/modules/strategy_session.py.
 project-context/
+
+# Packaged skill artifacts (built on demand for upload to claude.ai, not source)
+skills/*.zip
