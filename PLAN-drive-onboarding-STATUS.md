@@ -10,9 +10,14 @@ run-lock guard). `src/modules/tools/triggers.py` + 16 tests
 (`tests/mcp/test_triggers.py`); 5 trigger tools in `services/matcher_mcp/main.py`.
 Deploy done: `mcp-confirm-secret` created, `matcher-mcp@` → `run.admin` on all 5
 jobs, redeployed with `MCP_CONFIRM_SECRET` (**rev `matcher-mcp-00004-jlk`**,
-verified: discovery 200 / `/mcp` 401 / secret mounted). **194 tests pass.**
-**Remaining:** reconnect the claude.ai connector to pick up the 5 new tools, then
-smoke-test an estimate→confirm.
+verified: discovery 200 / `/mcp` 401 / secret mounted). **194 tests pass.** User
+**reconnected the claude.ai connector**. Also: zipped the skill to
+`skills/bwco-matcher.zip` (gitignored via new `skills/*.zip` rule) for upload.
+**Remaining (not yet done — do next session):** (1) user uploads
+`skills/bwco-matcher.zip` to claude.ai (Settings → Capabilities → Skills); (2) a
+first real estimate→confirm smoke-test through the connector (nothing has actually
+triggered a job via MCP yet — the two-step path is unit-tested but unproven live);
+(3) rotate the Google OAuth client secret (still outstanding from 2026-10-22).
 
 **Prior session (2026-10-22):** switched **Phase 2 LIVE** (nightly schedulers) and
 built + **deployed Phase 5 Tier 1** (the Matcher MCP server), proven working
@@ -44,10 +49,12 @@ end-to-end from claude.ai, plus wrote the `bwco-matcher` skill.
 - **Managed Agents needs `anthropic>=1.15`** (repo-wide pin is 1.3; `requirements.onboard_job.txt` pins 1.15). Verify `client.beta.agents` exists before bumping.
 - Running the onboarding agent / shadow eval locally needs a current `anthropic` + GCS/Drive creds (we used a throwaway venv + the `matcher-app@` SA key from `.streamlit/secrets.toml`; the scratchpad venv and key are session-scoped and gone now).
 - A safety classifier repeatedly interrupted long prose *summaries about the onboarding agent's company-matching* — keep that narration minimal; file writes/tool calls were unaffected.
+- **matcher-mcp Tier 2 (2026-10-23):** trigger logic is `src/modules/tools/triggers.py` (confirm token = `{expiry}.{hmac}` over tool+sorted-args+email; caps in `admin-config/mcp_limits.json`; spend ledger `mcp-spend/{date}.json`, committed **before** the job fires). Each MCP trigger tool takes an optional `confirm_token` (empty=estimate, set=run). `MCP_CONFIRM_SECRET` must be a stable Secret-Manager value (not per-instance) so a token verifies across the 2 Cloud Run instances. To add a 6th trigger: add a `Spec` + resolver + config builder to `_SPECS`/`_RESOLVERS`/`_CONFIGURERS` and one `@mcp.tool()` wrapper calling `run_trigger`. Config shapes MUST mirror the view's (we copied bulk_matching / client_profiler / drive_sync / fathom_sync / onboard verbatim).
 - **matcher-mcp / Cloud Run (learned 2026-10-22, all in `docs/matcher-in-claude.md`):** (1) a **new** Cloud Run service's URL is NOT predictable — it gets the `-<projectNumber>.<region>.run.app` format, not the old `-76zevaohwa-uc` the existing services use; deploy once, read the `Service URL`, then set `MCP_BASE_URL` + the Google redirect URI to it. (2) Public access: `--allow-unauthenticated` is **refused** by the DRS org policy (no `allUsers`); use **`--no-invoker-iam-check`** like intake-web. (3) FastMCP 3.x ignores `FASTMCP_HOST/PORT` — bind via `run(transport='streamable-http', host='0.0.0.0', port=$PORT)` or the container fails the Cloud Run probe. (4) `fastmcp` pin is `>=3.3,<4` (resolved 3.4.11); signature-check `GoogleProvider` + `get_access_token` before any bump. (5) `GoogleProvider` needs explicit `required_scopes=['openid','…/userinfo.email']` or the email claim is absent and the gate denies everyone.
 
 ## Pick-up actions for the user (not code — do these when ready)
-- **Upload the skill:** `skills/bwco-matcher/SKILL.md` → claude.ai Settings → Capabilities → Skills → Upload.
+- **Upload the skill:** zip already built at `skills/bwco-matcher.zip` (rebuild: `cd skills && python -c "import zipfile;z=zipfile.ZipFile('bwco-matcher.zip','w',zipfile.ZIP_DEFLATED);z.write('bwco-matcher/SKILL.md','bwco-matcher/SKILL.md');z.close()"`) → claude.ai Settings → Capabilities → Skills → Upload.
+- **Smoke-test a Tier-2 trigger** from the reconnected connector: ask for a `build_profiles` on one company, confirm the estimate step shows a cost + token, then confirm to run it; check `mcp-audit/{date}.jsonl` for `outcome=estimate` then `outcome=triggered`, and `mcp-spend/{date}.json` for the committed cost. **This has never been exercised live.**
 - **Rotate the OAuth client secret** (appeared in a transcript): Console → Credentials → `matcher-mcp` client → reset secret → `! printf '%s' 'NEW' | gcloud secrets versions add mcp-google-client-secret --data-file=- --project cc-matcher-v1` → `gcloud run services update matcher-mcp --region us-central1 --project cc-matcher-v1` (remount `:latest`).
 - **Merge `cc-helped-325` → main** when ready (branch is pushed, not merged).
 
