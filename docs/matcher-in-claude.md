@@ -110,10 +110,14 @@ Two gotchas learned on the first deploy:
   3.x ignores `FASTMCP_HOST/PORT`, so a container that only sets those env vars binds
   `127.0.0.1:8000` and fails the Cloud Run startup probe.
 
-### 3b. Tier 2 setup (triggers) — needed before the trigger tools work
+### 3b. Tier 2 setup (triggers) — ✅ DONE 2026-10-23
 
-Tier 2 is in the image as of this PR, but the trigger tools stay disabled until the
-service account can run the jobs and the confirm secret is mounted.
+Done and live on revision **`matcher-mcp-00004-jlk`**: `mcp-confirm-secret` created,
+`matcher-mcp@` granted `run.admin` on all 5 triggerable jobs, service redeployed
+with `MCP_CONFIRM_SECRET` mounted. Verified: OAuth discovery 200, `/mcp` 401,
+`MCP_CONFIRM_SECRET` present on the revision. (claude.ai caches the tool list, so
+reconnect the connector once to pick up the 5 new trigger tools.) The commands
+that did it, for reference / a rebuild:
 
 ```
 # (a) the HMAC key the confirm tokens are signed with. One stable secret so a token
