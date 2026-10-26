@@ -239,3 +239,66 @@ def test_add_spend_accumulates(storage):
     # a different user has their own ledger entry
     assert tg.add_spend(storage, 'other@bwcoconsulting.com', 0.5) == 0.5
     assert tg.today_spend(storage, EMAIL) == 3.5
+
+
+def test_add_spend_enforces_cap_atomically(storage):
+    # the cap is checked inside the guarded write: a charge that would exceed it
+    # raises and writes nothing, so a concurrent commit can't be out-raced.
+    assert tg.add_spend(storage, EMAIL, 0.6, cap=1.0) == 0.6
+    with pytest.raises(tg.SpendCapExceeded):
+        tg.add_spend(storage, EMAIL, 0.6, cap=1.0)
+    assert tg.today_spend(storage, EMAIL) == 0.6
+
+
+def test_add_spend_rejects_replayed_token(storage):
+    sig = 'deadbeef'
+    assert tg.add_spend(storage, EMAIL, 0.5, token_sig=sig) == 0.5
+    with pytest.raises(tg.TokenReplayed):
+        tg.add_spend(storage, EMAIL, 0.5, token_sig=sig)
+    # the replay charged nothing
+    assert tg.today_spend(storage, EMAIL) == 0.5
+    # a different token still commits
+    assert tg.add_spend(storage, EMAIL, 0.5, token_sig='feedface') == 1.0
+
+
+def test_trigger_token_is_single_use(storage):
+    """Replaying the same confirm token inside its TTL must not start a second
+    run or charge a second time (findings #3/#4)."""
+    args = {'company_keys': ['Acme||https://acme.com']}
+    est = tg.estimate(storage, 'build_profiles', args, EMAIL, secret=SECRET, now=1000)
+    jobs = FakeJobs()
+    first = tg.trigger(storage, 'build_profiles', args, EMAIL, est['confirm_token'],
+                       secret=SECRET, jobs_client=jobs, now=1001)
+    assert first['triggered']
+    charged = tg.today_spend(storage, EMAIL)
+    replay = tg.trigger(storage, 'build_profiles', args, EMAIL, est['confirm_token'],
+                        secret=SECRET, jobs_client=jobs, now=1002)
+    assert 'error' in replay and 'already used' in replay['error']
+    assert len(jobs.calls) == 1                       # no duplicate run
+    assert tg.today_spend(storage, EMAIL) == charged  # no double charge
+
+
+def test_trigger_matching_already_running_via_lock(storage):
+    """matching-job now holds a run lock, so a concurrent run_matching is caught
+    by running_run_id just like the sync jobs (finding #4)."""
+    bucket = storage.bucket(tg.BUCKET)
+    assert gw.acquire_lock(bucket, 'matching-job', 'existing_match', 3600)
+    args = {'agencies': ['DOD'], 'sources': ['apollo']}
+    est = tg.estimate(storage, 'run_matching', args, EMAIL, secret=SECRET, now=1000)
+    jobs = FakeJobs()
+    out = tg.trigger(storage, 'run_matching', args, EMAIL, est['confirm_token'],
+                     secret=SECRET, jobs_client=jobs, now=1001)
+    assert out.get('already_running') and out['run_id'] == 'existing_match'
+    assert len(jobs.calls) == 0
+
+
+def test_run_matching_email_config_is_dict(storage):
+    """email_config must be {} not None, or matching_job crashes with
+    prewrite_email on (finding #1)."""
+    args = {'agencies': ['DOD'], 'sources': ['apollo'], 'prewrite_email': True}
+    est = tg.estimate(storage, 'run_matching', args, EMAIL, secret=SECRET, now=1000)
+    out = tg.trigger(storage, 'run_matching', args, EMAIL, est['confirm_token'],
+                     secret=SECRET, jobs_client=FakeJobs(), now=1001)
+    cfg = json.loads(storage.bucket(tg.BUCKET).blob(
+        f"job-configs/{out['run_id']}.json").download_as_text())
+    assert cfg['email_config'] == {} and cfg['prewrite_email'] is True

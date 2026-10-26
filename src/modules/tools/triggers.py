@@ -49,8 +49,24 @@ TOKEN_TTL_S = 600  # 10 minutes, per the plan (§5.5)
 _LIMITS_BLOB = 'admin-config/mcp_limits.json'
 _SPEND_PREFIX = 'mcp-spend/'
 _SPEND_RETRIES = 6
+_TOKENS_KEY = '__tokens__'     # reserved ledger key (never a valid email) that
+_MAX_LEDGER_TOKENS = 500       # records the confirm tokens already committed today
 
 DEFAULT_DAILY_CAP_USD = 25.0
+
+
+class SpendCapExceeded(RuntimeError):
+    """Committing this charge would push the user past their daily cap. Raised
+    inside the generation-guarded write, so a cap check made against a read taken
+    before a concurrent commit cannot be out-raced."""
+    def __init__(self, new_total: float):
+        super().__init__(f'daily spend cap would be exceeded (${new_total:.2f})')
+        self.new_total = new_total
+
+
+class TokenReplayed(RuntimeError):
+    """This confirm token was already committed today — a replay. The first
+    trigger already started the run and charged its spend."""
 
 _SYNC_MODEL = 'claude-sonnet-4-6'  # mirrors drive_sync / fathom_sync views
 
@@ -142,26 +158,53 @@ def today_spend(gcs_client, email: str, *, bucket: str = BUCKET) -> float:
     return float(doc.get(email.lower(), 0.0) or 0.0)
 
 
-def add_spend(gcs_client, email: str, amount: float, *, bucket: str = BUCKET) -> float:
-    """Add `amount` to this email's committed spend for today, under a generation
-    guard so two concurrent triggers never lose an increment. Returns the new
-    total. Mirrors the audit-log append pattern (small JSON, not parquet)."""
+def add_spend(gcs_client, email: str, amount: float, *, cap: float | None = None,
+              token_sig: str | None = None, bucket: str = BUCKET) -> float:
+    """Add `amount` to this email's committed spend for today — and, in the SAME
+    generation-guarded write, enforce the cap and reject a replayed token, so
+    neither can be out-raced by a concurrent trigger. Returns the new total.
+
+    Two concurrent triggers never lose an increment (that is what the generation
+    guard gave us before); on top of that:
+      • `cap` (when given): if adding `amount` would exceed it, SpendCapExceeded
+        is raised and NOTHING is written. Because the check is re-evaluated after
+        every 412-retry against the freshly re-read total, a commit that another
+        trigger landed between our read and our write is counted — closing the
+        read-then-commit TOCTOU in trigger().
+      • `token_sig` (when given): if it is already in today's ledger the token is
+        a replay — TokenReplayed is raised before any charge, so a confirm token
+        reused inside its TTL can neither double-charge nor double-trigger. The
+        winner of a same-token race records the sig; the loser 412-retries, now
+        sees it recorded, and raises.
+    Raises ConcurrencyError if the guarded write cannot land within the retry
+    budget — the caller must NOT trigger if spend cannot be recorded."""
     blob = gcs_client.bucket(bucket).blob(f'{_SPEND_PREFIX}{_today()}.json')
     key = email.lower()
     for _ in range(_SPEND_RETRIES):
         try:
             cur = json.loads(blob.download_as_bytes())
             gen = blob.generation
+            if not isinstance(cur, dict):
+                cur, gen = {}, 0
         except NotFound:
             cur, gen = {}, 0
         except Exception:
             cur, gen = {}, 0
-        cur[key] = round(float(cur.get(key, 0.0) or 0.0) + float(amount), 6)
+        consumed = cur.get(_TOKENS_KEY)
+        consumed = list(consumed) if isinstance(consumed, list) else []
+        if token_sig and token_sig in consumed:
+            raise TokenReplayed('this confirmation was already used today')
+        new_total = round(float(cur.get(key, 0.0) or 0.0) + float(amount), 6)
+        if cap is not None and new_total > cap:
+            raise SpendCapExceeded(new_total)
+        cur[key] = new_total
+        if token_sig:
+            cur[_TOKENS_KEY] = (consumed + [token_sig])[-_MAX_LEDGER_TOKENS:]
         try:
             blob.upload_from_string(json.dumps(cur),
                                     content_type='application/json',
                                     if_generation_match=gen)
-            return cur[key]
+            return new_total
         except PreconditionFailed:
             continue
     # Could not commit the ledger after retries — surface it; the caller must
@@ -173,10 +216,11 @@ def add_spend(gcs_client, email: str, amount: float, *, bucket: str = BUCKET) ->
 
 def running_run_id(gcs_client, job: str, *, bucket: str = BUCKET) -> str | None:
     """The run_id of an in-flight run of `job`, or None. Checks the job run lock
-    (drive-sync-job / fathom-sync-job hold one) first, then the newest status.json
-    if its state reads as running. Best-effort — for jobs that write status only
-    on completion (matching-job) this can't see an in-flight run, which is why the
-    trigger is still idempotent via the server-side config write, not this check."""
+    first, then the newest status.json if its state reads as running. All five
+    triggerable jobs now hold a run lock while executing (matching-job acquires
+    one in its __main__, same as the sync jobs), so an in-flight run is seen here;
+    the single-use confirm token closes the remaining replay-after-completion gap
+    that a run_id or a status check alone could not."""
     lock = gcs_client.bucket(bucket).blob(gw.lock_blob(job))
     try:
         rec = json.loads(lock.download_as_bytes())
@@ -268,7 +312,10 @@ def _config_matching(norm: dict, extra: dict, run_id: str) -> dict:
         'topic_filters': [],
         'ai_validation': norm['ai_validation'],
         'prewrite_email': norm['prewrite_email'],
-        'email_config': None,
+        # {} not None: matching_job does config.get('email_config', {}), which
+        # returns the value when the key is present, so None would reach
+        # email_config.get(...) and crash the run when prewrite_email is on.
+        'email_config': {},
     }
 
 
@@ -563,6 +610,8 @@ def trigger(gcs_client, tool: str, args: dict, email: str, confirm_token: str, *
 
     cost, minutes = _estimate_cost_minutes(spec, units)
     daily_cap = daily_cap_for(email, limits)
+    # Advisory fast-fail on a clearly-over-cap request (friendly message, no write
+    # attempt). The race-safe enforcement is add_spend(cap=…) below.
     spent = today_spend(gcs_client, email, bucket=bucket)
     if spent + cost > daily_cap:
         return {'error': f'daily spend cap reached: ${round(spent, 2)} already '
@@ -576,9 +625,23 @@ def trigger(gcs_client, tool: str, args: dict, email: str, confirm_token: str, *
                 'note': f'{spec.job} is already running (run {busy}); not starting '
                         'a duplicate'}
 
-    # Commit spend first — if the ledger write fails we must not trigger.
+    # Commit spend first — if the ledger write fails we must not trigger. The cap
+    # and the token's single use are enforced inside this one guarded write, so a
+    # concurrent confirm cannot slip past the cap and a replayed token cannot
+    # double-charge or double-trigger.
+    token_sig = hashlib.sha256((confirm_token or '').encode('utf-8')).hexdigest()
     try:
-        new_total = add_spend(gcs_client, email, cost, bucket=bucket)
+        new_total = add_spend(gcs_client, email, cost, cap=daily_cap,
+                              token_sig=token_sig, bucket=bucket)
+    except SpendCapExceeded:
+        return {'error': f'daily spend cap reached: a concurrent run used the '
+                         f'remaining budget, so ${cost} would exceed your '
+                         f'${round(daily_cap, 2)} cap. Try again tomorrow or ask '
+                         'an admin to raise mcp_limits.json'}
+    except TokenReplayed:
+        return {'error': 'this confirmation was already used — the run was already '
+                         'started. Poll its status, or call again without '
+                         'confirm_token for a fresh estimate.'}
     except Exception as e:  # noqa: BLE001
         return {'error': f'could not record spend, not triggering: {e}'}
 

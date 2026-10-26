@@ -34,6 +34,7 @@ from openai import AsyncOpenAI
 
 # ── src modules are on the path because the Dockerfile sets PYTHONPATH ────────
 import src.modules.anthropic_utils as au
+import src.modules.gcs_write as gw
 from src.modules.email_generator import (
     async_generate_subject_line, async_josiah_copy, async_custom_prompt, clean_agency,
 )
@@ -46,6 +47,7 @@ _CONTACTS_PREFIX  = 'data/all-contacts/'
 _TOPICS_PREFIX    = 'data/all-topics/processed/'
 _RESULTS_PREFIX   = 'matching-results/'
 _SEGMENT_SIZE     = 1000
+_TASK_TIMEOUT_S   = 3600   # matches the deployed --task-timeout; used for the run-lock ttl
 _VALIDATION_BATCH = 10
 _EMAIL_BATCH      = 5
 _SCORE_CHUNK      = 2000
@@ -561,19 +563,48 @@ if __name__ == '__main__':
         print('Usage: python jobs/matching_job.py <config_blob_path>', file=sys.stderr)
         sys.exit(1)
 
+    config_path     = sys.argv[1]
+    run_id_fallback = config_path.split('/')[-1].replace('.json', '')
+    _gcs_client     = _gcs()
+
+    # Run lock: one matching-job execution at a time. An MCP trigger mints a fresh
+    # run_id each call, so a replayed or concurrent run_matching can't be caught by
+    # run_id alone — the MCP trigger path reads this same lock (triggers.running_run_id)
+    # to refuse a duplicate. A second execution exits cleanly as skipped_locked
+    # rather than racing. ttl = the deployed task timeout + 15 min, so a run killed
+    # without releasing is taken over by the next only once it can only be dead.
     try:
-        main(sys.argv[1])
+        _cfg = json.loads(
+            _gcs_client.bucket(_BUCKET).blob(config_path).download_as_text())
+    except Exception:
+        _cfg = {}
+    _run_id = _cfg.get('run_id', run_id_fallback)
+    _lock = gw.acquire_lock(_gcs_client.bucket(_BUCKET), 'matching-job',
+                            _run_id, _TASK_TIMEOUT_S + 900)
+    if _lock is None:
+        print('Another matching-job run holds the lock — exiting cleanly.', flush=True)
+        try:
+            _write_status(_gcs_client, f'{_RESULTS_PREFIX}{_run_id}/',
+                          {'run_id': _run_id, 'state': 'skipped_locked',
+                           'total_saved': 0, 'error': None})
+        except Exception:
+            pass
+        sys.exit(0)
+
+    try:
+        main(config_path)
     except Exception:
         tb = traceback.format_exc()
         print(tb, file=sys.stderr, flush=True)
         # Best-effort status write so Streamlit can surface the error
         try:
-            run_id = sys.argv[1].split('/')[-1].replace('.json', '')
             _write_status(
-                _gcs(),
-                f'{_RESULTS_PREFIX}{run_id}/',
-                {'run_id': run_id, 'error': tb, 'total_saved': 0},
+                _gcs_client,
+                f'{_RESULTS_PREFIX}{run_id_fallback}/',
+                {'run_id': run_id_fallback, 'error': tb, 'total_saved': 0},
             )
         except Exception:
             pass
         sys.exit(1)
+    finally:
+        gw.release_lock(_lock)
