@@ -1154,9 +1154,12 @@ Two Cloud Run Jobs run the heavy pipeline work so Streamlit never hits memory or
     {"column": "open_date", "type": "date_range", "date_from": "2026-06-01", "date_to": "2026-06-30", "operator": "AND"}
   ],
   "ai_validation":  true,
-  "prewrite_email": false
+  "prewrite_email": false,
+  "include_procurement": false
 }
 ```
+
+`include_procurement` (default `false`) mirrors the Grant Search / Bulk Aspect Match toggle: the job runs `grant_utils.add_record_kind()` on the loaded topics and drops `record_kind == 'procurement'` (sole-source, sources-sought, commodity/supply buys, already-awarded notices) unless this is `true`. Bulk Matching surfaces the same checkbox and reflects the filtered count. `record_kind` rides into the output segment CSVs.
 
 ### One-time setup (already done — skip if job exists)
 

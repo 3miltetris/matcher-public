@@ -78,6 +78,10 @@ DO NOT IMPORT (NO) if any of the following are true:
 - The opportunity is clearly intended for universities, nonprofits, state/local governments, or large prime contractors with no realistic small business angle
 - It is a workforce development, training, community services, or infrastructure project
 - It is a generic service procurement with no meaningful R&D or innovation component (e.g., janitorial, facilities, staffing, administrative support)
+- It is a COMMODITY, SUPPLY, or PRODUCT purchase — buying goods, materials, or finished product rather than funding research or development. This includes medical/laboratory/dental supplies, drug or radiopharmaceutical product delivery, equipment buys, and anything requiring the offeror to already hold FDA approval or sell an established commercial product. A radiopharmaceutical or vaccine *supply/delivery* contract is NOT R&D even though the subject matter sounds technical.
+- It is a SOLE-SOURCE notice, brand-name or "brand name or equal" justification, or a NOTICE OF INTENT TO AWARD — there is no open competition to pursue.
+- It is a SOURCES-SOUGHT notice or RFI that only surveys the market for an existing product or capability, or an award that has ALREADY been made.
+- Its scope is written so narrowly that only an incumbent or a handful of named vendors could perform it.
 - The NAICS descriptor is in a sector where deep tech startups almost never compete (e.g., construction, food service, transportation logistics)
 - The description makes clear that prior large-scale program experience or clearances beyond typical small business reach are required
 

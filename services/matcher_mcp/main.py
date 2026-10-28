@@ -182,15 +182,23 @@ def build_server():
     # ── search ────────────────────────────────────────────────────────────────
     @mcp.tool()
     def search_grants(query: str, agency: str = '', open_only: bool = True,
-                      limit: int = 10) -> str:
+                      include_procurement: bool = False, limit: int = 10) -> str:
         """Rank open grant topics against a typed technology description. Set
         `agency` to one folder code (e.g. 'DOD', 'HHS') to narrow, or leave empty
-        for all. Returns the top matches with a 0-1 relevance score."""
+        to search every agency. With `open_only` (default), archived/inactive and
+        provably-expired topics (past deadline, not rolling) are dropped. Commodity
+        /supply buys, sources-sought, sole-source and notice-of-intent-to-award
+        notices are dropped as non-fundable unless `include_procurement` is set.
+        Each result carries a 0-1 relevance score, a `record_kind`
+        (solicitation/procurement/award), a `status` (open/rolling/unknown), a blank
+        `due_date` when none is published, and `also_listed_under` naming any other
+        folders the same opportunity appears in (collapsed to one row)."""
         args = {'query': query, 'agency': agency, 'open_only': open_only,
-                'limit': limit}
+                'include_procurement': include_procurement, 'limit': limit}
         r = run_tool('search_grants', lambda: t_search.search_grants(
             gcs, embed_query, query, agency=(agency or None),
-            open_only=open_only, limit=limit), args)
+            open_only=open_only, include_procurement=include_procurement,
+            limit=limit), args)
         return _emit(r)
 
     @mcp.tool()

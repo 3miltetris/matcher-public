@@ -10,53 +10,31 @@ No API key required — uses the public search2 endpoint.
 """
 
 import io
-import json
-import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
 import streamlit as st
-from anthropic import Anthropic
-from bs4 import BeautifulSoup
 from google.cloud import storage
 
-from src.modules.Embedding.text_embedder import TextProcessor
-from src.modules.GoogleBucketManager.bucket_manager import BucketManager
-import src.modules.anthropic_utils as au
 import src.modules.newsletter as nl
 import src.modules.ui_common as uc
+from src.modules import grants_gov as gg
 
 # ── GCS ────────────────────────────────────────────────────────────────────
 
 _BUCKET        = 'cc-matcher-bucket-jeg-v1'
 _GRANTS_PREFIX = 'data/all-topics/processed/GRANTS-GOV/'
 
-_SCREEN_MODEL    = 'claude-haiku-4-5-20251001'
-_SCREEN_WORKERS  = 8
-_SCREEN_MAX_CHARS = 3000
-
-# ── Grants.gov API ─────────────────────────────────────────────────────────
-
-_SEARCH_URL   = 'https://api.grants.gov/v1/api/search2'
-_DETAIL_URL   = 'https://apply07.grants.gov/grantsws/rest/opportunity/details'
-_PAGE_SIZE    = 25   # conservative; grants.gov legacy API
-_DETAIL_WORKERS = 8
-
-_STATUS_OPTIONS = {
-    'Posted':     'posted',
-    'Forecasted': 'forecasted',
-    'Closed':     'closed',
-    'Archived':   'archived',
-}
-
-_INSTRUMENT_OPTIONS = {
-    'Grant':                 'G',
-    'Cooperative Agreement': 'CA',
-    'Procurement Contract':  'PC',
-    'Other':                 'O',
-}
+# Search / screen / summarize / embed logic lives in src/modules/grants_gov.py,
+# shared with grants-gov-job. This view keeps thin wrappers that add the
+# st.progress UI, plus the rolling re-check (_refresh_rolling_grants) which is
+# view-only.
+_STATUS_OPTIONS     = gg.STATUS_OPTIONS
+_INSTRUMENT_OPTIONS = gg.INSTRUMENT_OPTIONS
+_SEARCH_URL         = gg.SEARCH_URL
+_DETAIL_WORKERS     = gg.DETAIL_WORKERS
 
 _GRANTS_RESERVED_COLS = frozenset({
     'topic_number', 'agency', 'title', 'description', 'open_date', 'close_date',
@@ -74,70 +52,8 @@ def _get_storage_client() -> storage.Client:
 
 
 # ── Grants.gov helpers ─────────────────────────────────────────────────────
-
-def _parse_date(s: str) -> date | None:
-    for fmt in ('%m/%d/%Y', '%Y-%m-%d', '%Y/%m/%d'):
-        try:
-            return datetime.strptime(str(s).strip(), fmt).date()
-        except (ValueError, TypeError):
-            pass
-    return None
-
-
-def _items_to_df(items: list[dict], descriptions: list[str] | None = None) -> pd.DataFrame:
-    rows = []
-    for i, opp in enumerate(items):
-        desc = descriptions[i] if descriptions and i < len(descriptions) else ''
-        rows.append({
-            'title':         str(opp.get('title') or '').strip(),
-            'description':   str(desc).strip(),
-            'notice_id':     str(opp.get('number') or opp.get('id') or '').strip(),
-            'agency':        str(opp.get('agency') or '').strip(),
-            'agency_code':   str(opp.get('agencyCode') or '').strip(),
-            'posted_date':   str(opp.get('openDate') or '').strip(),
-            'close_date':    str(opp.get('closeDate') or '').strip(),
-            'award_ceiling': '',
-            'status':        str(opp.get('oppStatus') or '').strip(),
-        })
-    return pd.DataFrame(rows)
-
-
-def _fetch_description(opp_id: str, doc_type: str) -> str:
-    try:
-        r = requests.post(
-            _DETAIL_URL,
-            data={'oppId': opp_id},
-            headers={'Content-Type': 'application/x-www-form-urlencoded'},
-            timeout=15,
-        )
-        r.raise_for_status()
-        d = r.json()
-        if doc_type == 'forecast':
-            html = (d.get('forecast') or {}).get('forecastDesc') or ''
-        else:
-            html = (d.get('synopsis') or {}).get('synopsisDesc') or ''
-        return BeautifulSoup(html, 'html.parser').get_text(separator=' ', strip=True)
-    except Exception:
-        return ''
-
-
-def _fetch_all_descriptions(items: list[dict]) -> list[str]:
-    results = [''] * len(items)
-    progress = st.progress(0, text=f'Fetching descriptions… 0/{len(items)}')
-    with ThreadPoolExecutor(max_workers=_DETAIL_WORKERS) as pool:
-        futures = {
-            pool.submit(_fetch_description, str(item['id']), item.get('docType', 'synopsis')): i
-            for i, item in enumerate(items)
-        }
-        done = 0
-        for future in as_completed(futures):
-            i = futures[future]
-            results[i] = future.result()
-            done += 1
-            progress.progress(done / len(items), text=f'Fetching descriptions… {done}/{len(items)}')
-    progress.empty()
-    return results
-
+# items_to_df / fetch_description(s) / search / screen / summarize / embed now
+# live in src.modules.grants_gov (gg); the wrappers further down add st.progress.
 
 def _lookup_opp_status(number: str) -> tuple[bool, str | None]:
     """Current Grants.gov status for an opportunity number.
@@ -229,297 +145,50 @@ def _refresh_rolling_grants(gcs: storage.Client) -> dict:
     return {'checked': len(numbers), 'refreshed': refreshed, 'expired': expired}
 
 
-def _search_grants(
-    keyword:         str,
-    statuses:        list[str],
-    instruments:     list[str],
-    agencies:        list[str],
-    date_from:       date | None,
-    date_to:         date | None,
-    exclude_expired: bool,
-    max_results:     int,
-) -> tuple[pd.DataFrame, int]:
-    all_items: list[dict] = []
-    start = 1
-    total = None
-
-    # The Grants.gov API only supports "posted in the last N days" — derive N
-    # from the range start to narrow the server-side fetch, then enforce the
-    # exact [date_from, date_to] range client-side below.
-    date_range_days: int | None = None
-    if date_from:
-        days_back = (datetime.today().date() - date_from).days + 1
-        if 1 <= days_back <= 365:
-            date_range_days = days_back
-
+def _search_grants(keyword, statuses, instruments, agencies, date_from, date_to,
+                   exclude_expired, max_results) -> tuple[pd.DataFrame, int]:
+    """Thin wrapper over gg.search_grants adding a spinner + a fetch progress bar."""
     with st.spinner('Querying Grants.gov…'):
-        while True:
-            payload: dict = {
-                'oppStatuses': '|'.join(statuses),
-                'rows':        _PAGE_SIZE,
-                'startRecord': start,
-            }
-            if keyword:
-                payload['keyword'] = keyword
-            if instruments:
-                payload['fundingInstruments'] = '|'.join(instruments)
-            if agencies:
-                payload['agencies'] = '|'.join(agencies)
-            if date_range_days:
-                payload['dateRange'] = str(date_range_days)
-
-            r = requests.post(_SEARCH_URL, json=payload, timeout=30)
-            r.raise_for_status()
-            data = r.json().get('data', {})
-
-            if total is None:
-                total = int(data.get('hitCount', 0))
-
-            page_items = data.get('oppHits') or []
-            all_items.extend(page_items)
-
-            if not page_items:
-                break
-            if max_results and len(all_items) >= max_results:
-                all_items = all_items[:max_results]
-                break
-            start += len(page_items)
-            if start > total:
-                break
-
-    if not all_items:
-        return pd.DataFrame(), total or 0
-
-    # Apply exclude-expired and posted-date-range filters before fetching
-    # descriptions (the API's dateRange param is only a coarse pre-filter).
-    keep  = [True] * len(all_items)
-    today = datetime.today().date()
-    for i, item in enumerate(all_items):
-        if exclude_expired:
-            cd = _parse_date(str(item.get('closeDate') or ''))
-            if cd is not None and cd < today:
-                keep[i] = False
-                continue
-        if date_from and date_to:
-            posted = _parse_date(str(item.get('openDate') or ''))
-            if posted is None or posted < date_from or posted > date_to:
-                keep[i] = False
-
-    filtered_items = [item for item, k in zip(all_items, keep) if k]
-    descriptions = _fetch_all_descriptions(filtered_items) if filtered_items else []
-    return _items_to_df(filtered_items, descriptions), total or 0
-
-
-# ── Screening ─────────────────────────────────────────────────────────────
-
-_SCREEN_SYSTEM = """\
-You are a grant opportunity screening filter for a consultancy that serves innovative startups, R&D companies, and deep tech small businesses.
-
-You will be given a federal grant opportunity. Your only job is to decide: should this opportunity be imported into our matching system?
-
-Answer YES if the opportunity is a realistic fit for startups, small businesses, or deep tech R&D companies.
-Answer NO if it is not.
-
----
-
-OUR IDEAL CLIENTS:
-- Startups and small businesses doing technical R&D
-- Deep tech ventures (biotech, defense tech, energy, AI/ML, hardware, advanced manufacturing, etc.)
-- SBIR/STTR-eligible companies
-- Commercialization-stage innovators
-
-IMPORT (YES) if any of the following are true:
-- The opportunity is explicitly open to or designed for small businesses or startups
-- The work requires genuine technical innovation, applied research, or novel development
-- It is a vehicle our clients pursue (SBIR, STTR, BAA, cooperative agreement for R&D, etc.)
-- The topic area is one where deep tech startups commonly compete
-
-DO NOT IMPORT (NO) if any of the following are true:
-- The opportunity is clearly intended for universities, nonprofits, state/local governments, or large prime contractors only
-- It is workforce development, training, community services, or social services
-- It is a generic service procurement with no meaningful R&D or innovation component
-- The description makes clear that large-scale prior program experience beyond typical small business reach is required
-
-When uncertain, only import if the opportunity is clearly relevant.
-
-Also decide whether this is a ROLLING opportunity: one that accepts applications continuously or on an ongoing basis rather than by a single fixed deadline. Set "is_rolling": true for "applications accepted on an ongoing basis", continuously-open or standing programs, and anything with no close date. Set it false for an opportunity with one specific close date.
-
----
-
-OUTPUT FORMAT:
-Respond only with valid JSON. No preamble, no markdown, no explanation outside the JSON.
-{"import": true, "confidence": "high", "is_rolling": false, "reason": "One or two sentences explaining the decision."}\
-"""
-
-
-def _screen_one(title: str, desc: str, anth_key: str) -> dict:
-    client   = Anthropic(api_key=anth_key)
-    user_msg = f"Title: {title}\n\nDescription: {str(desc)[:_SCREEN_MAX_CHARS]}"
-    resp = client.messages.create(
-        model=_SCREEN_MODEL,
-        max_tokens=200,
-        system=_SCREEN_SYSTEM,
-        messages=[{'role': 'user', 'content': user_msg}],
-    )
-    raw = au.response_text(resp)
-    if raw.startswith('```'):
-        raw = raw.split('\n', 1)[-1].rsplit('```', 1)[0].strip()
-    return json.loads(raw)
-
+        bar = st.progress(0, text='Fetching descriptions…')
+        df, total = gg.search_grants(
+            keyword=keyword, statuses=statuses, instruments=instruments,
+            agencies=agencies, date_from=date_from, date_to=date_to,
+            exclude_expired=exclude_expired, max_results=max_results,
+            progress=lambda d, t: bar.progress(d / t, text=f'Fetching descriptions… {d}/{t}'),
+        )
+        bar.empty()
+    return df, total
 
 def _run_screening(df: pd.DataFrame, anth_key: str) -> pd.DataFrame:
-    titles  = df['title'].astype(str).tolist()
-    descs   = df['description'].astype(str).tolist()
-    results = [None] * len(df)
-    progress = st.progress(0, text='Screening rows…')
-
-    with ThreadPoolExecutor(max_workers=_SCREEN_WORKERS) as pool:
-        futures = {
-            pool.submit(_screen_one, titles[i], descs[i], anth_key): i
-            for i in range(len(df))
-        }
-        done = 0
-        for future in as_completed(futures):
-            i = futures[future]
-            try:
-                results[i] = future.result()
-            except Exception as e:
-                results[i] = {'import': False, 'confidence': 'low', 'reason': f'Screening error: {e}'}
-            done += 1
-            progress.progress(done / len(df), text=f'Screening rows… {done}/{len(df)}')
-
-    progress.empty()
-    out = df.copy()
-    out['_import']     = [r['import']     for r in results]
-    out['_confidence'] = [r['confidence'] for r in results]
-    out['_reason']     = [r['reason']     for r in results]
-    out['_is_rolling'] = [bool(r.get('is_rolling')) for r in results]
+    """Thin wrapper over gg.run_screening adding a progress bar."""
+    bar = st.progress(0, text='Screening rows…')
+    out = gg.run_screening(
+        df, anth_key,
+        progress=lambda d, t: bar.progress(d / t, text=f'Screening rows… {d}/{t}'))
+    bar.empty()
     return out
 
 
-# ── Summarization ──────────────────────────────────────────────────────────
-
-_SUMMARY_SYSTEM = """\
-You are preparing a federal grant opportunity for semantic matching against startup and R&D company profiles.
-
-Summarize the opportunity in 3–5 sentences. Focus exclusively on:
-- The specific technical problem, research area, or capability being sought
-- Key deliverables or desired technical outcomes
-- Relevant domain, technology, or sector (e.g., AI/ML, biotech, defense electronics, advanced manufacturing)
-
-Strip out all procurement boilerplate: FAR clauses, set-aside language, submission deadlines, page limits, administrative instructions, and points of contact. Write in plain technical language. If the description is already short and technical, return it as-is.\
-"""
-
-
-def _summarize_one(title: str, desc: str, anth_key: str) -> str:
-    client   = Anthropic(api_key=anth_key)
-    user_msg = f"Title: {title}\n\nDescription:\n{str(desc)[:5000]}"
-    resp = client.messages.create(
-        model=_SCREEN_MODEL,
-        max_tokens=400,
-        system=_SUMMARY_SYSTEM,
-        messages=[{'role': 'user', 'content': user_msg}],
-    )
-    return au.response_text(resp)
-
-
-def _summarize_all(titles: list[str], descs: list[str], anth_key: str) -> list[str]:
-    results  = [''] * len(descs)
-    progress = st.progress(0, text='Summarizing descriptions…')
-    with ThreadPoolExecutor(max_workers=_SCREEN_WORKERS) as pool:
-        futures = {
-            pool.submit(_summarize_one, titles[i], descs[i], anth_key): i
-            for i in range(len(descs))
-        }
-        done = 0
-        for future in as_completed(futures):
-            i = futures[future]
-            try:
-                results[i] = future.result()
-            except Exception:
-                results[i] = descs[i]
-            done += 1
-            progress.progress(done / len(descs), text=f'Summarizing… {done}/{len(descs)}')
-    progress.empty()
-    return results
-
-
-# ── Dedup ─────────────────────────────────────────────────────────────────
-
 def _load_existing_keys(client: storage.Client) -> tuple[set[str], set[str]]:
-    notice_ids: set[str] = set()
-    titles:     set[str] = set()
-    blobs = client.list_blobs(_BUCKET, prefix=_GRANTS_PREFIX)
-    for blob in blobs:
-        if not blob.name.endswith('.parquet'):
-            continue
-        try:
-            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()), columns=['topic_number', 'title'])
-            notice_ids.update(df['topic_number'].dropna().astype(str).str.strip())
-            titles.update(df['title'].dropna().astype(str).str.lower().str.strip())
-        except Exception:
-            pass
-    return notice_ids, titles
+    return gg.load_existing_keys(client)
 
 
-# ── Embed + save ───────────────────────────────────────────────────────────
-
-def _embed_and_save(
-    df: pd.DataFrame,
-    oai_key: str,
-    anth_key: str,
-    extra_cols: dict[str, str] | None = None,
-) -> str:
-    tp    = TextProcessor(api_key=oai_key)
-    bm    = BucketManager(_BUCKET, client=_get_storage_client())
-    today = datetime.today().strftime('%Y-%m-%d')
-
-    out = pd.DataFrame()
-    out['topic_number']  = df['notice_id'].astype(str)
-    out['agency']        = df['agency'].astype(str)
-    out['title']         = df['title'].astype(str)
-    out['description']   = df['description'].astype(str)
-    out['open_date']     = df['posted_date'].astype(str)
-    out['close_date']    = df['close_date'].astype(str)
-    out['award_ceiling'] = df['award_ceiling'].astype(str)
-    out['status']        = df['status'].astype(str)
-    out['scraped_at']    = today
-
-    # Rolling = screener flagged it OR no close date was published.
-    _rolling_llm = (df['_is_rolling'].fillna(False).astype(bool).values
-                    if '_is_rolling' in df.columns else [False] * len(df))
-    _blank_cd = out['close_date'].astype(str).str.strip().str.lower().isin(['', 'nan', 'nat', 'none'])
-    out['is_rolling']           = (pd.Series(_rolling_llm, index=out.index) | _blank_cd)
-    out['last_verified_active'] = today
-    out['verify_status']        = 'active'
-
-    summaries        = _summarize_all(out['title'].tolist(), out['description'].tolist(), anth_key)
-    out['grant_summary'] = summaries
-
-    embed_texts = [s if s.strip() else d for s, d in zip(summaries, out['description'].tolist())]
-    progress    = st.progress(0, text='Generating embeddings…')
-    embeddings  = []
-    for i, text in enumerate(embed_texts):
-        embeddings.append(tp.get_embedding(text) if text.strip() else None)
-        progress.progress((i + 1) / len(embed_texts), text=f'Embedding {i + 1}/{len(embed_texts)}…')
-    progress.empty()
-
-    out['embeddings'] = embeddings
-
-    # Newsletter screening — the published opportunity title is the hint.
-    nl_bar = st.progress(0, text='Newsletter screening…')
-    nl.tag_frame(out, anth_key, title_hints=out['title'].tolist(),
-                 progress=lambda d, t: nl_bar.progress(d / t, text=f'Newsletter screening {d}/{t}'))
-    nl_bar.empty()
-
-    if extra_cols:
-        for col_name, col_val in extra_cols.items():
-            out[col_name] = col_val
-
-    hex_suffix = secrets.token_hex(3)
-    gcs_path   = f'{_GRANTS_PREFIX}grants_gov_{today}_{hex_suffix}.parquet'
-    bm.upload_file(gcs_path, out)
-    return gcs_path
+def _embed_and_save(df: pd.DataFrame, oai_key: str, anth_key: str,
+                    extra_cols: dict[str, str] | None = None) -> str:
+    """Thin wrapper over gg.embed_and_save adding summary/embed/newsletter bars."""
+    sum_bar = st.progress(0, text='Summarizing descriptions…')
+    emb_bar = st.progress(0, text='Generating embeddings…')
+    nl_bar  = st.progress(0, text='Newsletter screening…')
+    try:
+        path = gg.embed_and_save(
+            df, oai_key, anth_key, _get_storage_client(), extra_cols=extra_cols,
+            summary_progress=lambda d, t: sum_bar.progress(d / t, text=f'Summarizing… {d}/{t}'),
+            embed_progress=lambda d, t: emb_bar.progress(d / t, text=f'Embedding {d}/{t}…'),
+            newsletter_progress=lambda d, t: nl_bar.progress(d / t, text=f'Newsletter screening {d}/{t}'),
+        )
+    finally:
+        sum_bar.empty(); emb_bar.empty(); nl_bar.empty()
+    return path
 
 
 # ── Page ──────────────────────────────────────────────────────────────────
@@ -700,7 +369,7 @@ def render():
     if screened is None:
         st.caption(
             f'Claude Haiku will screen **{n_rows:,}** rows for relevance to R&D small businesses. '
-            f'Estimated time: ~{est_mins} min at {_SCREEN_WORKERS} concurrent workers.'
+            f'Estimated time: ~{est_mins} min at {gg.SCREEN_WORKERS} concurrent workers.'
         )
         if st.button('⚡ Run Screening', type='primary', key='gg_screen_btn'):
             anth_key = st.secrets['anthropic_api_key']

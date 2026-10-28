@@ -51,7 +51,7 @@ import src.modules.aspect_matching as am
 import src.modules.aspect_profile as ap
 import src.modules.pools as pl
 import src.modules.ui_common as uc
-from src.modules.grant_utils import normalize_grant_columns, drop_dead_topics
+from src.modules.grant_utils import normalize_grant_columns, drop_dead_topics, add_record_kind
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -107,7 +107,8 @@ def _list_agencies(client: storage.Client) -> list[str]:
         return []
 
 
-def _load_topics(client: storage.Client, agencies: list[str]) -> pd.DataFrame:
+def _load_topics(client: storage.Client, agencies: list[str],
+                 include_procurement: bool = False) -> pd.DataFrame:
     frames = []
     for agency in agencies:
         for blob in client.list_blobs(_BUCKET, prefix=f'{_TOPICS_PREFIX}{agency}/'):
@@ -124,6 +125,13 @@ def _load_topics(client: storage.Client, agencies: list[str]) -> pd.DataFrame:
     # Drop archived notices and expired rolling deadlines (verify_status 'inactive')
     topics = drop_dead_topics(topics)
     topics = normalize_grant_columns(topics.reset_index(drop=True))
+    # Classify each topic (solicitation / procurement / award) and, by default,
+    # drop procurement notices — supply buys, sources-sought, sole-source and
+    # intent-to-award notices that are topically similar to a client but not a
+    # fundable R&D opportunity. Opt in to keep them.
+    topics = add_record_kind(topics)
+    if not include_procurement and 'record_kind' in topics.columns:
+        topics = topics[topics['record_kind'] != 'procurement'].reset_index(drop=True)
     # Stored as float64; halved to float32 here because the whole topic store
     # is held in session state alongside the scoring matrix. This frame is
     # never written back, so the narrower dtype is local to the view.
@@ -372,10 +380,21 @@ selected_agencies = [
     if ag_cols[i % len(ag_cols)].checkbox(ag, value=True, key=f'am_agency_{ag}')
 ]
 
+_am_include_procurement = st.checkbox(
+    'Include procurement / supply notices',
+    value=False,
+    key='am_include_procurement',
+    help='Off by default: commodity/supply buys, sources-sought, sole-source and '
+         'notice-of-intent-to-award notices are dropped because they are not fundable '
+         'R&D opportunities even when the subject matter matches. Tick to keep them '
+         '(each result carries a `record_kind` column).',
+)
+
 if st.button('Load Topics', type='primary', disabled=not selected_agencies):
     with st.spinner(f'Loading topics from {len(selected_agencies)} agenc'
                     f'{"y" if len(selected_agencies) == 1 else "ies"}…'):
-        topics = _load_topics(gcs, selected_agencies)
+        topics = _load_topics(gcs, selected_agencies,
+                              include_procurement=_am_include_procurement)
     if topics.empty:
         st.warning('No topics found for the selected agencies.')
     else:

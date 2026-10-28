@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.grants_gov_job.txt .
+RUN pip install --no-cache-dir -r requirements.grants_gov_job.txt
+
+COPY jobs/grants_gov_job.py jobs/grants_gov_job.py
+
+# Shared streamlit-free modules (also imported by views/grants_gov_fetch.py)
+COPY src/__init__.py src/__init__.py
+COPY src/modules/__init__.py src/modules/__init__.py
+COPY src/modules/grants_gov.py src/modules/grants_gov.py
+COPY src/modules/anthropic_utils.py src/modules/anthropic_utils.py
+COPY src/modules/newsletter.py src/modules/newsletter.py
+COPY src/modules/Embedding/__init__.py src/modules/Embedding/__init__.py
+COPY src/modules/Embedding/text_embedder.py src/modules/Embedding/text_embedder.py
+COPY src/modules/GoogleBucketManager/bucket_manager.py src/modules/GoogleBucketManager/bucket_manager.py
+
+ENV PYTHONPATH=/app
+
+ENTRYPOINT ["python", "jobs/grants_gov_job.py"]

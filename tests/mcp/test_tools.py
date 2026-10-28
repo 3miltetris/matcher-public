@@ -181,6 +181,91 @@ def test_search_grants(storage):
     assert scoped['results'][0]['topic_number'] == 'T2'
 
 
+def test_search_grants_dedup_across_folders(storage):
+    # Same opportunity (same topic_number) listed under three consortium folders.
+    row = {'topic_number': 'MUSA-1', 'title': 'Biomanufacturing call',
+           'grant_summary': 'cell therapy manufacturing', 'due_date': '',
+           'is_rolling': True, 'embeddings': [1.0, 0.0, 0.0]}
+    for folder, label in (('NIIMBL', 'NIIMBL'), ('AFFOA', 'AFFOA'),
+                          ('NEXTFLEX', 'NextFlex')):
+        put_parquet(storage, f'data/all-topics/processed/{folder}/t.parquet',
+                    pd.DataFrame([{**row, 'agency': label}]))
+
+    out = t_search.search_grants(storage, _fake_embedder([1.0, 0.0, 0.0]),
+                                 'manufacturing', open_only=True, limit=10)
+    assert len(out['results']) == 1                       # collapsed to one row
+    r = out['results'][0]
+    assert r['status'] == 'rolling'
+    assert len(r['also_listed_under']) == 2               # the other two labels
+    assert out['topics_searched'] == 3                    # all three were scored
+
+
+def test_search_grants_open_only_drops_expired(storage):
+    topics = pd.DataFrame([
+        {'topic_number': 'OLD', 'title': 'Expired call', 'agency': 'ARMY',
+         'grant_summary': 'x', 'due_date': '2001-01-01', 'is_rolling': False,
+         'embeddings': [1.0, 0.0, 0.0]},
+        {'topic_number': 'ROLL', 'title': 'Rolling call', 'agency': 'ARMY',
+         'grant_summary': 'x', 'due_date': 'nan', 'is_rolling': True,
+         'embeddings': [0.9, 0.1, 0.0]},
+    ])
+    put_parquet(storage, 'data/all-topics/processed/DOD/t.parquet', topics)
+
+    out = t_search.search_grants(storage, _fake_embedder([1.0, 0.0, 0.0]),
+                                 'call', open_only=True, limit=10)
+    nums = [r['topic_number'] for r in out['results']]
+    assert 'OLD' not in nums and 'ROLL' in nums
+    roll = out['results'][0]
+    assert roll['due_date'] == ''                         # 'nan' scrubbed
+    assert roll['broad_agency'] == 'DOD'                  # folder-injected
+
+    # open_only=False keeps the expired one.
+    allout = t_search.search_grants(storage, _fake_embedder([1.0, 0.0, 0.0]),
+                                    'call', open_only=False, limit=10)
+    assert 'OLD' in [r['topic_number'] for r in allout['results']]
+
+
+def test_search_grants_filters_procurement_and_surfaces_record_kind(storage):
+    topics = pd.DataFrame([
+        {'topic_number': 'RD', 'title': 'Radiopharmaceutical R&D',
+         'agency': 'NIH', 'grant_summary': 'development of novel F-18 tracers',
+         'due_date': '2030-01-01', 'embeddings': [1.0, 0.0, 0.0]},
+        {'topic_number': 'BUY', 'title': '6505--Radiopharmaceuticals',
+         'agency': 'VA', 'grant_summary': 'supply of radiopharmaceutical product',
+         'due_date': '2030-01-01', 'embeddings': [0.98, 0.02, 0.0]},
+    ])
+    put_parquet(storage, 'data/all-topics/processed/HHS/t.parquet', topics)
+
+    # Default: the supply buy is dropped even though it scores high on topical fit.
+    out = t_search.search_grants(storage, _fake_embedder([1.0, 0.0, 0.0]),
+                                 'radiopharmaceuticals', open_only=False, limit=10)
+    nums = [r['topic_number'] for r in out['results']]
+    assert nums == ['RD']
+    assert out['results'][0]['record_kind'] == 'solicitation'
+
+    # Opt in: the supply buy returns, tagged as procurement.
+    inc = t_search.search_grants(storage, _fake_embedder([1.0, 0.0, 0.0]),
+                                 'radiopharmaceuticals', open_only=False,
+                                 include_procurement=True, limit=10)
+    by_num = {r['topic_number']: r for r in inc['results']}
+    assert by_num['BUY']['record_kind'] == 'procurement'
+
+
+def test_search_grants_empty_agency_streams_all(storage):
+    put_parquet(storage, 'data/all-topics/processed/DOD/a.parquet', pd.DataFrame([
+        {'topic_number': 'A', 'title': 'alpha', 'agency': 'ARMY', 'grant_summary': 'x',
+         'due_date': '2030-01-01', 'embeddings': [1.0, 0.0]}]))
+    put_parquet(storage, 'data/all-topics/processed/HHS/b.parquet', pd.DataFrame([
+        {'topic_number': 'B', 'title': 'beta', 'agency': 'NCI', 'grant_summary': 'y',
+         'due_date': '2030-01-01', 'embeddings': [0.0, 1.0]}]))
+
+    out = t_search.search_grants(storage, _fake_embedder([0.0, 1.0]),
+                                 'anything', open_only=True, limit=10)
+    assert out['topics_searched'] == 2
+    assert {r['topic_number'] for r in out['results']} == {'A', 'B'}
+    assert out['results'][0]['topic_number'] == 'B'       # best cosine first
+
+
 def test_search_resumes(storage):
     res = pd.DataFrame([
         {'firstName': 'Ada', 'lastName': 'Lovelace', 'company': 'Acme',

@@ -154,8 +154,14 @@ DO NOT IMPORT (NO) if any of the following are true:
 - The opportunity is clearly intended for universities, nonprofits, state/local governments, or large prime contractors with no realistic small business angle
 - It is a workforce development, training, community services, or infrastructure project
 - It is a generic service procurement with no meaningful R&D or innovation component (e.g., janitorial, facilities, staffing, administrative support)
+- It is a COMMODITY, SUPPLY, or PRODUCT purchase — buying goods, materials, or finished product rather than funding research or development. This includes medical/laboratory/dental supplies, drug or radiopharmaceutical product delivery, equipment buys, and anything requiring the offeror to already hold FDA approval or sell an established commercial product. A radiopharmaceutical or vaccine *supply/delivery* contract is NOT R&D even though the subject matter sounds technical.
+- It is a SOLE-SOURCE notice, brand-name or "brand name or equal" justification, or a NOTICE OF INTENT TO AWARD — there is no open competition to pursue.
+- It is a SOURCES-SOUGHT notice or RFI that only surveys the market for an existing product or capability, or an award that has ALREADY been made.
+- Its scope is written so narrowly that only an incumbent or a handful of named vendors could perform it.
 - The NAICS descriptor is in a sector where deep tech startups almost never compete (e.g., construction, food service, transportation logistics)
 - The description makes clear that prior large-scale program experience or clearances beyond typical small business reach are required
+
+Use the Notice type and Set-aside fields as evidence: a "Sources Sought" notice is a market survey, not a fundable call; a "Special Notice" is often a sole-source/intent-to-award; and a set-aside you cannot read as open to a typical small R&D business (for example a notice that demands an established commercial product) is a signal to answer NO.
 
 When uncertain, only import if the opportunity is clearly relevant. Do not import on weak signals alone.
 
@@ -584,6 +590,12 @@ async def _screen_all(df: pd.DataFrame, anth_key: str,
     titles = df['title'].astype(str).tolist()
     descs  = df['description'].astype(str).tolist()
     naics  = df['naics_desc'].astype(str).tolist() if 'naics_desc' in df.columns else [''] * len(df)
+    # Notice type and set-aside are available from the search metadata even in API
+    # mode, where the description is not fetched until after screening — so they are
+    # often the only signal that a technically-worded notice is a supply buy,
+    # sources-sought, or sole-source. Pass them to the screener.
+    ntypes = df['notice_type'].astype(str).tolist() if 'notice_type' in df.columns else [''] * len(df)
+    setasd = df['set_aside'].astype(str).tolist() if 'set_aside' in df.columns else [''] * len(df)
 
     sem      = asyncio.Semaphore(_SCREEN_CONCUR)
     results: list[dict | None] = [None] * len(df)
@@ -601,6 +613,8 @@ async def _screen_all(df: pd.DataFrame, anth_key: str,
                             system=system,
                             messages=[{'role': 'user', 'content': (
                                 f"Title: {titles[i]}\n"
+                                f"Notice type: {ntypes[i] or '(unknown)'}\n"
+                                f"Set-aside: {setasd[i] or '(none)'}\n"
                                 f"Description: {descs[i][:_SCREEN_MAX_CHARS]}\n"
                                 f"NAICS Descriptor: {naics[i]}"
                             )}],
@@ -1689,6 +1703,15 @@ def main(config_blob_path: str) -> None:
         'last_verified_active': today,
         'verify_status':        'active',
     })
+
+    # Persist the classification fields going forward (previously extracted then
+    # dropped). They let `grant_utils.classify_record_kind` and the re-ranker tell
+    # a supply buy / sources-sought / sole-source notice from a fundable R&D
+    # solicitation without re-fetching from SAM.gov. Present in API mode; guarded
+    # for the CSV path, where only naics may be mapped.
+    for _src, _dst in (('notice_type', 'notice_type'), ('base_type', 'base_type'),
+                       ('set_aside', 'set_aside'), ('naics_desc', 'naics_code')):
+        out[_dst] = new_rows[_src].astype(str).values if _src in new_rows.columns else ''
 
     for col_name, col_val in custom_cols.items():
         out[col_name] = col_val

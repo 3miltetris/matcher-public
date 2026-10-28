@@ -216,11 +216,12 @@ def add_spend(gcs_client, email: str, amount: float, *, cap: float | None = None
 
 def running_run_id(gcs_client, job: str, *, bucket: str = BUCKET) -> str | None:
     """The run_id of an in-flight run of `job`, or None. Checks the job run lock
-    first, then the newest status.json if its state reads as running. All five
-    triggerable jobs now hold a run lock while executing (matching-job acquires
-    one in its __main__, same as the sync jobs), so an in-flight run is seen here;
-    the single-use confirm token closes the remaining replay-after-completion gap
-    that a run_id or a status check alone could not."""
+    first, then the newest status.json if its state reads as running. matching-job
+    and the two sync jobs (drive-sync, fathom-sync) hold a run lock while executing
+    and are seen by the lock check; client-profile-job and drive-onboard-job do NOT
+    take a lock, so for those the status.json fallback is the only in-flight signal
+    — keep it. The single-use confirm token closes the remaining
+    replay-after-completion gap that a run_id or a status check alone could not."""
     lock = gcs_client.bucket(bucket).blob(gw.lock_blob(job))
     try:
         rec = json.loads(lock.download_as_bytes())

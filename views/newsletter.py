@@ -92,8 +92,11 @@ def _load(start: date, end: date, agencies: list[str]) -> pd.DataFrame:
     scraped = df.get('scraped_at', pd.Series([''] * len(df))).astype(str).str[:10]
     lo, hi = start.isoformat(), end.isoformat()
     df = df[(scraped >= lo) & (scraped <= hi)].reset_index(drop=True)
-    # Archived notices and expired rolling deadlines are not newsletter candidates.
-    df = drop_dead_topics(df).reset_index(drop=True)
+    # Archived/inactive notices are not newsletter candidates. Keep provably-expired
+    # items (drop_expired=False): a just-scraped item with an already-past deadline
+    # should still reach the human review — a passed deadline is a screening-time
+    # editorial call, not a reason to hide the row silently.
+    df = drop_dead_topics(df, drop_expired=False).reset_index(drop=True)
 
     for col in nl.COLUMNS + nl.REVIEW_COLUMNS:
         if col not in df.columns:

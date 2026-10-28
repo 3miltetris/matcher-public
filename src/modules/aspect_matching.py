@@ -71,19 +71,24 @@ CATEGORY_ALL = 'All categories'
 # flat market_embeddings / unexplored_embeddings block.
 Unit = namedtuple('Unit', 'prof market mi kind')
 
-# Topic columns carried into the results, when present.
+# Topic columns carried into the results, when present. `record_kind` /
+# `notice_type` / `set_aside` let a reviewer see what each row actually is (a
+# fundable solicitation vs a supply buy / sources-sought / award) and judge
+# eligibility; `source` is the link to the solicitation (a coworker's top ask).
 TOPIC_COLS = [
-    'topic_number', 'title', 'agency', 'broad_agency', 'due_date', 'close_date',
-    'open_date', 'is_rolling', 'last_verified_active', 'verify_status',
-    'funding_amount', 'grant_summary', 'source',
+    'topic_number', 'title', 'agency', 'broad_agency', 'record_kind', 'due_date',
+    'close_date', 'open_date', 'is_rolling', 'last_verified_active', 'verify_status',
+    'funding_amount', 'set_aside', 'notice_type', 'grant_summary', 'source',
 ]
 
-# Result columns worth seeing first, in this order.
+# Result columns worth seeing first, in this order. `record_kind` and `source`
+# are promoted so a reviewer sees what each row is and where it lives without
+# scrolling to the far-right "rest" columns.
 DISPLAY_FIRST = [
     'client', 'pool', 'market', 'market_kind', 'market_tier', 'aspect_label', 'aspect_score',
     'aspects_hit', 'aspects_total',
-    'llm_score', 'llm_samples', 'llm_rationale', 'topic_number', 'title', 'agency', 'broad_agency',
-    'is_rolling',
+    'llm_score', 'llm_samples', 'llm_rationale', 'record_kind', 'topic_number', 'title',
+    'agency', 'broad_agency', 'is_rolling', 'source',
 ]
 
 
@@ -375,6 +380,11 @@ RERANK_SYSTEM = (
     'does not do\n'
     '1 = no meaningful connection\n\n'
     'Judge only the capability as described — never assume capabilities that are not stated.\n'
+    'A high score requires a FUNDABLE R&D opportunity. If the notice type / record '
+    'kind below shows this is a commodity or supply purchase, a sources-sought '
+    'market survey, a sole-source or notice-of-intent-to-award, or a contract '
+    'already awarded, it cannot be pursued as R&D — score it 1 however closely the '
+    'subject matter appears to match.\n'
     'When torn between two scores, choose the lower.\n'
     'Return ONLY a JSON object, no markdown or headings — rationale first, then score:\n'
     '{"rationale": "<at most 50 words naming the core need and whether it is '
@@ -402,11 +412,32 @@ RERANK_UNEXPLORED_SYSTEM = (
     '1 = unrelated to anything the company can do\n\n'
     'Judge the extension ONLY against the listed capabilities — never assume capabilities '
     'that are not stated, and never credit the hypothesis for being ambitious.\n'
+    'A high score requires a FUNDABLE R&D opportunity. If the notice type / record '
+    'kind below shows this is a commodity or supply purchase, a sources-sought '
+    'market survey, a sole-source or notice-of-intent-to-award, or a contract '
+    'already awarded, it cannot be pursued as R&D — score it 1.\n'
     'When torn between two scores, choose the lower.\n'
     'Return ONLY a JSON object, no markdown or headings — rationale first, then score:\n'
     '{"rationale": "<at most 50 words naming which listed capability carries over and '
     'what gap remains>", "score": <integer 1-5>}'
 )
+
+
+def _notice_descriptor(row: dict) -> str:
+    """A one-line 'what kind of notice is this' descriptor for the re-ranker,
+    from whatever classification fields the row carries. Empty when nothing is
+    known (so it adds no misleading 'unknown' noise)."""
+    kind = str(row.get('record_kind') or '').strip()
+    ntype = str(row.get('notice_type') or '').strip()
+    setaside = str(row.get('set_aside') or '').strip()
+    parts = []
+    if kind and kind.lower() != 'solicitation':
+        parts.append(f'record kind: {kind}')
+    if ntype:
+        parts.append(f'notice type: {ntype}')
+    if setaside:
+        parts.append(f'set-aside: {setaside}')
+    return ('Notice classification (' + '; '.join(parts) + ')\n') if parts else ''
 
 
 def rerank_user_message(row: dict) -> str:
@@ -424,6 +455,7 @@ def rerank_user_message(row: dict) -> str:
             f"{str(row.get('_linked_aspects') or '(none recorded)')[:3000]}\n\n"
             f"Grant topic: {row.get('title', '')}\n"
             f"Agency: {row.get('agency', '') or row.get('broad_agency', '')}\n"
+            f"{_notice_descriptor(row)}"
             f"Topic description:\n{str(row.get('grant_summary') or '')[:6000]}"
         )
     return (
@@ -433,6 +465,7 @@ def rerank_user_message(row: dict) -> str:
         f"{str(row.get('_aspect_text') or '')[:2000]}\n\n"
         f"Grant topic: {row.get('title', '')}\n"
         f"Agency: {row.get('agency', '') or row.get('broad_agency', '')}\n"
+        f"{_notice_descriptor(row)}"
         f"Topic description:\n{str(row.get('grant_summary') or '')[:6000]}"
     )
 

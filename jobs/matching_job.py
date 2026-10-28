@@ -38,7 +38,8 @@ import src.modules.gcs_write as gw
 from src.modules.email_generator import (
     async_generate_subject_line, async_josiah_copy, async_custom_prompt, clean_agency,
 )
-from src.modules.grant_utils import normalize_grant_columns, drop_dead_topics
+from src.modules.grant_utils import (normalize_grant_columns, drop_dead_topics,
+                                      add_record_kind)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -414,6 +415,7 @@ def main(config_blob_path: str) -> None:
     topic_filters   = config.get('topic_filters', [])
     ai_validation   = bool(config.get('ai_validation', True))
     prewrite_email  = bool(config.get('prewrite_email', False))
+    include_procurement = bool(config.get('include_procurement', False))
     email_config    = config.get('email_config', {})
     results_prefix  = f'{_RESULTS_PREFIX}{run_id}/'
 
@@ -429,6 +431,21 @@ def main(config_blob_path: str) -> None:
 
     topics_df = normalize_grant_columns(topics_df)
 
+    # Classify each topic (solicitation / procurement / award) and, by default,
+    # drop supply buys, sources-sought, sole-source and already-awarded notices —
+    # the same filter Grant Search and Bulk Aspect Match apply. Without it the
+    # outreach CSVs this job produces are dominated by non-fundable SAM.gov rows
+    # (the complaint that motivated record_kind). `include_procurement` opts back in.
+    topics_df = add_record_kind(topics_df)
+    if not include_procurement and 'record_kind' in topics_df.columns:
+        _before = len(topics_df)
+        topics_df = topics_df[topics_df['record_kind'] != 'procurement'].reset_index(drop=True)
+        print(f'  dropped {_before - len(topics_df):,} procurement topics '
+              f'({len(topics_df):,} remain)', flush=True)
+        if topics_df.empty:
+            raise RuntimeError('No fundable solicitations remain after the '
+                               'procurement filter (set include_procurement to include them).')
+
     if topic_filters:
         topics_df = _apply_filters(topics_df, topic_filters)
         if topics_df.empty:
@@ -438,8 +455,8 @@ def main(config_blob_path: str) -> None:
     grant_embeddings = np.stack(topics_df['embeddings'].values).astype(np.float32)
     topics_df        = topics_df.drop(columns=['embeddings'])
 
-    grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'due_date',
-                  'is_rolling', 'last_verified_active', 'verify_status',
+    grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'record_kind',
+                  'due_date', 'is_rolling', 'last_verified_active', 'verify_status',
                   'funding_amount', 'grant_summary', 'source']
     grant_meta = topics_df[[c for c in grant_cols if c in topics_df.columns]].reset_index(drop=True)
     if 'source' in grant_meta.columns:
@@ -551,6 +568,7 @@ def main(config_blob_path: str) -> None:
     )
     _write_status(gcs_client, results_prefix, {
         'run_id':           run_id,
+        'state':            'complete',
         'total_candidates': total_candidates,
         'total_saved':      total_saved,
         'segments':         seg_num,
@@ -601,7 +619,8 @@ if __name__ == '__main__':
             _write_status(
                 _gcs_client,
                 f'{_RESULTS_PREFIX}{run_id_fallback}/',
-                {'run_id': run_id_fallback, 'error': tb, 'total_saved': 0},
+                {'run_id': run_id_fallback, 'state': 'error', 'error': tb,
+                 'total_saved': 0},
             )
         except Exception:
             pass

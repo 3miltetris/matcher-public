@@ -43,7 +43,7 @@ import src.modules.aspect_profile as ap
 import src.modules.pools as pl
 import src.modules.ui_common as uc
 from src.modules.Embedding.text_embedder import TextProcessor
-from src.modules.grant_utils import normalize_grant_columns, drop_dead_topics
+from src.modules.grant_utils import normalize_grant_columns, drop_dead_topics, add_record_kind
 
 # ── GCS ────────────────────────────────────────────────────────────────────
 
@@ -109,7 +109,8 @@ def _list_award_sources() -> list[str]:
         return []
 
 
-def _load_topics(agencies: list[str], award_sources: list[str] | None = None) -> pd.DataFrame:
+def _load_topics(agencies: list[str], award_sources: list[str] | None = None,
+                 include_procurement: bool = False) -> pd.DataFrame:
     client = _get_storage_client()
     frames = []
     for agency in agencies:
@@ -118,7 +119,6 @@ def _load_topics(agencies: list[str], award_sources: list[str] | None = None) ->
             if blob.name.endswith('.parquet'):
                 df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
                 df['broad_agency'] = agency
-                df['record_kind']  = 'solicitation'
                 frames.append(df)
     for src in (award_sources or []):
         prefix = f'{_AWARDS_PREFIX}{src}/'
@@ -134,6 +134,12 @@ def _load_topics(agencies: list[str], award_sources: list[str] | None = None) ->
     # Drop notices the revision check archived and rolling deadlines a re-check
     # found gone (verify_status == 'inactive').
     topics = drop_dead_topics(topics).reset_index(drop=True)
+    # Classify solicitation vs procurement vs award (award frames keep 'award').
+    # Drop procurement (supply buys, sources-sought, sole-source, intent-to-award)
+    # by default — not fundable opportunities — unless opted in.
+    topics = add_record_kind(topics)
+    if not include_procurement and 'record_kind' in topics.columns:
+        topics = topics[topics['record_kind'] != 'procurement'].reset_index(drop=True)
     return topics
 
 
@@ -522,9 +528,20 @@ if _award_sources:
         _selected_awards = _award_sources
         st.caption(f'Award sources included: `{", ".join(_award_sources)}`')
 
+_gs_include_procurement = st.checkbox(
+    'Include procurement / supply notices',
+    value=False,
+    key='gs_include_procurement',
+    help='Off by default: commodity/supply buys, sources-sought, sole-source and '
+         'notice-of-intent-to-award notices are dropped because they are not fundable '
+         'R&D opportunities even when the subject matter matches. Tick to keep them '
+         '(tagged in the `record_kind` column).',
+)
+
 if st.button('Load Topics', type='primary', disabled=not selected):
     with st.spinner(f'Loading topics from {len(selected)} agenc{"y" if len(selected) == 1 else "ies"}…'):
-        df = _load_topics(selected, _selected_awards)
+        df = _load_topics(selected, _selected_awards,
+                          include_procurement=_gs_include_procurement)
     if df.empty:
         st.warning('No topics found for the selected agencies.')
     else:
@@ -683,7 +700,8 @@ if search_mode == _MODE_DESC:
             # Surface award/solicitation up front rather than leaving it buried among
             # the trailing columns — a past award read as an open opportunity is the
             # one mistake this whole separation exists to prevent.
-            if 'record_kind' in results.columns and (results['record_kind'] == 'award').any():
+            if 'record_kind' in results.columns and \
+                    results['record_kind'].isin(('award', 'procurement')).any():
                 primary_cols = ['record_kind'] + primary_cols
             if has_rolling:
                 primary_cols = ['is_rolling'] + primary_cols

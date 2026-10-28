@@ -77,43 +77,124 @@ def _load_parquets(gcs_client, prefix: str, *, bucket: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def _topic_folders(gcs_client, *, bucket: str) -> dict[str, list]:
+    """Group the parquet blobs under processed/ by their agency folder (the first
+    path segment after the prefix). One cheap list call — blobs aren't downloaded
+    until a folder is scored, so peak memory is one folder, not the whole store."""
+    folders: dict[str, list] = {}
+    for blob in gcs_client.list_blobs(bucket, prefix=_TOPICS_PREFIX):
+        if not blob.name.endswith('.parquet'):
+            continue
+        rest = blob.name[len(_TOPICS_PREFIX):]
+        folder = rest.split('/', 1)[0] if '/' in rest else ''
+        if folder:
+            folders.setdefault(folder, []).append(blob)
+    return folders
+
+
+def _dedup_key(row) -> str:
+    """Identity of an opportunity for cross-folder dedup: its topic number when
+    present, else its normalized title. Collapses the same call listed under
+    several consortium folders (NIIMBL/AFFOA/NextFlex)."""
+    tn = str(row.get('topic_number', '') or '').strip()
+    if tn and tn.lower() not in ('nan', 'none'):
+        return f'tn::{tn.lower()}'
+    title = ' '.join(str(row.get('title', '') or '').split()).lower()
+    return f'ti::{title}'
+
+
 # ── grants ────────────────────────────────────────────────────────────────────
 
 def search_grants(gcs_client, embed_query, query: str, *, agency: str | None = None,
-                  open_only: bool = True, limit: int = 10,
-                  bucket: str = BUCKET) -> dict:
+                  open_only: bool = True, include_procurement: bool = False,
+                  limit: int = 10, bucket: str = BUCKET) -> dict:
     """Rank grant topics against a typed technology description. `agency`
-    restricts to one processed/ folder (e.g. 'DOD'); omit for all. `open_only`
-    drops archived/expired topics (grant_utils.drop_dead_topics), the same filter
-    every other reader uses. Returns the top matches with a 0-1 cosine score."""
-    prefix = _TOPICS_PREFIX + (f'{agency.strip("/")}/' if agency else '')
-    df = _load_parquets(gcs_client, prefix, bucket=bucket)
-    if df.empty:
-        return {'query': query, 'results': [], 'topics_searched': 0}
-    df = gu.normalize_grant_columns(df)
-    if open_only and hasattr(gu, 'drop_dead_topics'):
-        df = gu.drop_dead_topics(df).reset_index(drop=True)
-    if 'embeddings' not in df.columns or df.empty:
-        return {'query': query, 'results': [], 'topics_searched': 0}
+    restricts to one processed/ folder (e.g. 'DOD'); omit for all — the all-agency
+    search streams folder by folder, so it no longer loads the whole store at once.
+    `open_only` drops archived/inactive and provably-expired topics (past deadline,
+    not rolling), the same filter every reader uses. `include_procurement` (default
+    False) keeps commodity/supply buys, sources-sought, sole-source and
+    notice-of-intent-to-award notices — otherwise they are dropped as non-fundable.
+    The same call listed under several folders is collapsed to one row with
+    `also_listed_under`. Each result carries a `record_kind`
+    (solicitation/procurement/award), a `status` of open/rolling/unknown and a
+    0-1 cosine score."""
+    folders = _topic_folders(gcs_client, bucket=bucket)
+    if agency:
+        want = agency.strip('/')
+        folders = {want: folders[want]} if want in folders else {}
+    if not folders:
+        return {'query': query, 'topics_searched': 0, 'results': []}
 
-    mat, rows = _matrix(list(df['embeddings']))
     qvec = embed_query(query)
-    top = _cosine_top(qvec, mat, rows, limit)
+    keep_per_folder = max(2 * int(limit), 20)
+    candidates: list[dict] = []
+    scored = 0
 
-    results = []
-    for pos, score in top:
-        r = df.iloc[pos]
-        results.append({
-            'topic_number': str(r.get('topic_number', '') or ''),
-            'title': cm.cap_text(r.get('title'), 300),
-            'agency': str(r.get('agency', '') or ''),
-            'broad_agency': str(r.get('broad_agency', '') or ''),
-            'due_date': str(r.get('due_date', '') or r.get('close_date', '') or ''),
-            'grant_summary': cm.cap_text(r.get('grant_summary'), 800),
-            'source': cm.cap_text(r.get('source'), 300),
-            'score': round(score, 3),
-        })
-    return {'query': query, 'topics_searched': int(len(df)), 'results': results}
+    for folder, blobs in folders.items():
+        frames = []
+        for blob in blobs:
+            try:
+                frames.append(pd.read_parquet(io.BytesIO(blob.download_as_bytes())))
+            except Exception:
+                continue
+        if not frames:
+            continue
+        df = pd.concat(frames, ignore_index=True)
+        del frames
+        df['broad_agency'] = folder            # folder is the agency identity
+        df = gu.normalize_grant_columns(df)
+        if open_only:
+            df = gu.drop_dead_topics(df).reset_index(drop=True)
+        df = gu.add_record_kind(df)
+        if not include_procurement and 'record_kind' in df.columns:
+            df = df[df['record_kind'] != 'procurement'].reset_index(drop=True)
+        if df.empty or 'embeddings' not in df.columns:
+            continue
+        scored += len(df)
+        mat, rowpos = _matrix(list(df['embeddings']))
+        for pos, score in _cosine_top(qvec, mat, rowpos, keep_per_folder):
+            r = df.iloc[pos]
+            candidates.append({
+                'topic_number': str(r.get('topic_number', '') or ''),
+                'title': cm.cap_text(r.get('title'), 300),
+                'agency': str(r.get('agency', '') or ''),
+                'broad_agency': folder,
+                'record_kind': str(r.get('record_kind', '') or 'solicitation'),
+                'due_date': gu.clean_date_display(
+                    r.get('due_date', '') or r.get('close_date', '')),
+                'status': gu.topic_open_status(r),
+                'grant_summary': cm.cap_text(r.get('grant_summary'), 800),
+                'source': cm.cap_text(r.get('source'), 300),
+                'score': round(float(score), 3),
+                '_key': _dedup_key(r),
+            })
+        del df, mat
+
+    # Collapse cross-folder duplicates: keep the best-scoring copy, record the
+    # other folders/agencies it was listed under.
+    best: dict[str, dict] = {}
+    for c in candidates:
+        key = c['_key']
+        cur = best.get(key)
+        if cur is None:
+            c['also_listed_under'] = []
+            best[key] = c
+        else:
+            keeper = cur if cur['score'] >= c['score'] else c
+            other = c if keeper is cur else cur
+            alts = set(keeper.get('also_listed_under', []))
+            for lbl in (other['agency'] or other['broad_agency'],
+                        *other.get('also_listed_under', [])):
+                if lbl and lbl != (keeper['agency'] or keeper['broad_agency']):
+                    alts.add(lbl)
+            keeper['also_listed_under'] = sorted(alts)
+            best[key] = keeper
+
+    results = sorted(best.values(), key=lambda c: c['score'], reverse=True)[:max(1, int(limit))]
+    for c in results:
+        c.pop('_key', None)
+    return {'query': query, 'topics_searched': scored, 'results': results}
 
 
 # ── profiles ──────────────────────────────────────────────────────────────────

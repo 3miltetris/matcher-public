@@ -27,7 +27,8 @@ from google.oauth2 import service_account
 
 import src.modules.pools as pl
 from src.modules.email_generator import DEFAULT_SUBJECT_SYSTEM, DEFAULT_JOSIAH_SYSTEM
-from src.modules.grant_utils import normalize_grant_columns, drop_dead_topics
+from src.modules.grant_utils import (normalize_grant_columns, drop_dead_topics,
+                                      add_record_kind)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -362,6 +363,7 @@ if st.button('Load Topics', type='primary', disabled=not selected_agencies):
         st.warning('No topics found for the selected agencies.')
     else:
         _df = normalize_grant_columns(_df)
+        _df = add_record_kind(_df)   # classify; the procurement filter is applied below
         _df = _df.drop(columns=['embeddings'], errors='ignore')
         st.session_state.bm_topics_df  = _df
         st.session_state.bm_filters    = [{'column': None, 'type': 'keyword', 'keyword': '', 'operator': 'AND'}]
@@ -369,7 +371,26 @@ if st.button('Load Topics', type='primary', disabled=not selected_agencies):
         st.success(f'Loaded **{len(_df):,}** grant topics.')
 
 if st.session_state.bm_topics_df is not None:
-    _topics_df      = st.session_state.bm_topics_df
+    _topics_df = st.session_state.bm_topics_df
+
+    # Fundable R&D solicitations only, by default: sole-source / sources-sought /
+    # supply buys / already-awarded notices (tagged in `record_kind`) are excluded.
+    # The run applies the same filter, so these counts match what it scores.
+    _include_procurement = st.checkbox(
+        'Include procurement & supply notices',
+        value=False,
+        key='bm_include_procurement',
+        help='Off by default: non-fundable SAM.gov rows — sole-source, '
+             'sources-sought market surveys, commodity/supply buys and already-'
+             'awarded contracts — are excluded. Tick to match against them too.',
+    )
+    if not _include_procurement and 'record_kind' in _topics_df.columns:
+        _n_proc = int((_topics_df['record_kind'] == 'procurement').sum())
+        _topics_df = _topics_df[_topics_df['record_kind'] != 'procurement'].reset_index(drop=True)
+        if _n_proc:
+            st.caption(f'Excluding {_n_proc:,} procurement/supply notice(s) — '
+                       f'{len(_topics_df):,} fundable solicitation(s) remain.')
+
     filterable_cols = list(_topics_df.columns)
 
     for f in st.session_state.bm_filters:
@@ -624,6 +645,7 @@ if st.button('▶ Run Matching', type='primary', disabled=not can_run):
         'topic_filters':  active_filters,
         'ai_validation':  ai_validation,
         'prewrite_email': prewrite_email,
+        'include_procurement': bool(st.session_state.get('bm_include_procurement', False)),
         'email_config':   email_config,
     }
     try:
