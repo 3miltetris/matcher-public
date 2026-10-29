@@ -4,6 +4,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# weasyprint renders the funding-roadmap PDF; it needs pango/cairo/harfbuzz via
+# the system libs below, plus Liberation (Arial-metric) and Carlito
+# (Calibri-metric) fonts so the BW&CO brand stack resolves on a headless image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
+      libjpeg62-turbo libffi8 shared-mime-info \
+      fonts-liberation fonts-dejavu-core fonts-crosextra-carlito \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.intake_web.txt .
 RUN pip install --no-cache-dir -r requirements.intake_web.txt
 
@@ -26,6 +35,16 @@ COPY src/modules/tech_research.py src/modules/tech_research.py
 COPY src/modules/folder_match.py src/modules/folder_match.py
 COPY src/modules/drive_client.py src/modules/drive_client.py
 COPY src/modules/doc_extract.py src/modules/doc_extract.py
+
+# roadmap feature (event-kiosk funding roadmap) + its shared cores: profile
+# build, aspect matching, grant_utils, anthropic_utils, and the roadmap package
+# (templates included).
+COPY src/modules/anthropic_utils.py src/modules/anthropic_utils.py
+COPY src/modules/aspect_matching.py src/modules/aspect_matching.py
+COPY src/modules/profile_build.py src/modules/profile_build.py
+COPY src/modules/grant_utils.py src/modules/grant_utils.py
+COPY src/modules/roadmap src/modules/roadmap
+
 COPY src/modules/Embedding/__init__.py src/modules/Embedding/__init__.py
 COPY src/modules/Embedding/text_embedder.py src/modules/Embedding/text_embedder.py
 COPY src/modules/GoogleBucketManager/bucket_manager.py src/modules/GoogleBucketManager/bucket_manager.py

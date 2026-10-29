@@ -19,6 +19,7 @@ SMTP is unset. Never set it in the deployed service.
 
 import logging
 import os
+import re
 import secrets
 import time
 from collections import defaultdict, deque
@@ -38,6 +39,8 @@ from src.modules.intake import schema_export as sx
 from src.modules.intake import sessions as ss
 from src.modules.intake import submit_pipeline as sp
 from src.modules.intake import uploads as up
+from src.modules.roadmap import hubspot_roadmap as hr
+from src.modules.roadmap import pipeline as rp
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message)s')
 log = logging.getLogger('intake')
@@ -67,6 +70,16 @@ def deps() -> sp.Deps:
     if _deps is None:
         _deps = sp.production_deps()
     return _deps
+
+
+_rm_deps: rp.RoadmapDeps | None = None
+
+
+def rm_deps() -> rp.RoadmapDeps:
+    global _rm_deps
+    if _rm_deps is None:
+        _rm_deps = rp.production_deps()
+    return _rm_deps
 
 
 # ── Abuse limits (per instance; Turnstile + the allowlist are the real gates) ─
@@ -369,3 +382,102 @@ def _finish(session_id: str) -> None:
     except Exception as e:
         log.exception('intake %s: background pipeline crashed', session_id)
         notify.step_failed(session_id, '(unknown)', 'background', type(e).__name__)
+
+
+# ── Funding roadmap (event kiosk / Instantly) ─────────────────────────────────
+#
+# A HubSpot form submission fires a workflow webhook here. We trust the payload
+# only to name a contact; every field is re-read from HubSpot with our token, so
+# a forged body can at most trigger work (guarded by the shared secret + rate
+# limit), never inject content. The roadmap runs as a background task and writes
+# roadmap_pdf_url back onto the contact, which is the boss's HubSpot workflow
+# trigger for the email/text sequence.
+
+_ROADMAP_MODES = {rp.MODE_EVENT, rp.MODE_INSTANTLY}
+_TOKEN_RE      = re.compile(r'^[A-Za-z0-9_-]{16,64}$')
+
+
+def _roadmap_secret_ok(request: Request) -> bool:
+    """Constant-time check of the shared secret (header or query). An unset
+    secret refuses in production, so the endpoint is never an open faucet."""
+    expected = os.environ.get('ROADMAP_WEBHOOK_SECRET')
+    if not expected:
+        return DEV
+    given = (request.headers.get('X-Roadmap-Secret')
+             or request.query_params.get('secret') or '')
+    return secrets.compare_digest(given, expected)
+
+
+@app.post('/api/roadmap/webhook')
+async def roadmap_webhook(request: Request, background: BackgroundTasks):
+    """HubSpot workflow webhook. The body is whatever HubSpot sends (its envelope
+    carries objectId); we pull the contact id/email flexibly and re-fetch every
+    field ourselves. `mode` comes from the query string (?mode=event|instantly),
+    since the workflow action sets the URL, not the body."""
+    _limit(f'rm:{_client_ip(request)}', 120, 3600)     # 120/hour/IP, before any work
+    if not _roadmap_secret_ok(request):
+        raise HTTPException(401, 'unauthorized')
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    contact_id, email = hr.contact_ref_from_webhook(payload)
+    if not (contact_id or email):
+        raise HTTPException(400, 'a contact id or email is required')
+    mode = (request.query_params.get('mode')
+            or (payload.get('mode') if isinstance(payload, dict) else None)
+            or rp.MODE_EVENT)
+    if mode not in _ROADMAP_MODES:
+        mode = rp.MODE_EVENT
+    background.add_task(_run_roadmap, contact_id, email, mode, _public_base(request))
+    log.info('roadmap: accepted (%s, by %s)', mode, 'id' if contact_id else 'email')
+    return {'status': 'accepted'}
+
+
+def _run_roadmap(contact_id, email, mode, public_base) -> None:
+    try:
+        rp.generate_roadmap(rm_deps(), contact_id=contact_id, email=email,
+                            mode=mode, public_base=public_base)
+    except Exception:
+        log.exception('roadmap: background task crashed')
+
+
+@app.post('/api/roadmap/poll')
+def roadmap_poll(request: Request, background: BackgroundTasks):
+    """Polling fallback for HubSpot tiers without a 'Send a webhook' workflow
+    action. Cloud Scheduler hits this with the shared secret; we claim up to
+    `limit` pending contacts synchronously (so overlapping polls can't double-
+    process) and generate their roadmaps in the background. Only ever touches
+    contacts that actually submitted the form, so a leaked secret can't inflate
+    spend beyond real submissions."""
+    _limit(f'rmpoll:{_client_ip(request)}', 30, 3600)
+    if not _roadmap_secret_ok(request):
+        raise HTTPException(401, 'unauthorized')
+    mode = request.query_params.get('mode') or rp.MODE_EVENT
+    if mode not in _ROADMAP_MODES:
+        mode = rp.MODE_EVENT
+    try:
+        limit = max(1, min(int(request.query_params.get('limit') or 10), 50))
+    except ValueError:
+        limit = 10
+    ids = rp.claim_pending(rm_deps(), limit=limit)
+    if ids:
+        background.add_task(rp.generate_batch, rm_deps(), ids, mode, _public_base(request))
+    log.info('roadmap poll: claimed %d (%s)', len(ids), mode)
+    return {'claimed': len(ids)}
+
+
+@app.get('/api/roadmap/{token}.pdf', include_in_schema=False)
+def roadmap_pdf(token: str):
+    """Stream a hosted roadmap PDF by its unguessable token. The GCS bucket
+    stays private; the link's secrecy is the access control."""
+    if not _TOKEN_RE.match(token):
+        raise HTTPException(404, 'Not found.')
+    blob = deps().storage_client.bucket(rp.BUCKET).blob(f'{rp.PDF_PREFIX}{token}.pdf')
+    try:
+        data = blob.download_as_bytes()
+    except Exception:
+        raise HTTPException(404, 'Not found.')
+    return Response(content=data, media_type='application/pdf',
+                    headers={'Content-Disposition': 'inline; filename="funding-roadmap.pdf"',
+                             'Cache-Control': 'private, max-age=3600'})

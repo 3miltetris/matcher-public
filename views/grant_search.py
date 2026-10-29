@@ -38,8 +38,8 @@ from google.cloud import storage
 from google.oauth2 import service_account
 
 import src.modules.aspect_matching as am
-import src.modules.anthropic_utils as au
 import src.modules.aspect_profile as ap
+import src.modules.profile_build as pb
 import src.modules.pools as pl
 import src.modules.ui_common as uc
 from src.modules.Embedding.text_embedder import TextProcessor
@@ -218,51 +218,6 @@ def _similarity_search(df: pd.DataFrame, query_embedding: list[float], threshold
 
 # ── Building a profile from pasted notes ───────────────────────────────────
 
-def _claude_json(anth: anthropic.Anthropic, model: str, system: str, user_msg: str, parse):
-    """One Claude call with one strict-JSON retry, parsed by `parse`.
-    Returns (parsed, model_that_answered).
-
-    Same contract as client_profile_job._claude_json — a truncated response is
-    a hard error rather than a half-parsed profile, and a **refusal falls back
-    to the other supported model**: some entirely legitimate companies trip a
-    false-positive refusal (measured on a real biopharma client), and a refusal
-    is deterministic for the same model and material, so the strict-JSON retry
-    below can only burn a second call. No temperature: the anthropic 1.x SDK
-    removed it, and passing it raises a local TypeError."""
-    last_err   = None
-    others     = [m for m in ap.ASPECT_MODELS if m != model]
-    candidates = [model] + others[:1]
-
-    for current in candidates:
-        refused = False
-        for attempt in range(2):
-            content = user_msg if attempt == 0 else (
-                user_msg + '\n\nYour previous response was not valid JSON. '
-                           'Return ONLY the valid JSON object.'
-            )
-            resp = anth.messages.create(
-                model=current,
-                max_tokens=6000,
-                system=system,
-                messages=[{'role': 'user', 'content': content}],
-            )
-            if resp.stop_reason == 'max_tokens':
-                raise ValueError('Claude hit the output token limit')
-            if resp.stop_reason == 'refusal':
-                last_err = ValueError(f'{current} declined to answer (stop_reason=refusal)')
-                refused  = True
-                break          # retrying the same model cannot change a refusal
-            try:
-                return parse(au.response_text(resp)), current
-            except ValueError as e:
-                last_err = e
-        if not refused:
-            # Bad JSON twice is a prompt/material problem, not a model-policy
-            # one — another model is no more likely to parse, so stop here.
-            break
-    raise ValueError(f'invalid response twice: {last_err}')
-
-
 def _build_profile_from_notes(
     *,
     company_name: str,
@@ -276,104 +231,20 @@ def _build_profile_from_notes(
     max_unexplored: int,
     model: str,
 ) -> tuple[dict, list[str]]:
-    """(profile record, warnings). Mirrors client_profile_job's per-client build
-    so a profile made here is indistinguishable from one the job wrote — same
-    prompt, same merges, same normalisation, same record shape."""
-    warnings: list[str] = []
-    texts = ap.notes_source_texts(notes)
-    if not texts:
-        raise ValueError('nothing to profile')
-
+    """(profile record, warnings). Thin wrapper over the shared, streamlit-free
+    profile_build.build_profile_from_texts — same prompt, merges, normalisation
+    and record shape as client-profile-job and the roadmap pipeline. The notes
+    ride in under ap.NOTES_SOURCE_KEY, so sources_used honestly says 'notes'."""
     anth = anthropic.Anthropic(api_key=st.secrets['anthropic_api_key'])
     tp   = TextProcessor(api_key=st.secrets['openai_api_key'])
-
-    parsed, built_by = _claude_json(
-        anth, model,
-        ap.build_aspect_system(target_aspects, max_markets, assess_defense),
-        ap.build_aspect_user_message(
-            {'company_name': company_name, 'website': website, 'state': state}, texts
-        ),
-        ap.parse_aspect_response,
+    return pb.build_profile_from_texts(
+        anth, tp.get_embedding,
+        company_name=company_name, website=website, state=state,
+        texts=ap.notes_source_texts(notes),
+        target_aspects=target_aspects, max_markets=max_markets,
+        assess_defense=assess_defense, assess_unexplored=assess_unexplored,
+        max_unexplored=max_unexplored, model=model,
     )
-    if built_by != model:
-        # Same reporting as the job: a profile must never claim a model that
-        # declined it, and pass 2 below runs on the model that answered.
-        warnings.append(
-            f'{model} declined to answer (refusal) — the profile was built '
-            f'with {built_by} instead.'
-        )
-    summary = parsed['profile_summary']
-    aspects = parsed['aspects']
-    markets = parsed['markets']
-
-    vectors = [tp.get_embedding(ap.aspect_embed_text(a)) for a in aspects]
-    # Fold near-identical aspects together BEFORE market membership is re-derived,
-    # so no market is left pointing at an aspect that was merged away.
-    aspects, vectors, merges = ap.merge_similar_aspects(
-        aspects, vectors, ap.ASPECT_MERGE_THRESHOLD
-    )
-    warnings += [f'Merged near-identical aspects: {m}' for m in merges]
-
-    market_vectors = [tp.get_embedding(ap.market_embed_text(m)) for m in markets]
-    if markets:
-        aspects, markets, market_vectors = ap.merge_similar_markets(
-            aspects, markets, market_vectors, ap.MARKET_MERGE_THRESHOLD
-        )
-        by_name = {m['market']: v for m, v in zip(markets, market_vectors)}
-        aspects, markets = ap.normalize_markets(aspects, markets, max_markets)
-        market_vectors = [by_name[m['market']] for m in markets]
-
-    # Pass 2 — markets the company does NOT serve. Additive and separately
-    # guarded: a failure here must never discard the pass-1 work above, which
-    # cost a Claude call and every embedding.
-    unexplored, unexplored_vectors = [], []
-    if assess_unexplored:
-        try:
-            unexplored, _ = _claude_json(
-                anth, built_by,
-                ap.build_unexplored_system(max_unexplored),
-                ap.build_unexplored_user_message(
-                    {'company_name': company_name, 'website': website, 'state': state},
-                    summary, aspects, markets,
-                    # stated_intentions() reads notable_updates off client rows;
-                    # pasted notes have no such structure, so there are none.
-                    [],
-                ),
-                lambda raw: ap.parse_unexplored_response(
-                    raw, markets, aspects, max_unexplored
-                ),
-            )
-            unexplored_vectors = [
-                tp.get_embedding(ap.market_embed_text(m)) for m in unexplored
-            ]
-        except Exception as e:
-            unexplored, unexplored_vectors = [], []
-            warnings.append(
-                f'Unexplored-market pass failed ({type(e).__name__}: {e}) — the '
-                'profile is complete apart from its unexplored markets.'
-            )
-
-    record = ap.build_profile_record(
-        company_key     = ap.company_key(
-            {'company_name': company_name, 'companyWebsite': website}
-        ),
-        company_name    = company_name,
-        website         = website,
-        profile_summary = summary,
-        aspects         = aspects,
-        vectors         = vectors,
-        sources_used    = list(texts.keys()),
-        # Over the pasted material only — it is all this profile was built from,
-        # which is exactly what a later staleness check should compare against.
-        fingerprint     = ap.source_fingerprint(texts),
-        model           = built_by,
-        markets         = markets,
-        market_vectors  = market_vectors,
-        unexplored         = unexplored,
-        unexplored_vectors = unexplored_vectors,
-        dod_assessment  = parsed['dod_assessment'],
-    )
-    return record, warnings
 
 
 # ── Profile display ────────────────────────────────────────────────────────

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Non-Dilutive Funding Roadmap — {{ company_name }}</title>
+<style>
+  /* BW&CO brand tokens (from the funding-deck skill's build_deck.py) */
+  :root { }
+  @page {
+    size: A4 portrait;
+    margin: 20mm 16mm 18mm 16mm;
+    @bottom-left  { content: "{{ firm_url }}"; font-family: Calibri, Carlito, "Segoe UI", Arial, sans-serif; font-size: 8pt; color: #5A6B80; }
+    @bottom-right { content: "Page " counter(page) " of " counter(pages); font-family: Calibri, Carlito, "Segoe UI", Arial, sans-serif; font-size: 8pt; color: #5A6B80; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: Calibri, Carlito, "Segoe UI", Arial, sans-serif;
+    color: #36404F; font-size: 10.5pt; line-height: 1.45;
+  }
+  .wordmark {
+    font-family: "Arial Black", Arial, Helvetica, sans-serif;
+    font-weight: 900; letter-spacing: .5px; color: #162739; font-size: 13pt;
+  }
+  .wordmark .amp { color: #022C5E; }
+
+  .cover { border-bottom: 2pt solid #022C5E; padding-bottom: 10pt; margin-bottom: 16pt; }
+  .eyebrow { font-size: 8.5pt; letter-spacing: 2px; text-transform: uppercase; color: #5A6B80; margin: 14pt 0 2pt; }
+  h1 {
+    font-family: "Arial Black", Arial, Helvetica, sans-serif;
+    font-weight: 900; color: #162739; font-size: 26pt; line-height: 1.08;
+    margin: 0 0 6pt;
+  }
+  .for { font-size: 13pt; color: #022C5E; font-weight: 600; }
+  .meta { font-size: 9pt; color: #5A6B80; margin-top: 4pt; }
+
+  .section-label {
+    font-family: "Arial Black", Arial, Helvetica, sans-serif; font-weight: 900;
+    color: #162739; font-size: 11pt; text-transform: uppercase; letter-spacing: 1px;
+    margin: 18pt 0 6pt;
+  }
+  .lede { color: #36404F; font-size: 10.5pt; margin: 0 0 4pt; }
+
+  .profile { background: #F4F6F9; border: 0.75pt solid #E4E9F0; border-radius: 4pt;
+             padding: 9pt 11pt; font-size: 9.5pt; color: #36404F; margin-bottom: 4pt; }
+
+  .opp {
+    border: 0.75pt solid #E4E9F0; border-left: 3pt solid #022C5E; border-radius: 4pt;
+    padding: 10pt 12pt; margin: 9pt 0; background: #FFFFFF;
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  .opp-head { display: flex; align-items: baseline; }
+  .num {
+    font-family: "Arial Black", Arial, Helvetica, sans-serif; font-weight: 900;
+    color: #022C5E; font-size: 15pt; width: 26pt; flex: 0 0 26pt;
+  }
+  .opp-title {
+    font-family: "Arial Black", Arial, Helvetica, sans-serif; font-weight: 900;
+    color: #162739; font-size: 12pt; line-height: 1.12; flex: 1;
+  }
+  .chips { margin: 5pt 0 7pt 26pt; }
+  .chip {
+    display: inline-block; font-size: 8pt; letter-spacing: .5px; text-transform: uppercase;
+    padding: 2pt 7pt; border-radius: 9pt; margin-right: 5pt; font-weight: 600;
+  }
+  .chip-agency   { background: #EEF2F7; color: #022C5E; }
+  .chip-deadline { background: #022C5E; color: #FFFFFF; }
+  .chip-count    { background: #DDE4ED; color: #162739; }
+
+  .opp-body { margin-left: 26pt; }
+  .field { margin: 3pt 0; font-size: 9.7pt; }
+  .field .k {
+    font-family: "Arial Black", Arial, Helvetica, sans-serif; font-weight: 900;
+    color: #5A6B80; font-size: 7.5pt; letter-spacing: 1px; text-transform: uppercase;
+    display: block; margin-bottom: 1pt;
+  }
+  .opp-link { font-size: 8.5pt; margin-top: 5pt; }
+  .opp-link a { color: #0563C1; text-decoration: none; word-break: break-all; }
+
+  .disclaimer {
+    margin-top: 16pt; border-top: 0.75pt solid #E4E9F0; padding-top: 7pt;
+    font-size: 7.8pt; color: #5A6B80; line-height: 1.4;
+  }
+  .empty { background: #F4F6F9; border: 0.75pt solid #E4E9F0; border-radius: 4pt;
+           padding: 14pt; color: #5A6B80; font-size: 10pt; }
+</style>
+</head>
+<body>
+
+  <div class="cover">
+    <div class="wordmark">BW<span class="amp">&amp;</span>CO</div>
+    <div class="eyebrow">Non-Dilutive Funding</div>
+    <h1>Funding Roadmap</h1>
+    <div class="for">Prepared for {{ company_name }}</div>
+    <div class="meta">{{ generated }} &middot; Federal grant &amp; SBIR/STTR opportunities matched to your technology</div>
+  </div>
+
+  {% if profile_summary %}
+  <div class="section-label">What we matched</div>
+  <div class="profile">{{ profile_summary }}</div>
+  {% endif %}
+
+  {% if why_now %}
+  <div class="section-label">Why now</div>
+  <p class="lede">{{ why_now }}</p>
+  {% endif %}
+
+  <div class="section-label">Your opportunities{% if opportunities %} ({{ opportunities|length }}){% endif %}</div>
+
+  {% if not opportunities %}
+    <div class="empty">We did not find a confident grant match from your description alone. A BW&amp;CO strategist will follow up, and a richer picture (your deck or website) usually surfaces strong fits.</div>
+  {% endif %}
+
+  {% for o in opportunities %}
+  <div class="opp">
+    <div class="opp-head">
+      <div class="num">{{ o.number }}</div>
+      <div class="opp-title">{{ o.title }}</div>
+    </div>
+    <div class="chips">
+      {% if o.agency %}<span class="chip chip-agency">{{ o.agency }}</span>{% endif %}
+      <span class="chip chip-deadline">{{ o.deadline }}</span>
+      {% if o.countdown %}<span class="chip chip-count">{{ o.countdown }}</span>{% endif %}
+    </div>
+    <div class="opp-body">
+      {% if o.what_it_is %}
+      <div class="field"><span class="k">What it is</span>{{ o.what_it_is }}</div>
+      {% endif %}
+      {% if o.why_it_fits %}
+      <div class="field"><span class="k">Why it fits {{ company_name }}</span>{{ o.why_it_fits }}</div>
+      {% endif %}
+      {% if o.url %}
+      <div class="opp-link"><a href="{{ o.url }}">{{ o.url }}</a></div>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+
+  <div class="disclaimer">
+    Opportunities were identified by BW&amp;CO's matching engine from your
+    description{% if profile_summary %} and profile{% endif %}. Deadlines are shown where published and
+    are indicative, confirm each against the official solicitation before relying on it. Award amounts
+    are not shown here and vary by program. This roadmap is a starting point, not an eligibility
+    determination or an offer of representation.
+  </div>
+
+</body>
+</html>
