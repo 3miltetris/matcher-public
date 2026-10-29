@@ -15,6 +15,9 @@ COPY src/modules/__init__.py src/modules/__init__.py
 COPY src/modules/anthropic_utils.py src/modules/anthropic_utils.py
 # Newsletter screening of every stored notice (verticals + solicitation title).
 COPY src/modules/newsletter.py src/modules/newsletter.py
+# Verified SBIR/STTR ceiling table + its upper-bound parser.
+COPY src/modules/finance_research.py src/modules/finance_research.py
+COPY src/modules/sbir_ceilings.py src/modules/sbir_ceilings.py
 
 ENV PYTHONPATH=/app
 

@@ -20,6 +20,7 @@ from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 import src.modules.anthropic_utils as au
 import src.modules.newsletter as nl
+import src.modules.sbir_ceilings as sc
 import src.modules.ui_common as uc
 
 # ── GCS ────────────────────────────────────────────────────────────────────
@@ -61,6 +62,7 @@ _RESERVED_COLS = frozenset({
     'topic_number', 'title', 'agency', 'source', 'due_date', 'funding_amount',
     'scraped_at', 'description', 'embeddings', 'grant_summary',
     'is_rolling', 'last_verified_active', 'verify_status',
+    *sc.CEILING_COLUMNS,
     *nl.COLUMNS,
 })
 
@@ -151,6 +153,25 @@ def _embed_and_save(df: pd.DataFrame, broad_agency: str, oai_key: str, anth_key:
     # Newsletter screening. The extracted (and possibly hand-edited)
     # solicitation_title column rides in as the hint via tag_frame.
     df = df.copy()
+
+    # Verified ceilings: a dollar figure Claude extracted into funding_amount is the
+    # per-notice (stated_text) figure; otherwise the SBIR/STTR agency table applies
+    # to topics that look like SBIR/STTR. program_text includes the summary + the
+    # parent solicitation title so "SBIR"/"STTR" anywhere is seen.
+    _n = len(df)
+    _blank = pd.Series([''] * _n, index=df.index)
+    _fa = (df['funding_amount'].astype(str).tolist() if 'funding_amount' in df.columns
+           else [''] * _n)
+    _pt = [f'{t} {s} {so}' for t, s, so in zip(
+        df.get('title', _blank).astype(str),
+        df.get('grant_summary', _blank).astype(str),
+        df.get('solicitation_title', _blank).astype(str))]
+    _ceils = [sc.resolve_ceilings(broad_agency=broad_agency, agency=a,
+                                  program_text=pt, funding_amount_text=fa)
+              for a, pt, fa in zip(df['agency'].astype(str).tolist(), _pt, _fa)]
+    for _col in sc.CEILING_COLUMNS:
+        df[_col] = [c[_col] for c in _ceils]
+
     nl_bar = st.progress(0, text='Newsletter screening…')
     nl.tag_frame(df, anth_key, progress=lambda d, t: nl_bar.progress(
         d / t, text=f'Newsletter screening {d}/{t}'))

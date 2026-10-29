@@ -66,6 +66,7 @@
   .chip-agency   { background: #EEF2F7; color: #022C5E; }
   .chip-deadline { background: #022C5E; color: #FFFFFF; }
   .chip-count    { background: #DDE4ED; color: #162739; }
+  .chip-ceiling  { background: #0B6B3A; color: #FFFFFF; }
 
   .opp-body { margin-left: 26pt; }
   .field { margin: 3pt 0; font-size: 9.7pt; }
@@ -121,6 +122,7 @@
       {% if o.agency %}<span class="chip chip-agency">{{ o.agency }}</span>{% endif %}
       <span class="chip chip-deadline">{{ o.deadline }}</span>
       {% if o.countdown %}<span class="chip chip-count">{{ o.countdown }}</span>{% endif %}
+      {% if o.ceiling %}<span class="chip chip-ceiling">{{ o.ceiling }}</span>{% endif %}
     </div>
     <div class="opp-body">
       {% if o.what_it_is %}
@@ -139,9 +141,10 @@
   <div class="disclaimer">
     Opportunities were identified by BW&amp;CO's matching engine from your
     description{% if profile_summary %} and profile{% endif %}. Deadlines are shown where published and
-    are indicative, confirm each against the official solicitation before relying on it. Award amounts
-    are not shown here and vary by program. This roadmap is a starting point, not an eligibility
-    determination or an offer of representation.
+    are indicative, confirm each against the official solicitation before relying on it. Dollar figures,
+    where shown, are either stated in the solicitation or the program's typical Phase I/II ceiling, and
+    are omitted where we cannot source them; confirm each against the official solicitation. This roadmap
+    is a starting point, not an eligibility determination or an offer of representation.
   </div>
 
 </body>

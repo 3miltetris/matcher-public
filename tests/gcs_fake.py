@@ -34,6 +34,9 @@ class FakeBlob:
                 raise PreconditionFailed('generation mismatch')
         self.store[self.name] = {'data': data, 'gen': (cur['gen'] + 1 if cur else 1)}
 
+    def upload_from_file(self, file_obj, content_type=None, if_generation_match=None):
+        self.upload_from_string(file_obj.read(), content_type, if_generation_match)
+
     def download_as_bytes(self, start=None, end=None):
         if self.name not in self.store:
             raise NotFound(self.name)

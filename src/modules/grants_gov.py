@@ -28,6 +28,7 @@ from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 import src.modules.anthropic_utils as au
 import src.modules.newsletter as nl
+import src.modules.sbir_ceilings as sc
 
 BUCKET         = 'cc-matcher-bucket-jeg-v1'
 GRANTS_PREFIX  = 'data/all-topics/processed/GRANTS-GOV/'
@@ -71,10 +72,18 @@ def parse_date(s) -> date | None:
     return None
 
 
-def items_to_df(items: list[dict], descriptions: list[str] | None = None) -> pd.DataFrame:
+def _clean_ceiling_str(value) -> str:
+    """Raw awardCeiling as a display string; '' for a blank or an unset-0."""
+    s = str(value or '').strip()
+    return '' if s in ('', '0', '0.0', '0.00') else s
+
+
+def items_to_df(items: list[dict], descriptions: list[str] | None = None,
+                synopses: list[dict] | None = None) -> pd.DataFrame:
     rows = []
     for i, opp in enumerate(items):
         desc = descriptions[i] if descriptions and i < len(descriptions) else ''
+        syn  = (synopses[i] if synopses and i < len(synopses) else {}) or {}
         rows.append({
             'title':         str(opp.get('title') or '').strip(),
             'description':   str(desc).strip(),
@@ -83,13 +92,23 @@ def items_to_df(items: list[dict], descriptions: list[str] | None = None) -> pd.
             'agency_code':   str(opp.get('agencyCode') or '').strip(),
             'posted_date':   str(opp.get('openDate') or '').strip(),
             'close_date':    str(opp.get('closeDate') or '').strip(),
-            'award_ceiling': '',
+            'award_ceiling': _clean_ceiling_str(syn.get('awardCeiling')),
             'status':        str(opp.get('oppStatus') or '').strip(),
+            # Structured ceiling fields from the detail endpoint, consumed by
+            # embed_and_save's resolve_ceilings. Kept as hidden *scalar* columns
+            # (not a dict) so they survive st.dataframe preview / dedup unharmed,
+            # and are not persisted (a fresh `out` frame is built there).
+            '_gg_award_ceiling': syn.get('awardCeiling'),
+            '_gg_award_floor':   syn.get('awardFloor'),
         })
     return pd.DataFrame(rows)
 
 
-def fetch_description(opp_id: str, doc_type: str) -> str:
+def fetch_description(opp_id: str, doc_type: str) -> tuple[str, dict]:
+    """Return (plain-text description, structured-ceiling fields) for one
+    opportunity. The detail endpoint carries `awardCeiling`/`awardFloor`/
+    `estimatedFunding` on the synopsis (or forecast) object alongside the text;
+    both are returned so the ceiling is captured instead of discarded."""
     try:
         r = requests.post(
             DETAIL_URL,
@@ -99,19 +118,25 @@ def fetch_description(opp_id: str, doc_type: str) -> str:
         )
         r.raise_for_status()
         d = r.json()
-        if doc_type == 'forecast':
-            html = (d.get('forecast') or {}).get('forecastDesc') or ''
-        else:
-            html = (d.get('synopsis') or {}).get('synopsisDesc') or ''
-        return BeautifulSoup(html, 'html.parser').get_text(separator=' ', strip=True)
+        obj = (d.get('forecast') or {}) if doc_type == 'forecast' else (d.get('synopsis') or {})
+        html = (obj.get('forecastDesc') if doc_type == 'forecast' else obj.get('synopsisDesc')) or ''
+        text = BeautifulSoup(html, 'html.parser').get_text(separator=' ', strip=True)
+        fields = {
+            'awardCeiling':     obj.get('awardCeiling'),
+            'awardFloor':       obj.get('awardFloor'),
+            'estimatedFunding': obj.get('estimatedFunding'),
+        }
+        return text, fields
     except Exception:
-        return ''
+        return '', {}
 
 
-def fetch_all_descriptions(items: list[dict], progress=_noop) -> list[str]:
-    results = [''] * len(items)
+def fetch_all_descriptions(items: list[dict], progress=_noop) -> tuple[list[str], list[dict]]:
+    """(texts, synopsis-field dicts) aligned to `items`."""
+    texts    = [''] * len(items)
+    synopses = [{} for _ in items]
     if not items:
-        return results
+        return texts, synopses
     with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
         futures = {
             pool.submit(fetch_description, str(item['id']), item.get('docType', 'synopsis')): i
@@ -119,10 +144,11 @@ def fetch_all_descriptions(items: list[dict], progress=_noop) -> list[str]:
         }
         done = 0
         for future in as_completed(futures):
-            results[futures[future]] = future.result()
+            i = futures[future]
+            texts[i], synopses[i] = future.result()
             done += 1
             progress(done, len(items))
-    return results
+    return texts, synopses
 
 
 def search_grants(
@@ -200,8 +226,9 @@ def search_grants(
                 keep[i] = False
 
     filtered = [item for item, k in zip(all_items, keep) if k]
-    descriptions = fetch_all_descriptions(filtered, progress) if filtered else []
-    return items_to_df(filtered, descriptions), total or 0
+    descriptions, synopses = (fetch_all_descriptions(filtered, progress)
+                              if filtered else ([], []))
+    return items_to_df(filtered, descriptions, synopses), total or 0
 
 
 # ── screening ─────────────────────────────────────────────────────────────────
@@ -389,6 +416,23 @@ def embed_and_save(
                               anth_key, summary_progress)
     out['grant_summary'] = summaries
 
+    # Verified ceilings: Grants.gov's structured awardCeiling/awardFloor (captured
+    # by fetch_description) when present, else the SBIR/STTR agency table for topics
+    # that look like SBIR/STTR. program_text includes the summary so "SBIR"/"STTR"
+    # in the body is seen.
+    _ceil = (df['_gg_award_ceiling'].tolist() if '_gg_award_ceiling' in df.columns
+             else [None] * len(df))
+    _floor = (df['_gg_award_floor'].tolist() if '_gg_award_floor' in df.columns
+              else [None] * len(df))
+    syns = [{'awardCeiling': c, 'awardFloor': f} for c, f in zip(_ceil, _floor)]
+    ptexts = [f'{t} {d} {s}' for t, d, s in
+              zip(out['title'], out['description'], summaries)]
+    ceils = [sc.resolve_ceilings(broad_agency='GRANTS-GOV', agency=a,
+                                 program_text=pt, gg_synopsis=syn)
+             for a, pt, syn in zip(out['agency'].tolist(), ptexts, syns)]
+    for col in sc.CEILING_COLUMNS:
+        out[col] = [c[col] for c in ceils]
+
     embed_texts = [s if s.strip() else d
                    for s, d in zip(summaries, out['description'].tolist())]
     embeddings = []
@@ -408,3 +452,113 @@ def embed_and_save(
     gcs_path   = f'{GRANTS_PREFIX}grants_gov_{today}_{hex_suffix}.parquet'
     bm.upload_file(gcs_path, out)
     return gcs_path
+
+
+# ── re-verify (liveness) ────────────────────────────────────────────────────
+# Shared by the Funding → Grants.gov view's manual button (rolling_only) and the
+# scheduled grants-gov-job reverify mode (all open topics). Grants.gov returns a
+# definitive oppStatus, so there is no consecutive-miss guard (unlike scraped
+# funding sources).
+
+def lookup_opp_status(number: str) -> tuple[bool, str | None]:
+    """Current Grants.gov status for an opportunity number.
+
+    Returns (ok, status): ok=False means the lookup itself failed (leave the row
+    untouched); status=None means the number no longer appears in any status
+    (treat as gone); otherwise the lowercased oppStatus. All four statuses are
+    queried so a closed/archived opportunity is still returned.
+    """
+    try:
+        r = requests.post(
+            SEARCH_URL,
+            json={'keyword': number, 'rows': 25, 'startRecord': 0,
+                  'oppStatuses': 'posted|forecasted|closed|archived'},
+            timeout=20,
+        )
+        r.raise_for_status()
+        hits = (r.json().get('data') or {}).get('oppHits') or []
+        for h in hits:
+            if str(h.get('number') or '').strip() == str(number).strip():
+                return True, str(h.get('oppStatus') or '').strip().lower()
+        return True, None
+    except Exception:
+        return False, None
+
+
+def reverify_grants(gcs_client, *, today: str | None = None,
+                    rolling_only: bool = True, dry_run: bool = False,
+                    progress=_noop) -> dict:
+    """Re-check stored GRANTS-GOV opportunities against the live API and update
+    `verify_status` / `last_verified_active`.
+
+    Candidates are rows not already `verify_status == 'inactive'`, and with
+    `rolling_only=True` additionally `is_rolling` (the manual button's original
+    behaviour). `rolling_only=False` re-checks every open topic — the scheduled
+    sweep — catching non-rolling grants that closed early or were archived before
+    their posted deadline, which the deadline-only expiry in `drop_dead_topics`
+    misses. posted/forecasted → active; closed/archived/gone → inactive. Rewrites
+    only changed parquets (skipped on `dry_run`).
+    """
+    today = today or datetime.today().strftime('%Y-%m-%d')
+    frames: dict = {}
+    numbers: set = set()
+    for blob in gcs_client.list_blobs(BUCKET, prefix=GRANTS_PREFIX):
+        if not blob.name.endswith('.parquet'):
+            continue
+        try:
+            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
+        except Exception:
+            continue
+        if 'topic_number' not in df.columns:
+            continue
+        for col, default in (('last_verified_active', ''), ('verify_status', 'active')):
+            if col not in df.columns:
+                df[col] = default
+        active = df['verify_status'].fillna('').astype(str) != 'inactive'
+        if rolling_only:
+            if 'is_rolling' not in df.columns:
+                continue
+            sel = active & df['is_rolling'].fillna(False).astype(bool)
+        else:
+            sel = active
+        if sel.any():
+            frames[blob] = (df, sel)
+            numbers.update(df.loc[sel, 'topic_number'].astype(str))
+
+    status_map: dict = {}
+    if numbers:
+        done = 0
+        with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
+            futs = {pool.submit(lookup_opp_status, n): n for n in numbers}
+            for fut in as_completed(futs):
+                n = futs[fut]
+                ok, status = fut.result()
+                done += 1
+                progress(done, len(numbers))
+                if not ok:
+                    continue                       # leave unchanged on lookup error
+                status_map[n] = ('active' if status in ('posted', 'forecasted')
+                                 else 'inactive')  # closed/archived/None → gone
+
+    refreshed = expired = files_written = 0
+    for blob, (df, sel) in frames.items():
+        dirty = False
+        for idx in df.index[sel]:
+            res = status_map.get(str(df.at[idx, 'topic_number']))
+            if res == 'active':
+                df.at[idx, 'last_verified_active'] = today
+                df.at[idx, 'verify_status']        = 'active'
+                refreshed += 1
+                dirty = True
+            elif res == 'inactive':
+                df.at[idx, 'verify_status'] = 'inactive'
+                expired += 1
+                dirty = True
+        if dirty and not dry_run:
+            buf = io.BytesIO()
+            df.to_parquet(buf, index=False)
+            buf.seek(0)
+            blob.upload_from_file(buf, content_type='application/octet-stream')
+            files_written += 1
+    return {'checked': len(numbers), 'refreshed': refreshed, 'expired': expired,
+            'files_written': files_written, 'dry_run': dry_run}

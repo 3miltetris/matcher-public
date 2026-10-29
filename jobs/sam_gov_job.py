@@ -79,6 +79,7 @@ from openai import OpenAI
 
 import src.modules.anthropic_utils as au
 import src.modules.newsletter as nl
+import src.modules.sbir_ceilings as sc
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -1712,6 +1713,18 @@ def main(config_blob_path: str) -> None:
     for _src, _dst in (('notice_type', 'notice_type'), ('base_type', 'base_type'),
                        ('set_aside', 'set_aside'), ('naics_desc', 'naics_code')):
         out[_dst] = new_rows[_src].astype(str).values if _src in new_rows.columns else ''
+
+    # Verified SBIR/STTR ceilings: SAM.gov solicitations carry no structured dollar
+    # field, so the agency reference table applies — but only to notices that look
+    # like SBIR/STTR (program_text = title + summary + notice type). A general
+    # contract or supply buy gets no ceiling. No per-notice figure is captured in
+    # v1 (stated-text extraction from the screen prompt is a documented fast-follow).
+    _ptexts = [f'{t} {s} {n}' for t, s, n in
+               zip(out['title'], out['grant_summary'], out['notice_type'])]
+    _ceils = [sc.resolve_ceilings(broad_agency='SAM-GOV', agency=a, program_text=pt)
+              for a, pt in zip(out['agency'].tolist(), _ptexts)]
+    for _col in sc.CEILING_COLUMNS:
+        out[_col] = [c[_col] for c in _ceils]
 
     for col_name, col_val in custom_cols.items():
         out[col_name] = col_val

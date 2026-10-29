@@ -288,6 +288,59 @@ def to_number_str(value) -> str:
     return str(math.floor(n + 0.5) if n >= 0 else -math.floor(-n + 0.5))
 
 
+def to_upper_bound(value) -> float | None:
+    """Best-effort UPPER bound out of a prose award-amount value — the ceiling,
+    not the midpoint that `to_number` returns. Shares the same regex, multiplier
+    and fiscal-period-label handling, so "$2M" and "FY2024: $2.5M" behave as they
+    do there; the only difference is a range returns its high end.
+
+    "$50,000-$250,000"  → 250000.0   (high end of the range)
+    "Up to $2,000,000"  → 2000000.0
+    "$250K-$1M"         → 1000000.0
+    "1-2 million"       → 2000000.0  (suffix carries to the high end)
+    "$150,000"          → 150000.0   (lone figure)
+    "48/100"            → 48.0       (leading figure, not a range)
+    "Not found"         → None
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = re.sub(r'\([^)]*\)', ' ', str(value))   # drop "(Estimated)" labels
+    text = text.replace('%', ' ')
+    if text.strip().lower() in _NULLISH:
+        return None
+
+    matches = list(_NUM_RE.finditer(text))
+    if not matches:
+        return None
+    figures = [m for m in matches if not _is_period_label(m, text)]
+    if figures:
+        matches = figures
+
+    def figure(m, fallback_suffix: str | None = None) -> float:
+        n = float(m.group('num').replace(',', ''))
+        suffix = (m.group('suffix') or fallback_suffix or '').strip().lower()
+        return n * _MULTIPLIERS.get(suffix, 1.0)
+
+    lo = matches[0]
+    if len(matches) > 1:
+        hi = matches[1]
+        between = text[lo.end():hi.start()]
+        if _RANGE_SEP_RE.match(between):
+            return figure(hi)       # the ceiling is the top of the range
+    return figure(lo)
+
+
+def to_upper_bound_str(value) -> str:
+    """to_upper_bound() rendered as an integer string, '' when unparseable."""
+    n = to_upper_bound(value)
+    if n is None:
+        return ''
+    return str(math.floor(n + 0.5) if n >= 0 else -math.floor(-n + 0.5))
+
+
 def numeric_columns(d: dict) -> dict[str, str]:
     """{field}_num integer-string companions for every NUMERIC_FIELDS entry."""
     return {

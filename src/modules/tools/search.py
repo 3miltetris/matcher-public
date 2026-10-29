@@ -50,6 +50,20 @@ def _matrix(embeddings) -> tuple[np.ndarray, list[int]]:
     return mat, rows
 
 
+def _num(value):
+    """A JSON-safe number (int when whole) or None. Maps NaN/blank/unparseable to
+    None so a missing ceiling reads as 'no data', never 0, in the MCP payload."""
+    try:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return None
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(f):
+        return None
+    return int(f) if f.is_integer() else f
+
+
 def _cosine_top(query_vec, mat: np.ndarray, rows: list[int], limit: int):
     """Top `limit` (row_position, score) by cosine against `query_vec`."""
     if mat.shape[0] == 0:
@@ -165,6 +179,10 @@ def search_grants(gcs_client, embed_query, query: str, *, agency: str | None = N
                     r.get('due_date', '') or r.get('close_date', '')),
                 'status': gu.topic_open_status(r),
                 'grant_summary': cm.cap_text(r.get('grant_summary'), 800),
+                'award_ceiling_num': _num(r.get('award_ceiling_num')),
+                'phase1_ceiling_num': _num(r.get('phase1_ceiling_num')),
+                'phase2_ceiling_num': _num(r.get('phase2_ceiling_num')),
+                'ceiling_source': str(r.get('ceiling_source', '') or ''),
                 'source': cm.cap_text(r.get('source'), 300),
                 'score': round(float(score), 3),
                 '_key': _dedup_key(r),

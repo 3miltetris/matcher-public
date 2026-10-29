@@ -55,6 +55,55 @@ def banned_hits(text: str) -> list[str]:
     return [w for w in _BANNED if w in low]
 
 
+# ── Verified ceiling display ─────────────────────────────────────────────────
+# The roadmap shows a dollar figure ONLY from our own verified data, rendered in a
+# chip separate from the LLM copy — the model is never asked to state an amount, so
+# "nothing invented" still holds. A notice-specific figure (Grants.gov structured
+# or stated in the solicitation) is shown exactly; a program/agency table figure is
+# shown hedged as "typical", and only when `show_table_ceilings` is on.
+
+def _fmt_usd(value) -> str:
+    """A compact USD string: 250000 -> "$250K", 1_800_000 -> "$1.8M". '' for a
+    blank / NaN / non-positive value."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ''
+    if v != v or v <= 0:                 # NaN or non-positive
+        return ''
+    if v >= 1_000_000:
+        return f'${v / 1_000_000:.1f}M'.replace('.0M', 'M')
+    if v >= 1_000:
+        return f'${round(v / 1_000)}K'
+    return f'${int(round(v))}'
+
+
+def ceiling_display(opp: dict, *, show_table_ceilings: bool = True) -> str:
+    """The verified ceiling chip text for one opportunity, or '' to show nothing.
+
+    - 'grants_gov' / 'stated_text' → the exact notice figure ("Award ceiling: $500K")
+    - 'agency_table' → the hedged program caps ("Phase I up to ~$250K, Phase II up
+      to ~$1.8M (program typical)"), gated behind `show_table_ceilings`
+    - anything else / no figure → ''
+    """
+    source = str(opp.get('ceiling_source') or '')
+    if source in ('grants_gov', 'stated_text'):
+        amount = _fmt_usd(opp.get('award_ceiling_num'))
+        if amount:
+            return f'Award ceiling: {amount}'
+    if source == 'agency_table' and show_table_ceilings:
+        parts = []
+        p1 = _fmt_usd(opp.get('phase1_ceiling_num'))
+        p2 = _fmt_usd(opp.get('phase2_ceiling_num'))
+        if p1:
+            parts.append(f'Phase I up to ~{p1}')
+        if p2:
+            parts.append(f'Phase II up to ~{p2}')
+        if parts:
+            return ', '.join(parts) + ' (program typical)'
+    return ''
+
+
 # ── Narrative generation ─────────────────────────────────────────────────────
 
 def _build_system() -> str:
@@ -185,9 +234,13 @@ def deadline_display(opp: dict, today: date | None = None) -> tuple[str, str]:
 
 def build_context(*, company_name: str, profile_summary: str,
                   opportunities: list[dict], narrative: dict,
-                  presentation_date: date | None = None) -> dict:
+                  presentation_date: date | None = None,
+                  show_table_ceilings: bool = True) -> dict:
     """The template context. One item per opportunity, narrative merged in by
-    index, deadlines resolved honestly, no dollar figures."""
+    index, deadlines resolved honestly, and a verified ceiling chip from our own
+    data (never from the LLM). `show_table_ceilings` gates the program-typical
+    (agency-table) figures so they can be suppressed per client/event; exact
+    notice figures (Grants.gov / stated) always show."""
     today = presentation_date or date.today()
     items = narrative.get('items') or {}
     opps = []
@@ -201,6 +254,7 @@ def build_context(*, company_name: str, profile_summary: str,
             'topic_number': str(o.get('topic_number') or ''),
             'deadline':    label,
             'countdown':   countdown,
+            'ceiling':     ceiling_display(o, show_table_ceilings=show_table_ceilings),
             'what_it_is':  nar.get('what_it_is') or clean_copy(str(o.get('grant_summary') or '')[:280]),
             'why_it_fits': nar.get('why_it_fits') or '',
             'matched':     clean_copy(o.get('aspect_label') or ''),

@@ -47,6 +47,7 @@ _ALL_COLUMNS = [
     'firstName', 'lastName', 'email', 'source',
     'grant_summary', 'title', 'topic_number',
     'agency', 'broad_agency', 'due_date', 'funding_amount',
+    'phase1_ceiling_num', 'phase2_ceiling_num', 'award_ceiling_num', 'ceiling_source',
 ]
 
 

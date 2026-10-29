@@ -70,6 +70,32 @@ def _parse_iso(s) -> date | None:
         return None
 
 
+def _run_reverify(gcs: storage.Client, run_id: str, config: dict) -> None:
+    """Liveness re-verification mode (no ingest): re-check stored GRANTS-GOV topics
+    against the live API and update verify_status. `dry_run` reports without writing;
+    `rolling_only` restricts to rolling topics (default False = all open topics)."""
+    dry_run      = bool(config.get('dry_run', False))
+    rolling_only = bool(config.get('rolling_only', False))
+    status = {'run_id': run_id, 'mode': 'reverify', 'state': 'running',
+              'dry_run': dry_run, 'rolling_only': rolling_only,
+              'checked': 0, 'refreshed': 0, 'expired': 0, 'files_written': 0,
+              'error': None}
+    _write_status(gcs, run_id, status)
+    try:
+        res = gg.reverify_grants(gcs, rolling_only=rolling_only, dry_run=dry_run)
+        status.update(res)
+        status['state'] = 'complete'
+        _write_status(gcs, run_id, status)
+        print(f'reverify complete: {res}', flush=True)
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, flush=True)
+        status['state'] = 'error'
+        status['error'] = tb
+        _write_status(gcs, run_id, status)
+        raise
+
+
 def main(config_blob_path: str) -> None:
     gcs = _gcs()
     print(f'Loading config from {config_blob_path}', flush=True)
@@ -78,6 +104,11 @@ def main(config_blob_path: str) -> None:
     run_id = config['run_id']
     if run_id == 'daily':
         run_id = f"grants_gov_{datetime.today().strftime('%Y-%m-%d_%H-%M-%S')}"
+
+    # Liveness re-verification mode is a separate, key-free path.
+    if str(config.get('mode', 'ingest') or 'ingest').strip() == 'reverify':
+        _run_reverify(gcs, run_id, config)
+        return
 
     anth_key   = _get_secret('anthropic-api-key')
     openai_key = _get_secret('openai-api-key')

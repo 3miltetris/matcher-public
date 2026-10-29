@@ -78,7 +78,8 @@ Unit = namedtuple('Unit', 'prof market mi kind')
 TOPIC_COLS = [
     'topic_number', 'title', 'agency', 'broad_agency', 'record_kind', 'due_date',
     'close_date', 'open_date', 'is_rolling', 'last_verified_active', 'verify_status',
-    'funding_amount', 'set_aside', 'notice_type', 'grant_summary', 'source',
+    'funding_amount', 'phase1_ceiling_num', 'phase2_ceiling_num', 'award_ceiling_num',
+    'ceiling_source', 'set_aside', 'notice_type', 'grant_summary', 'source',
 ]
 
 # Result columns worth seeing first, in this order. `record_kind` and `source`

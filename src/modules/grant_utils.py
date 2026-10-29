@@ -30,6 +30,22 @@ ROLLING_DEFAULTS: dict = {
     'verify_status':        'unverified',
 }
 
+# Verified SBIR/STTR ceiling columns (populated by `sbir_ceilings.resolve_ceilings`
+# at ingest and by the one-off backfill). Defaulted here so every reader is
+# KeyError-free before a parquet has been backfilled. `None`, never 0, for the
+# numeric companions — a missing figure must read as "no data", not a $0 award
+# (the same convention as the finance-research `_num` columns). Defaults only: this
+# module stays dependency-light (no finance_research / sbir_ceilings import) so the
+# many job Dockerfiles that copy only grant_utils keep loading.
+CEILING_DEFAULTS: dict = {
+    'phase1_ceiling_num': None,
+    'phase2_ceiling_num': None,
+    'award_ceiling_num':  None,
+    'award_floor_num':    None,
+    'ceiling_source':     '',
+    'ceiling_basis':      '',
+}
+
 # Stored `due_date`/`close_date` are a genuine mix of ISO and mm/dd/yyyy — the
 # same formats the Bulk Matching / Grant Search / matching-job parsers accept.
 _DATE_FORMATS = ('%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d', '%m-%d-%Y', '%b %d, %Y')
@@ -245,6 +261,22 @@ def ensure_rolling_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def ensure_ceiling_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add any missing SBIR/STTR ceiling column with its default, in place.
+
+    Same backfill pattern as `ensure_rolling_columns`, so parquets written before
+    the ceiling columns existed (or not yet reached by the backfill job) load
+    cleanly and every reader can reference them unconditionally. No-op on an empty
+    frame. Defaults only — no parsing here (that lives in `sbir_ceilings`).
+    """
+    if df.empty:
+        return df
+    for col, default in CEILING_DEFAULTS.items():
+        if col not in df.columns:
+            df[col] = default
+    return df
+
+
 def _expired_mask(df: pd.DataFrame, today) -> pd.Series:
     """Vectorized `topic_open_status(...) == 'expired'` over a whole frame: a
     parseable deadline strictly before `today`, on a topic that is neither a
@@ -362,4 +394,5 @@ def normalize_grant_columns(df: pd.DataFrame) -> pd.DataFrame:
             else str(v).strip())
 
     df = ensure_rolling_columns(df)
+    df = ensure_ceiling_columns(df)
     return df

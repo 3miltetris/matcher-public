@@ -25,6 +25,7 @@ from src.modules.Embedding.text_embedder import TextProcessor
 from src.modules.GoogleBucketManager.bucket_manager import BucketManager
 import src.modules.anthropic_utils as au
 import src.modules.newsletter as nl
+import src.modules.sbir_ceilings as sc
 import src.modules.ui_common as uc
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -337,6 +338,14 @@ def _embed_and_save(
         n_thin = int(thin_mask.sum())
         st.warning(f'{n_thin} row(s) dropped — description had insufficient technical content to summarize.')
         out = out[~thin_mask].reset_index(drop=True)
+
+    # Verified SBIR/STTR ceilings from the agency table (SAM.gov CSVs carry no
+    # structured dollar field), applied only to SBIR/STTR-looking notices.
+    _pt = [f'{t} {s}' for t, s in zip(out['title'], out['grant_summary'])]
+    _ceils = [sc.resolve_ceilings(broad_agency='SAM-GOV', agency=a, program_text=pt)
+              for a, pt in zip(out['agency'].astype(str).tolist(), _pt)]
+    for _col in sc.CEILING_COLUMNS:
+        out[_col] = [c[_col] for c in _ceils]
 
     embed_texts = [s if s.strip() else d for s, d in zip(out['grant_summary'].tolist(), out['description'].tolist())]
     progress    = st.progress(0, text='Generating embeddings…')

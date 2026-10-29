@@ -274,7 +274,8 @@ RESULT_COLUMNS = [
     'llm_score', 'llm_rationale', 'record_kind', 'topic_number', 'title',
     'agency', 'broad_agency', 'open_date', 'due_date', 'close_date',
     'is_rolling', 'last_verified_active', 'verify_status',
-    'funding_amount', 'grant_summary', 'source',
+    'funding_amount', 'phase1_ceiling_num', 'phase2_ceiling_num', 'award_ceiling_num',
+    'ceiling_source', 'grant_summary', 'source',
 ]
 
 MAX_RESULT_ROWS = 400

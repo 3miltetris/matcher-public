@@ -72,3 +72,47 @@ def test_render_html_empty_state():
                              opportunities=[], narrative={'why_now': '', 'items': {}})
     html = deck.render_html(ctx)
     assert 'did not find a confident grant match' in html
+
+
+# ── Verified ceiling display (Stage: verified ceilings) ──────────────────────
+
+def test_fmt_usd():
+    assert deck._fmt_usd(2095748) == '$2.1M'
+    assert deck._fmt_usd(1000000) == '$1M'
+    assert deck._fmt_usd(305000) == '$305K'
+    assert deck._fmt_usd(0) == '' and deck._fmt_usd(None) == '' and deck._fmt_usd(float('nan')) == ''
+
+
+def test_ceiling_display_exact_for_notice_sources():
+    assert deck.ceiling_display(
+        {'ceiling_source': 'grants_gov', 'award_ceiling_num': 500000.0}
+    ) == 'Award ceiling: $500K'
+    assert deck.ceiling_display(
+        {'ceiling_source': 'stated_text', 'award_ceiling_num': 1800000.0}
+    ) == 'Award ceiling: $1.8M'
+
+
+def test_ceiling_display_hedged_for_table():
+    out = deck.ceiling_display({'ceiling_source': 'agency_table',
+                                'phase1_ceiling_num': 250000.0,
+                                'phase2_ceiling_num': 1800000.0})
+    assert 'Phase I up to ~$250K' in out and 'program typical' in out
+
+
+def test_ceiling_display_nothing_when_no_source_or_suppressed():
+    assert deck.ceiling_display({'ceiling_source': '', 'award_ceiling_num': None}) == ''
+    assert deck.ceiling_display({'ceiling_source': 'agency_table',
+                                 'phase1_ceiling_num': 250000.0},
+                                show_table_ceilings=False) == ''
+
+
+def test_build_context_sets_ceiling_and_prompt_still_forbids_inventing():
+    ctx = deck.build_context(
+        company_name='Acme', profile_summary='p',
+        opportunities=[{'title': 'T', 'ceiling_source': 'grants_gov',
+                        'award_ceiling_num': 500000.0}],
+        narrative={'items': {}})
+    assert ctx['opportunities'][0]['ceiling'] == 'Award ceiling: $500K'
+    # The model is still told never to invent a dollar amount (we render verified
+    # figures in a separate chip, so the guard stays).
+    assert 'NEVER state a dollar amount' in deck._build_system()

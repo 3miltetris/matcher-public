@@ -150,3 +150,34 @@ def test_add_record_kind_frame_and_default():
     # The awards loader passes default='award' so unmarked rows still read as award.
     out2 = gu.add_record_kind(pd.DataFrame([{'title': 'anything'}]), default='award')
     assert out2.iloc[0]['record_kind'] == 'award'
+
+
+# ── ensure_ceiling_columns (Stage: verified ceilings) ────────────────────────
+
+def test_ensure_ceiling_columns_adds_defaults():
+    df = pd.DataFrame([{'title': 'x'}])
+    out = gu.ensure_ceiling_columns(df)
+    for col, default in gu.CEILING_DEFAULTS.items():
+        assert col in out.columns
+        assert out.iloc[0][col] == default or (default is None and out.iloc[0][col] is None)
+
+
+def test_ensure_ceiling_columns_noop_on_empty():
+    empty = pd.DataFrame()
+    out = gu.ensure_ceiling_columns(empty)
+    assert out.empty
+
+
+def test_ensure_ceiling_columns_preserves_existing():
+    df = pd.DataFrame([{'title': 'x', 'award_ceiling_num': 500000.0,
+                        'ceiling_source': 'grants_gov'}])
+    out = gu.ensure_ceiling_columns(df)
+    assert out.iloc[0]['award_ceiling_num'] == 500000.0
+    assert out.iloc[0]['ceiling_source'] == 'grants_gov'
+    assert out.iloc[0]['phase1_ceiling_num'] is None       # backfilled default
+
+
+def test_normalize_grant_columns_brings_in_ceilings():
+    df = pd.DataFrame([{'description': 'desc', 'title': 't'}])
+    out = gu.normalize_grant_columns(df)
+    assert 'phase1_ceiling_num' in out.columns and 'ceiling_source' in out.columns

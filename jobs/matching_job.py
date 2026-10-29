@@ -457,7 +457,8 @@ def main(config_blob_path: str) -> None:
 
     grant_cols = ['topic_number', 'title', 'agency', 'broad_agency', 'record_kind',
                   'due_date', 'is_rolling', 'last_verified_active', 'verify_status',
-                  'funding_amount', 'grant_summary', 'source']
+                  'funding_amount', 'phase1_ceiling_num', 'phase2_ceiling_num',
+                  'award_ceiling_num', 'ceiling_source', 'grant_summary', 'source']
     grant_meta = topics_df[[c for c in grant_cols if c in topics_df.columns]].reset_index(drop=True)
     if 'source' in grant_meta.columns:
         grant_meta = grant_meta.rename(columns={'source': 'grant_source'})

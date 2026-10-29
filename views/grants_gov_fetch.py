@@ -55,94 +55,11 @@ def _get_storage_client() -> storage.Client:
 # items_to_df / fetch_description(s) / search / screen / summarize / embed now
 # live in src.modules.grants_gov (gg); the wrappers further down add st.progress.
 
-def _lookup_opp_status(number: str) -> tuple[bool, str | None]:
-    """Current Grants.gov status for an opportunity number.
-
-    Returns (ok, status): ok=False means the lookup itself failed (leave the row
-    untouched); status=None means the number no longer appears in any status
-    (treat as gone); otherwise the lowercased oppStatus. All four statuses are
-    queried so a closed/archived opportunity is still returned.
-    """
-    try:
-        r = requests.post(
-            _SEARCH_URL,
-            json={'keyword': number, 'rows': 25, 'startRecord': 0,
-                  'oppStatuses': 'posted|forecasted|closed|archived'},
-            timeout=20,
-        )
-        r.raise_for_status()
-        hits = (r.json().get('data') or {}).get('oppHits') or []
-        for h in hits:
-            if str(h.get('number') or '').strip() == str(number).strip():
-                return True, str(h.get('oppStatus') or '').strip().lower()
-        return True, None
-    except Exception:
-        return False, None
-
-
 def _refresh_rolling_grants(gcs: storage.Client) -> dict:
-    """Re-check every stored rolling GRANTS-GOV opportunity against the live API.
-
-    Still posted/forecasted → re-stamp active; closed, archived or gone →
-    verify_status 'inactive'. Grants.gov returns a definitive status, so (unlike
-    the scraped funding sources) there is no consecutive-miss guard. Rewrites only
-    the parquets that changed.
-    """
-    today  = datetime.today().strftime('%Y-%m-%d')
-    frames: dict = {}            # blob -> df
-    numbers: set = set()
-    for blob in gcs.list_blobs(_BUCKET, prefix=_GRANTS_PREFIX):
-        if not blob.name.endswith('.parquet'):
-            continue
-        try:
-            df = pd.read_parquet(io.BytesIO(blob.download_as_bytes()))
-        except Exception:
-            continue
-        if 'is_rolling' not in df.columns or 'topic_number' not in df.columns:
-            continue
-        for col, default in (('last_verified_active', ''), ('verify_status', 'active')):
-            if col not in df.columns:
-                df[col] = default
-        roll   = df['is_rolling'].fillna(False).astype(bool)
-        active = df['verify_status'].fillna('').astype(str) != 'inactive'
-        if (roll & active).any():
-            frames[blob] = df
-            numbers.update(df.loc[roll & active, 'topic_number'].astype(str))
-
-    status_map: dict = {}
-    if numbers:
-        with ThreadPoolExecutor(max_workers=_DETAIL_WORKERS) as pool:
-            futs = {pool.submit(_lookup_opp_status, n): n for n in numbers}
-            for fut in as_completed(futs):
-                n = futs[fut]
-                ok, status = fut.result()
-                if not ok:
-                    continue                      # leave unchanged on lookup error
-                status_map[n] = ('active' if status in ('posted', 'forecasted')
-                                 else 'inactive')  # closed/archived/None → gone
-
-    refreshed = expired = 0
-    for blob, df in frames.items():
-        roll   = df['is_rolling'].fillna(False).astype(bool)
-        active = df['verify_status'].fillna('').astype(str) != 'inactive'
-        dirty  = False
-        for idx in df.index[roll & active]:
-            res = status_map.get(str(df.at[idx, 'topic_number']))
-            if res == 'active':
-                df.at[idx, 'last_verified_active'] = today
-                df.at[idx, 'verify_status']        = 'active'
-                refreshed += 1
-                dirty = True
-            elif res == 'inactive':
-                df.at[idx, 'verify_status'] = 'inactive'
-                expired += 1
-                dirty = True
-        if dirty:
-            buf = io.BytesIO()
-            df.to_parquet(buf, index=False)
-            buf.seek(0)
-            blob.upload_from_file(buf, content_type='application/octet-stream')
-    return {'checked': len(numbers), 'refreshed': refreshed, 'expired': expired}
+    """Re-check stored rolling GRANTS-GOV opportunities against the live API. Thin
+    wrapper over the shared `gg.reverify_grants` (the scheduled grants-gov-job uses
+    the same core with `rolling_only=False` for the full open-topic sweep)."""
+    return gg.reverify_grants(gcs, rolling_only=True)
 
 
 def _search_grants(keyword, statuses, instruments, agencies, date_from, date_to,
