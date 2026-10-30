@@ -78,8 +78,9 @@
   .opp-link { font-size: 8.5pt; margin-top: 5pt; }
   .opp-link a { color: #0563C1; text-decoration: none; word-break: break-all; }
 
+  .topmark { margin-bottom: 8pt; }
   .totals {
-    background: #0E2A52; border-radius: 6pt; padding: 18pt 20pt; margin: 20pt 0 4pt;
+    background: #0E2A52; border-radius: 6pt; padding: 20pt 22pt; margin: 0 0 14pt;
     color: #FFFFFF; break-inside: avoid; page-break-inside: avoid;
   }
   .totals-eyebrow {
@@ -103,9 +104,20 @@
 </head>
 <body>
 
+  <div class="wordmark topmark">BW<span class="amp">&amp;</span>CO</div>
+
+  {% if totals %}
+  <div class="totals">
+    <div class="totals-eyebrow">Non-Dilutive Funding{% if company_name %} &middot; {{ company_name }}{% endif %}</div>
+    <div class="totals-amount">{{ totals.amount_display }}</div>
+    <div class="totals-sub">in potential non-dilutive funding
+      {%- if totals.all_counted %} across {{ totals.n_programs }} program{{ 's' if totals.n_programs != 1 else '' }}
+      {%- else %} across {{ totals.n_programs }} of {{ totals.n_total }} matched program{{ 's' if totals.n_total != 1 else '' }}{% endif %}</div>
+  </div>
+  {% endif %}
+
   <div class="cover">
-    <div class="wordmark">BW<span class="amp">&amp;</span>CO</div>
-    <div class="eyebrow">Non-Dilutive Funding</div>
+    {% if not totals %}<div class="eyebrow">Non-Dilutive Funding</div>{% endif %}
     <h1>Funding Roadmap</h1>
     <div class="for">Prepared for {{ company_name }}</div>
     <div class="meta">{{ generated }} &middot; Federal grant &amp; SBIR/STTR opportunities matched to your technology</div>
@@ -153,21 +165,12 @@
   </div>
   {% endfor %}
 
-  {% if totals %}
-  <div class="totals">
-    <div class="totals-eyebrow">If you pursued every match</div>
-    <div class="totals-amount">{{ totals.amount_display }}</div>
-    <div class="totals-sub">in potential non-dilutive funding
-      {%- if totals.all_counted %} across {{ totals.n_programs }} program{{ 's' if totals.n_programs != 1 else '' }}
-      {%- else %} across {{ totals.n_programs }} of {{ totals.n_total }} matched program{{ 's' if totals.n_total != 1 else '' }}{% endif %}</div>
-    <div class="totals-note">Estimated. Sums each program's full potential award: the ceiling stated in the
-      solicitation where one is published, otherwise the agency's typical Phase I plus Phase II SBIR/STTR
-      ceiling. Awards are competitive and not guaranteed, and a company rarely wins every program it pursues.
-      Confirm each figure against the official solicitation.</div>
-  </div>
-  {% endif %}
-
   <div class="disclaimer">
+    {% if totals %}The funding total is an estimate: it sums each program's full potential award, the
+    ceiling stated in the solicitation where one is published, otherwise the agency's typical Phase I plus
+    Phase II SBIR/STTR ceiling. Awards are competitive and not guaranteed, and a company rarely wins every
+    program it pursues.
+    {% endif %}
     Opportunities were identified by BW&amp;CO's matching engine from your
     description{% if profile_summary %} and profile{% endif %}. Deadlines are shown where published and
     are indicative, confirm each against the official solicitation before relying on it. Dollar figures,
