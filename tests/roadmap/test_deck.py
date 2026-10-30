@@ -176,3 +176,27 @@ def test_build_context_includes_totals_and_renders():
     assert ctx['totals']['amount_display'] in html
     assert 'potential non-dilutive funding' in html
     assert 'across 2 programs' in html
+
+
+# ── Clean truncation of the fallback blurb (no mid-word cut) ──────────────────
+
+def test_truncate_clean_sentence_boundary():
+    ex = ('Commercial technology that provides day / night, real-time surveillance, '
+          '24/7 observation through degraded environments that allows for response '
+          'to threats. Of particular interest is commercial solutions that allow for '
+          '360 degree visibility and allow for rapid integration onto multiple '
+          'platforms including ground vehicles and aircraft systems for the warfighter.')
+    out = deck.truncate_clean(ex, 300)
+    assert out.endswith('threats.')          # cut at the sentence end, not mid-word
+    assert len(out) <= 300 and 'onto mu' not in out
+
+
+def test_truncate_clean_word_boundary_ellipsis():
+    out = deck.truncate_clean('alpha bravo charlie delta echo foxtrot golf', 20)
+    assert out.endswith('…') and ' ' in out
+    assert not out[:-1].endswith(' ')         # no trailing space before the ellipsis
+
+
+def test_truncate_clean_short_passthrough():
+    assert deck.truncate_clean('Short.', 300) == 'Short.'
+    assert deck.truncate_clean('', 300) == ''

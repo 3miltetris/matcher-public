@@ -55,6 +55,25 @@ def banned_hits(text: str) -> list[str]:
     return [w for w in _BANNED if w in low]
 
 
+def truncate_clean(text, limit: int = 300) -> str:
+    """Shorten to <= `limit` chars WITHOUT cutting mid-word. Prefers to end on a
+    full sentence (keeping its period, no ellipsis); otherwise ends on a word
+    boundary with an ellipsis. Used for the fallback opportunity blurb when the LLM
+    narrative has no sentence for an opportunity, so a raw solicitation paragraph
+    never appears chopped mid-word ('...integration onto mu')."""
+    t = str(text or '').strip()
+    if len(t) <= limit:
+        return t
+    window = t[:limit]
+    cut = max(window.rfind('. '), window.rfind('! '), window.rfind('? '))
+    if cut >= limit * 0.5:                       # a clean full sentence fits
+        return window[:cut + 1].strip()
+    sp = window.rfind(' ')
+    if sp > 0:
+        window = window[:sp]
+    return window.rstrip(' ,;:.') + '…'
+
+
 # ── Verified ceiling display ─────────────────────────────────────────────────
 # The roadmap shows a dollar figure ONLY from our own verified data, rendered in a
 # chip separate from the LLM copy — the model is never asked to state an amount, so
@@ -306,7 +325,7 @@ def build_context(*, company_name: str, profile_summary: str,
             'deadline':    label,
             'countdown':   countdown,
             'ceiling':     ceiling_display(o, show_table_ceilings=show_table_ceilings),
-            'what_it_is':  nar.get('what_it_is') or clean_copy(str(o.get('grant_summary') or '')[:280]),
+            'what_it_is':  nar.get('what_it_is') or truncate_clean(clean_copy(o.get('grant_summary') or ''), 300),
             'why_it_fits': nar.get('why_it_fits') or '',
             'matched':     clean_copy(o.get('aspect_label') or ''),
             'url':         str(o.get('source') or ''),
