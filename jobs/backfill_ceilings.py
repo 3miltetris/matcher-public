@@ -76,6 +76,9 @@ def _apply_ceilings(df: pd.DataFrame, broad_agency: str) -> tuple[pd.DataFrame, 
     agency  = _col_list(df, 'agency', n)
     title   = _col_list(df, 'title', n)
     summ    = _col_list(df, 'grant_summary', n)
+    src_url = _col_list(df, 'source', n)
+    tnum    = _col_list(df, 'topic_number', n)
+    soltit  = _col_list(df, 'solicitation_title', n)
     fa      = _col_list(df, 'funding_amount', n)
     ac      = _col_list(df, 'award_ceiling', n)
     old_src = _col_list(df, 'ceiling_source', n)
@@ -86,9 +89,14 @@ def _apply_ceilings(df: pd.DataFrame, broad_agency: str) -> tuple[pd.DataFrame, 
         if old_src[i] in _PRESERVE:          # keep exact per-notice figures
             continue
         stated = fa[i] if fa[i].strip() else ac[i]
+        # program_text includes the source URL (sbir.gov / dodsbirsttr.mil) and the
+        # topic number / solicitation title, not just the summary — many real SBIR
+        # topics never spell out "SBIR/STTR" in their description but are plainly
+        # SBIR from the source, so this is what makes detection (and thus the phase
+        # caps) reach them.
         res = sc.resolve_ceilings(
             broad_agency=broad_agency, agency=agency[i],
-            program_text=f'{title[i]} {summ[i]}',
+            program_text=f'{title[i]} {summ[i]} {src_url[i]} {tnum[i]} {soltit[i]}',
             funding_amount_text=(stated or None),
         )
         row_changed = False

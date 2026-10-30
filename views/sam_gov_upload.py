@@ -341,7 +341,8 @@ def _embed_and_save(
 
     # Verified SBIR/STTR ceilings from the agency table (SAM.gov CSVs carry no
     # structured dollar field), applied only to SBIR/STTR-looking notices.
-    _pt = [f'{t} {s}' for t, s in zip(out['title'], out['grant_summary'])]
+    _pt = [f'{t} {s} {src} {tn}' for t, s, src, tn in
+           zip(out['title'], out['grant_summary'], out['source'], out['topic_number'])]
     _ceils = [sc.resolve_ceilings(broad_agency='SAM-GOV', agency=a, program_text=pt)
               for a, pt in zip(out['agency'].astype(str).tolist(), _pt)]
     for _col in sc.CEILING_COLUMNS:

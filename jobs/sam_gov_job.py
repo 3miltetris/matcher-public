@@ -1719,8 +1719,9 @@ def main(config_blob_path: str) -> None:
     # like SBIR/STTR (program_text = title + summary + notice type). A general
     # contract or supply buy gets no ceiling. No per-notice figure is captured in
     # v1 (stated-text extraction from the screen prompt is a documented fast-follow).
-    _ptexts = [f'{t} {s} {n}' for t, s, n in
-               zip(out['title'], out['grant_summary'], out['notice_type'])]
+    _ptexts = [f'{t} {s} {n} {src} {tn}' for t, s, n, src, tn in
+               zip(out['title'], out['grant_summary'], out['notice_type'],
+                   out['source'], out['topic_number'])]
     _ceils = [sc.resolve_ceilings(broad_agency='SAM-GOV', agency=a, program_text=pt)
               for a, pt in zip(out['agency'].tolist(), _ptexts)]
     for _col in sc.CEILING_COLUMNS:

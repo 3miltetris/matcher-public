@@ -162,10 +162,12 @@ def _embed_and_save(df: pd.DataFrame, broad_agency: str, oai_key: str, anth_key:
     _blank = pd.Series([''] * _n, index=df.index)
     _fa = (df['funding_amount'].astype(str).tolist() if 'funding_amount' in df.columns
            else [''] * _n)
-    _pt = [f'{t} {s} {so}' for t, s, so in zip(
+    _pt = [f'{t} {s} {so} {src} {tn}' for t, s, so, src, tn in zip(
         df.get('title', _blank).astype(str),
         df.get('grant_summary', _blank).astype(str),
-        df.get('solicitation_title', _blank).astype(str))]
+        df.get('solicitation_title', _blank).astype(str),
+        df.get('source', _blank).astype(str),
+        df.get('topic_number', _blank).astype(str))]
     _ceils = [sc.resolve_ceilings(broad_agency=broad_agency, agency=a,
                                   program_text=pt, funding_amount_text=fa)
               for a, pt, fa in zip(df['agency'].astype(str).tolist(), _pt, _fa)]

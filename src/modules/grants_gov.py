@@ -425,8 +425,8 @@ def embed_and_save(
     _floor = (df['_gg_award_floor'].tolist() if '_gg_award_floor' in df.columns
               else [None] * len(df))
     syns = [{'awardCeiling': c, 'awardFloor': f} for c, f in zip(_ceil, _floor)]
-    ptexts = [f'{t} {d} {s}' for t, d, s in
-              zip(out['title'], out['description'], summaries)]
+    ptexts = [f'{t} {d} {s} {tn}' for t, d, s, tn in
+              zip(out['title'], out['description'], summaries, out['topic_number'])]
     ceils = [sc.resolve_ceilings(broad_agency='GRANTS-GOV', agency=a,
                                  program_text=pt, gg_synopsis=syn)
              for a, pt, syn in zip(out['agency'].tolist(), ptexts, syns)]
