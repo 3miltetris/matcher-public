@@ -78,6 +78,21 @@
   .opp-link { font-size: 8.5pt; margin-top: 5pt; }
   .opp-link a { color: #0563C1; text-decoration: none; word-break: break-all; }
 
+  .totals {
+    background: #0E2A52; border-radius: 6pt; padding: 18pt 20pt; margin: 20pt 0 4pt;
+    color: #FFFFFF; break-inside: avoid; page-break-inside: avoid;
+  }
+  .totals-eyebrow {
+    font-size: 8.5pt; letter-spacing: 2px; text-transform: uppercase;
+    color: #9FB4D4; margin-bottom: 4pt;
+  }
+  .totals-amount {
+    font-family: "Arial Black", Arial, Helvetica, sans-serif; font-weight: 900;
+    font-size: 46pt; line-height: 1.0; color: #FFFFFF;
+  }
+  .totals-sub { font-size: 12pt; color: #DBE4F1; margin-top: 5pt; font-weight: 600; }
+  .totals-note { font-size: 7.8pt; color: #9FB4D4; margin-top: 8pt; line-height: 1.35; }
+
   .disclaimer {
     margin-top: 16pt; border-top: 0.75pt solid #E4E9F0; padding-top: 7pt;
     font-size: 7.8pt; color: #5A6B80; line-height: 1.4;
@@ -137,6 +152,20 @@
     </div>
   </div>
   {% endfor %}
+
+  {% if totals %}
+  <div class="totals">
+    <div class="totals-eyebrow">If you pursued every match</div>
+    <div class="totals-amount">{{ totals.amount_display }}</div>
+    <div class="totals-sub">in potential non-dilutive funding
+      {%- if totals.all_counted %} across {{ totals.n_programs }} program{{ 's' if totals.n_programs != 1 else '' }}
+      {%- else %} across {{ totals.n_programs }} of {{ totals.n_total }} matched program{{ 's' if totals.n_total != 1 else '' }}{% endif %}</div>
+    <div class="totals-note">Estimated. Sums each program's full potential award: the ceiling stated in the
+      solicitation where one is published, otherwise the agency's typical Phase I plus Phase II SBIR/STTR
+      ceiling. Awards are competitive and not guaranteed, and a company rarely wins every program it pursues.
+      Confirm each figure against the official solicitation.</div>
+  </div>
+  {% endif %}
 
   <div class="disclaimer">
     Opportunities were identified by BW&amp;CO's matching engine from your

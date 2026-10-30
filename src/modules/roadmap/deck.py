@@ -78,6 +78,57 @@ def _fmt_usd(value) -> str:
     return f'${int(round(v))}'
 
 
+def _num(value) -> float | None:
+    """A positive float, or None (NaN/blank/non-positive → None)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if (v == v and v > 0) else None
+
+
+def opportunity_value(opp: dict, *, show_table_ceilings: bool = True) -> float | None:
+    """The estimated potential funding for one opportunity, or None when we have no
+    sourced figure. Exact per-notice figures (Grants.gov / stated) use the award
+    ceiling; an SBIR/STTR program priced from the agency table uses the FULL award
+    path (Phase I + Phase II), which is the "funding available through this program"
+    the totals summary is meant to convey. Table figures are skipped when
+    `show_table_ceilings` is off, so the total matches what the chips show."""
+    source = str(opp.get('ceiling_source') or '')
+    if source in ('grants_gov', 'stated_text'):
+        return _num(opp.get('award_ceiling_num'))
+    if source == 'agency_table':
+        if not show_table_ceilings:
+            return None
+        path = sum(v for v in (_num(opp.get('phase1_ceiling_num')),
+                               _num(opp.get('phase2_ceiling_num'))) if v)
+        return path or None
+    return None
+
+
+def funding_totals(opportunities: list[dict], *, show_table_ceilings: bool = True) -> dict | None:
+    """Summed estimated potential funding across the matched opportunities, or None
+    when nothing has a sourced figure. `n_programs` counts the opportunities that
+    contributed a figure; `n_total` is the full match count (they differ when some
+    matches carry no sourced ceiling)."""
+    total = 0.0
+    n = 0
+    for o in opportunities:
+        v = opportunity_value(o, show_table_ceilings=show_table_ceilings)
+        if v:
+            total += v
+            n += 1
+    if n == 0 or total <= 0:
+        return None
+    return {
+        'amount': total,
+        'amount_display': _fmt_usd(total),
+        'n_programs': n,
+        'n_total': len(opportunities),
+        'all_counted': n == len(opportunities),
+    }
+
+
 def ceiling_display(opp: dict, *, show_table_ceilings: bool = True) -> str:
     """The verified ceiling chip text for one opportunity, or '' to show nothing.
 
@@ -265,6 +316,8 @@ def build_context(*, company_name: str, profile_summary: str,
         'profile_summary': clean_copy(profile_summary),
         'why_now':         narrative.get('why_now') or '',
         'opportunities':   opps,
+        'totals':          funding_totals(opportunities,
+                                          show_table_ceilings=show_table_ceilings),
         'generated':       today.strftime('%B %Y'),
         'firm_url':        'www.bwcoconsulting.com',
     }

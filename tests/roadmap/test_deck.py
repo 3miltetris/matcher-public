@@ -116,3 +116,63 @@ def test_build_context_sets_ceiling_and_prompt_still_forbids_inventing():
     # The model is still told never to invent a dollar amount (we render verified
     # figures in a separate chip, so the guard stays).
     assert 'NEVER state a dollar amount' in deck._build_system()
+
+
+# ── Funding totals summary (estimate of total available) ─────────────────────
+
+def test_opportunity_value_by_source():
+    assert deck.opportunity_value(
+        {'ceiling_source': 'grants_gov', 'award_ceiling_num': 500000}) == 500000
+    assert deck.opportunity_value(
+        {'ceiling_source': 'stated_text', 'award_ceiling_num': 150000}) == 150000
+    # SBIR table → full Phase I + Phase II path
+    assert deck.opportunity_value(
+        {'ceiling_source': 'agency_table', 'phase1_ceiling_num': 250000,
+         'phase2_ceiling_num': 1800000}) == 2050000
+    # table suppressed, or no sourced figure → None
+    assert deck.opportunity_value(
+        {'ceiling_source': 'agency_table', 'phase1_ceiling_num': 250000},
+        show_table_ceilings=False) is None
+    assert deck.opportunity_value({'ceiling_source': '', 'award_ceiling_num': None}) is None
+
+
+def test_funding_totals_sums_and_counts():
+    opps = [
+        {'ceiling_source': 'grants_gov', 'award_ceiling_num': 500000},
+        {'ceiling_source': 'agency_table', 'phase1_ceiling_num': 250000,
+         'phase2_ceiling_num': 1800000},
+        {'ceiling_source': '', 'award_ceiling_num': None},   # no figure
+    ]
+    t = deck.funding_totals(opps)
+    assert t['amount'] == 2550000
+    assert t['amount_display'] == '$2.5M'
+    assert t['n_programs'] == 2 and t['n_total'] == 3
+    assert t['all_counted'] is False
+
+
+def test_funding_totals_none_when_no_figures():
+    assert deck.funding_totals([{'ceiling_source': '', 'award_ceiling_num': None}]) is None
+    assert deck.funding_totals([]) is None
+
+
+def test_funding_totals_respects_suppression():
+    opps = [{'ceiling_source': 'agency_table', 'phase1_ceiling_num': 250000,
+             'phase2_ceiling_num': 1800000}]
+    assert deck.funding_totals(opps, show_table_ceilings=False) is None
+    assert deck.funding_totals(opps, show_table_ceilings=True)['amount'] == 2050000
+
+
+def test_build_context_includes_totals_and_renders():
+    ctx = deck.build_context(
+        company_name='Acme', profile_summary='p',
+        opportunities=[
+            {'title': 'A', 'ceiling_source': 'grants_gov', 'award_ceiling_num': 500000},
+            {'title': 'B', 'ceiling_source': 'agency_table',
+             'phase1_ceiling_num': 250000, 'phase2_ceiling_num': 1800000},
+        ],
+        narrative={'items': {}})
+    assert ctx['totals']['n_programs'] == 2 and ctx['totals']['all_counted'] is True
+    html = deck.render_html(ctx)
+    assert ctx['totals']['amount_display'] in html
+    assert 'potential non-dilutive funding' in html
+    assert 'across 2 programs' in html
