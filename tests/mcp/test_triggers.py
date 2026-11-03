@@ -230,6 +230,56 @@ def test_run_matching_config_and_run_id(storage):
     cfg = json.loads(storage.bucket(tg.BUCKET).blob(
         f"job-configs/{out['run_id']}.json").download_as_text())
     assert cfg['top_k'] == 7 and cfg['agencies'] == ['DOD', 'HHS']
+    # no date filter / procurement off by default
+    assert cfg['topic_filters'] == [] and cfg['include_procurement'] is False
+
+
+def test_run_matching_date_filter_config(storage):
+    args = {'agencies': ['DOD'], 'sources': ['apollo'],
+            'date_column': 'due_date', 'date_to': '2026-12-31',
+            'include_procurement': True}
+    est = tg.estimate(storage, 'run_matching', args, EMAIL, secret=SECRET, now=1000)
+    out = tg.trigger(storage, 'run_matching', args, EMAIL, est['confirm_token'],
+                     secret=SECRET, jobs_client=FakeJobs(), now=1001)
+    assert out['triggered']
+    cfg = json.loads(storage.bucket(tg.BUCKET).blob(
+        f"job-configs/{out['run_id']}.json").download_as_text())
+    assert cfg['include_procurement'] is True
+    assert cfg['topic_filters'] == [{
+        'column': 'due_date', 'type': 'date_range',
+        'date_from': '1900-01-01', 'date_to': '2026-12-31',  # missing side filled
+        'include_undated': True, 'operator': 'AND'}]
+
+
+def test_run_matching_date_filter_rejects_bad_input(storage):
+    base = {'agencies': ['DOD'], 'sources': ['apollo']}
+    # unknown column
+    assert 'error' in tg.estimate(storage, 'run_matching',
+                                  {**base, 'date_column': 'bogus', 'date_to': '2026-12-31'},
+                                  EMAIL, secret=SECRET)
+    # non-ISO date
+    assert 'error' in tg.estimate(storage, 'run_matching',
+                                  {**base, 'date_column': 'due_date', 'date_to': '12/31/2026'},
+                                  EMAIL, secret=SECRET)
+    # reversed range
+    assert 'error' in tg.estimate(storage, 'run_matching',
+                                  {**base, 'date_column': 'due_date',
+                                   'date_from': '2026-12-31', 'date_to': '2026-01-01'},
+                                  EMAIL, secret=SECRET)
+    # column set but no bound
+    assert 'error' in tg.estimate(storage, 'run_matching',
+                                  {**base, 'date_column': 'due_date'}, EMAIL, secret=SECRET)
+
+
+def test_run_matching_date_filter_token_binds_to_dates(storage):
+    args = {'agencies': ['DOD'], 'sources': ['apollo'],
+            'date_column': 'due_date', 'date_to': '2026-12-31'}
+    est = tg.estimate(storage, 'run_matching', args, EMAIL, secret=SECRET, now=1000)
+    # changing the range invalidates the token minted for the original args
+    changed = {**args, 'date_to': '2027-06-30'}
+    out = tg.trigger(storage, 'run_matching', changed, EMAIL, est['confirm_token'],
+                     secret=SECRET, jobs_client=FakeJobs(), now=1001)
+    assert 'error' in out and 'confirm_token' in out['error']
 
 
 def test_add_spend_accumulates(storage):

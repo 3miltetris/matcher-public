@@ -36,6 +36,9 @@ which tool to use for which job.
   `get_onboarding_proposal`.
 - **Trigger a job (two-step):** `run_matching` · `build_profiles` · `sync_drive` ·
   `sync_fathom` · `run_onboarding_agent`. See **Triggering jobs** below.
+- **Set up a bulk match:** `list_match_options` lists the real contact sources
+  (apollo / sba / clients / prospects…) and agency folders (DOD / HHS / SAM-GOV…)
+  to choose from. Call it before `run_matching`. See **Running a bulk match**.
 
 ## Workflows
 
@@ -49,9 +52,10 @@ which tool to use for which job.
    client is agency-specific. The `score` is 0–1 cosine similarity (relative,
    higher = closer) — not a probability or a decision.
 
-*(A one-click "profile → topics" company match and bulk match runs live in the
-Streamlit app's Grant Search / Bulk Aspect Match; the connector's `search_grants`
-is the typed-description version.)*
+*(`search_grants` is the typed-description search for one capability. To score a
+whole contact pool against an agency's topics, run a **bulk match** — see below.
+The one-click "profile → topics" per-company aspect match still lives in the
+Streamlit app's Grant Search / Bulk Aspect Match.)*
 
 **"What happened overnight?"** → `whats_new`. Gives the latest run of each
 scheduled job (Drive sync, Fathom sync, SAM.gov, deep-research) with its headline
@@ -108,6 +112,33 @@ Rules to relay honestly:
   `run_id`) instead of starting a duplicate — report that, don't retry.
 - A `confirm_token` lasts ~10 minutes and is bound to the exact arguments and
   caller. If it expires or the arguments change, just re-estimate.
+
+### Running a bulk match
+
+When someone asks to run a bulk match, gather the choices before triggering —
+don't guess codes:
+
+1. **Call `list_match_options` first.** It returns the real `contact_sources`
+   (the company pools/lead folders) and `agencies` (grant-topic folders).
+2. **Ask the person to choose**, one short question at a time (in claude.ai these
+   render as selectable options). Offer only what `list_match_options` returned:
+   - **Company source(s)** — one or more of `contact_sources`. Note **prospects**
+     is opt-in (`default_selected` is false); include it only if they say so.
+   - **Agency/agencies** — one or more of `agencies` (e.g. DOD, HHS, SAM-GOV).
+   - **Grant date filter (optional)** — offer to limit by `due_date` or
+     `scraped_at`, with a from/to range (either side alone is fine, e.g. "due
+     before 2026-12-31"), and whether to keep undated/rolling grants
+     (`include_undated`, default yes). Skip it if they don't want one.
+3. **Then the two-step:** call `run_matching` with the chosen `sources`,
+   `agencies`, and any `date_column`/`date_from`/`date_to`/`include_undated`,
+   **without** `confirm_token` → show the cost estimate → call again with the
+   **same** arguments plus the `confirm_token` → follow with
+   `get_run_status("matching-job", run_id)` and read the rows with
+   `get_match_results`.
+
+Remember a contact source (apollo, clients…) is **what gets scored**; an agency
+(DOD, SAM-GOV…) is **what it is scored against** — SAM-GOV is an agency, not a
+contact source.
 
 ## Conventions that matter
 

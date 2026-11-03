@@ -35,7 +35,7 @@ import hmac
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from google.api_core.exceptions import NotFound, PreconditionFailed
 
@@ -285,6 +285,48 @@ def _load_drive_assignments(gcs_client, bucket: str) -> dict:
 
 # run_matching ─────────────────────────────────────────────────────────────────
 
+# A date filter may only point at a grant date column matching_job can parse.
+# The job does NO column validation — an unknown column raises KeyError mid-run —
+# so the allowlist is enforced here, before anything is triggered.
+_DATE_COLUMNS = ('due_date', 'scraped_at', 'close_date', 'open_date')
+_DATE_MIN = '1900-01-01'
+_DATE_MAX = '2999-12-31'
+
+
+def _build_date_filter(args: dict):
+    """(topic_filters, error). Turns the simple single-range args (date_column,
+    date_from, date_to, include_undated) into the one date_range topic filter
+    matching_job applies, or ([], None) when no date_column is given. Bounds are
+    ISO YYYY-MM-DD (date.fromisoformat); a missing side is filled so one-sided
+    'due before X' / 'due after X' work."""
+    column = str(args.get('date_column', '') or '').strip()
+    if not column:
+        return [], None
+    if column not in _DATE_COLUMNS:
+        return None, (f'date_column must be one of {list(_DATE_COLUMNS)}, '
+                      f'got {column!r}')
+    raw_from = str(args.get('date_from', '') or '').strip()
+    raw_to = str(args.get('date_to', '') or '').strip()
+    if not raw_from and not raw_to:
+        return None, ('date_from or date_to is required when date_column is set '
+                      '(ISO YYYY-MM-DD)')
+    try:
+        d_from = date.fromisoformat(raw_from) if raw_from else date.fromisoformat(_DATE_MIN)
+        d_to = date.fromisoformat(raw_to) if raw_to else date.fromisoformat(_DATE_MAX)
+    except ValueError:
+        return None, 'date_from / date_to must be ISO dates (YYYY-MM-DD)'
+    if d_from > d_to:
+        return None, 'date_from must not be after date_to'
+    return [{
+        'column': column,
+        'type': 'date_range',
+        'date_from': d_from.isoformat(),
+        'date_to': d_to.isoformat(),
+        'include_undated': bool(args.get('include_undated', True)),
+        'operator': 'AND',
+    }], None
+
+
 def _resolve_matching(gcs_client, args: dict, bucket: str):
     agencies = _as_list(args.get('agencies'))
     sources = _as_list(args.get('sources'))
@@ -292,6 +334,9 @@ def _resolve_matching(gcs_client, args: dict, bucket: str):
         return None, 0, {}, 'at least one agency is required (e.g. ["DOD","HHS"])'
     if not sources:
         return None, 0, {}, 'at least one contact source is required (e.g. ["apollo"])'
+    topic_filters, err = _build_date_filter(args)
+    if err:
+        return None, 0, {}, err
     norm = {
         'agencies': sorted(agencies),
         'sources': sorted(sources),
@@ -299,6 +344,8 @@ def _resolve_matching(gcs_client, args: dict, bucket: str):
         'top_k': int(args.get('top_k', 5)),
         'ai_validation': bool(args.get('ai_validation', True)),
         'prewrite_email': bool(args.get('prewrite_email', False)),
+        'include_procurement': bool(args.get('include_procurement', False)),
+        'topic_filters': topic_filters,
     }
     return norm, 1, {}, None
 
@@ -310,7 +357,8 @@ def _config_matching(norm: dict, extra: dict, run_id: str) -> dict:
         'top_k': norm['top_k'],
         'sources': norm['sources'],
         'agencies': norm['agencies'],
-        'topic_filters': [],
+        'topic_filters': norm['topic_filters'],
+        'include_procurement': norm['include_procurement'],
         'ai_validation': norm['ai_validation'],
         'prewrite_email': norm['prewrite_email'],
         # {} not None: matching_job does config.get('email_config', {}), which

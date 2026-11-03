@@ -11,13 +11,21 @@ import pandas as pd
 
 from src.modules import attention as aq, onboarding as ob
 from src.modules.tools import (
-    _common as cm, attention as t_att, onboarding as t_ob, runs as t_runs,
-    search as t_search,
+    _common as cm, attention as t_att, match_options as t_mo, onboarding as t_ob,
+    runs as t_runs, search as t_search,
 )
 from tests.mcp.conftest import put_csv, put_json, put_parquet
 
 
 # ── _common ───────────────────────────────────────────────────────────────────
+
+def test_list_subfolders(storage):
+    put_json(storage, 'data/all-contacts/apollo/a.parquet', {})
+    put_json(storage, 'data/all-contacts/apollo/b.parquet', {})
+    put_json(storage, 'data/all-contacts/clients/c.parquet', {})
+    assert cm.list_subfolders(storage, 'data/all-contacts/',
+                              bucket='cc-matcher-bucket-jeg-v1') == ['apollo', 'clients']
+
 
 def test_cap_text_middle_out():
     out = cm.cap_text('x' * 1000, 100)
@@ -29,6 +37,29 @@ def test_cursor_roundtrip_and_garbage():
     assert cm.decode_cursor(cm.encode_cursor(42)) == 42
     assert cm.decode_cursor(None) == 0
     assert cm.decode_cursor('not-a-cursor') == 0
+
+
+# ── match_options ───────────────────────────────────────────────────────────────
+
+def test_list_match_options(storage):
+    put_json(storage, 'data/all-contacts/apollo/a.parquet', {})
+    put_json(storage, 'data/all-contacts/clients/c.parquet', {})
+    put_json(storage, 'data/all-contacts/prospects/p.parquet', {})
+    put_json(storage, 'data/all-topics/processed/DOD/t.parquet', {})
+    put_json(storage, 'data/all-topics/processed/SAM-GOV/t.parquet', {})
+    out = t_mo.list_match_options(storage)
+
+    assert out['agencies'] == ['DOD', 'SAM-GOV']
+    assert out['date_columns'] == ['due_date', 'scraped_at']
+    by_name = {s['name']: s for s in out['contact_sources']}
+    assert set(by_name) == {'apollo', 'clients', 'prospects'}
+    assert by_name['clients']['kind'] == 'pool'
+    assert by_name['apollo']['kind'] == 'lead_source'
+    # prospects is available but off by default; mirrors the Bulk Matching view
+    assert by_name['prospects']['default_selected'] is False
+    assert by_name['apollo']['default_selected'] is True
+    # names only — no row counts anywhere
+    assert all('count' not in k for s in out['contact_sources'] for k in s)
 
 
 # ── attention ─────────────────────────────────────────────────────────────────

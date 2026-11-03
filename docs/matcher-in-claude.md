@@ -29,10 +29,17 @@ answers.
 
 **Tier 1 tools:** `search_grants`, `search_companies`, `get_company`, `get_profile`,
 `search_resumes`, `list_runs`, `get_run_status`, `get_match_results`, `whats_new`,
-`list_attention`, `list_onboarding_proposals`, `get_onboarding_proposal`.
+`list_attention`, `list_onboarding_proposals`, `get_onboarding_proposal`,
+`list_match_options` (the available contact sources + agency folders, by name, to
+feed a `run_matching` request).
 
 **Tier 2 tools (triggers):** `run_matching`, `build_profiles`, `sync_drive`,
-`sync_fathom`, `run_onboarding_agent`. Each is **two-step**: calling it without a
+`sync_fathom`, `run_onboarding_agent`. `run_matching` takes the match axes
+(`agencies`, `sources`) plus an optional single grant **date filter**
+(`date_column` = `due_date`/`scraped_at`, `date_from`/`date_to` ISO, one-sided
+allowed, `include_undated`) and `include_procurement`; the date filter becomes a
+`date_range` `topic_filter` the matching job already applies. Each is **two-step**:
+calling it without a
 `confirm_token` validates the arguments and returns `{estimate, confirm_token}`
 with no side effect; calling it again with the SAME arguments plus that token
 starts the Cloud Run job. The token is an HMAC over `(tool, normalized args,

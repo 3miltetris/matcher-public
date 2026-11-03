@@ -38,6 +38,21 @@ def cap_text(text, limit: int = 2_000) -> str:
     return f'{s[:head]}\n…[{len(s) - keep} chars elided]…\n{s[-tail:]}'
 
 
+def list_subfolders(gcs_client, prefix: str, *, bucket: str) -> list[str]:
+    """The immediate sub-folder names directly under `prefix` (e.g. 'apollo',
+    'clients' under 'data/all-contacts/'; 'DOD', 'SAM-GOV' under
+    'data/all-topics/processed/'). Uses a plain `prefix=` list and splits the
+    first path segment off each blob — NOT list_blobs(delimiter='/')/.prefixes,
+    which the GCS test fake does not implement. Precedents: runs._run_ids,
+    search._topic_folders."""
+    names = set()
+    for blob in gcs_client.list_blobs(bucket, prefix=prefix):
+        seg = str(blob.name)[len(prefix):].split('/', 1)[0]
+        if seg:
+            names.add(seg)
+    return sorted(names)
+
+
 def encode_cursor(offset: int) -> str:
     """An opaque pagination cursor over a 0-based offset."""
     raw = json.dumps({'o': int(offset)}).encode('utf-8')

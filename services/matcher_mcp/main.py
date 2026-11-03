@@ -35,8 +35,8 @@ from google.cloud import storage
 
 from services.matcher_mcp import audit as au, auth
 from src.modules.tools import (
-    attention as t_att, company_lookup as t_co, onboarding as t_ob,
-    runs as t_runs, search as t_search, triggers as t_trig,
+    attention as t_att, company_lookup as t_co, match_options as t_mo,
+    onboarding as t_ob, runs as t_runs, search as t_search, triggers as t_trig,
 )
 
 _BUCKET = 'cc-matcher-bucket-jeg-v1'
@@ -270,6 +270,17 @@ def build_server():
         return _emit(r)
 
     @mcp.tool()
+    def list_match_options() -> str:
+        """The choices a bulk match needs: the available contact sources (company
+        pools/lead folders — apollo, sba, clients, prospects…) and the grant
+        agency folders (DOD, HHS, SAM-GOV…) that exist right now. Call this BEFORE
+        run_matching so the options offered are real, not guessed. Prospects is
+        listed but `default_selected` is false. Names only — no counts."""
+        r = run_tool('list_match_options',
+                     lambda: t_mo.list_match_options(gcs), {})
+        return _emit(r)
+
+    @mcp.tool()
     def whats_new() -> str:
         """A digest of what the scheduled pipeline produced (latest run of each
         scheduled job) plus the open attention-queue counts."""
@@ -342,14 +353,25 @@ def build_server():
     @mcp.tool()
     def run_matching(agencies: str, sources: str, threshold: float = 0.82,
                      top_k: int = 5, ai_validation: bool = True,
-                     prewrite_email: bool = False, confirm_token: str = '') -> str:
+                     prewrite_email: bool = False, include_procurement: bool = False,
+                     date_column: str = '', date_from: str = '', date_to: str = '',
+                     include_undated: bool = True, confirm_token: str = '') -> str:
         """Start a bulk matching run (contacts × grant topics). `agencies` and
-        `sources` are comma-separated (e.g. 'DOD,HHS' / 'apollo,sba'). Call once
-        WITHOUT confirm_token to get an estimate and a confirm_token, then call
-        again with the SAME arguments plus that confirm_token to start the run."""
+        `sources` are comma-separated (e.g. 'DOD,HHS' / 'apollo,sba'); get the real
+        options from list_match_options first. Optional grant date filter: set
+        `date_column` to 'due_date' or 'scraped_at' plus `date_from`/`date_to`
+        (ISO YYYY-MM-DD; either side may be omitted for a one-sided range), and
+        `include_undated` (default true) to keep rolling/undated grants.
+        `include_procurement` (default false) opts supply/sources-sought notices
+        back in. Call once WITHOUT confirm_token to get an estimate and a
+        confirm_token, then call again with the SAME arguments plus that
+        confirm_token to start the run."""
         args = {'agencies': agencies, 'sources': sources, 'threshold': threshold,
                 'top_k': top_k, 'ai_validation': ai_validation,
-                'prewrite_email': prewrite_email}
+                'prewrite_email': prewrite_email,
+                'include_procurement': include_procurement,
+                'date_column': date_column, 'date_from': date_from,
+                'date_to': date_to, 'include_undated': include_undated}
         return run_trigger('run_matching', args, confirm_token)
 
     @mcp.tool()
