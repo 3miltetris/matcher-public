@@ -25,6 +25,7 @@ _MODES = {
     '📄 Import Topics':   'views.topic_importer',
     '🏛️ SAM.gov':         'views.sam_gov_upload',
     '🏦 Grants.gov':      'views.grants_gov_fetch',
+    '🪖 DoD SBIR':        'views.dod_sbir_fetch',
     '🛰️ Funding Sources': 'views.funding_sources',
 }
 
