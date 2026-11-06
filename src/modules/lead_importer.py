@@ -214,7 +214,7 @@ async def scrape_pages(df: pd.DataFrame, url_col: str = 'companyWebsite') -> pd.
 async def _summarize_one(client: AsyncOpenAI, page_text: str) -> str:
     try:
         resp = await client.chat.completions.create(
-            model='gpt-3.5-turbo',
+            model='gpt-4o-mini',
             max_tokens=300,
             messages=[
                 {'role': 'system', 'content': _SUMMARISE_SYSTEM},

@@ -327,7 +327,7 @@ def _summarize_one(idx: int, text: str, client: OpenAI) -> tuple[int, str]:
         return idx, ''
     try:
         resp = client.chat.completions.create(
-            model='gpt-3.5-turbo',
+            model='gpt-4o-mini',
             max_tokens=300,
             messages=[
                 {'role': 'system', 'content': _SUMMARISE_SYSTEM},
@@ -336,7 +336,13 @@ def _summarize_one(idx: int, text: str, client: OpenAI) -> tuple[int, str]:
         )
         return idx, resp.choices[0].message.content.strip()
     except Exception as e:
-        return idx, f'SUMMARY_ERROR: {e}'
+        # Return an EMPTY summary, never the error string. An empty summary
+        # yields a None embedding (_get_embedding) and the row is dropped at
+        # save time, so a transient/deprecated-model failure can never poison
+        # the pool with thousands of identical error-string embeddings that
+        # cluster together and then silently match nothing.
+        print(f'  summary error (index {idx}): {e}', flush=True)
+        return idx, ''
 
 
 def _run_summarization(page_texts: list[str], openai_key: str) -> list[str]:

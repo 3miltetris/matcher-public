@@ -282,8 +282,41 @@ def items_to_df(items: list[dict], descriptions: list[str] | None = None) -> pd.
             'program':            str(_get(opp, 'program', 'programName') or '').strip().upper(),
             'solicitation_title': str(_get(opp, 'solicitationTitle') or cycle).strip(),
             'source':             TOPIC_URL.format(tid=topic_id) if topic_id else '',
+            'topic_id':           topic_id,   # hidden; used by the detail probe, not persisted
         })
     return pd.DataFrame(rows)
+
+
+def probe_detail(topic_id: str) -> dict:
+    """Fetch ONE topic's raw detail response and report its actual shape, so the
+    live field names can be seen instead of guessed. Returns {ok, http, status,
+    top_level_keys, extracted_len, raw_snippet, error}. Never raises."""
+    out = {'ok': False, 'http': None, 'status': '', 'top_level_keys': [],
+           'extracted_len': 0, 'raw_snippet': '', 'error': ''}
+    if not topic_id:
+        out['error'] = 'no topic_id on the row'
+        return out
+    try:
+        r = requests.get(DETAIL_URL.format(tid=topic_id), headers=_HEADERS, timeout=_TIMEOUT)
+        out['http'] = r.status_code
+        out['raw_snippet'] = (r.text or '')[:2000]
+        if r.status_code != 200:
+            out['error'] = f'HTTP {r.status_code}'
+            return out
+        d = r.json()
+        if isinstance(d, dict):
+            out['top_level_keys'] = sorted(d.keys())
+            inner = d.get('data')
+            if isinstance(inner, dict):
+                out['top_level_keys'] = sorted(set(out['top_level_keys']) |
+                                               {f'data.{k}' for k in inner.keys()})
+            out['extracted_len'] = len(_detail_text(d if 'objective' in d else (inner or d)))
+        out['ok'] = True
+        out['status'] = 'ok' if out['extracted_len'] else 'empty'
+        return out
+    except Exception as e:
+        out['error'] = f'{type(e).__name__}: {e}'
+        return out
 
 
 def search_topics(

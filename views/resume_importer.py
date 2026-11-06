@@ -215,7 +215,7 @@ def _run_summarization(rows: list[dict], openai_key: str, progress) -> list[dict
             return idx, {**row, 'expertise_summary': ''}
         try:
             resp = client.chat.completions.create(
-                model='gpt-3.5-turbo',
+                model='gpt-4o-mini',
                 max_tokens=400,
                 messages=[
                     {'role': 'system', 'content': _SUMMARISE_SYSTEM},
@@ -230,7 +230,11 @@ def _run_summarization(rows: list[dict], openai_key: str, progress) -> list[dict
                 summary = ''
             return idx, {**row, 'expertise_summary': summary}
         except Exception as e:
-            return idx, {**row, 'expertise_summary': f'SUMMARY_ERROR: {e}'}
+            # Empty, never the error string — an empty expertise_summary is
+            # skipped (not embedded), so a failed call drops the row rather
+            # than embedding a junk error-string that matches nothing.
+            print(f'  resume summary error (index {idx}): {e}', flush=True)
+            return idx, {**row, 'expertise_summary': ''}
 
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {pool.submit(_one, i, r): i for i, r in enumerate(rows)}

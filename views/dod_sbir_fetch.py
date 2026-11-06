@@ -156,30 +156,40 @@ def render():
     no_desc = int((df_raw['description'].str.strip() == '').sum())
     report  = st.session_state.get('dsbir_detail_report') or {}
     if no_desc > 0:
-        failed   = int(report.get('failed', 0))
-        statuses = report.get('statuses') or {}
-        sample   = report.get('sample_error', '')
-        if failed and failed >= no_desc * 0.5:
-            # Most blanks are failed detail calls, not genuinely empty topics —
-            # name the reason (e.g. http_403/http_429 = the detail endpoint refused
-            # the burst) so it is fixable rather than a silent gap.
-            st.warning(
-                f'{no_desc} of {len(df_raw)} topics have no description because the detail '
-                f'endpoint **failed** for {failed} of them (most common: `{sample}`). '
-                'Re-fetch to retry, or reduce the batch. Saving now embeds those by title only.',
-                icon='⚠️',
-            )
-            with st.expander('Detail-fetch diagnostics'):
-                st.json({'retrieved': report.get('ok', 0), 'empty_200': report.get('empty', 0),
-                         'failed': failed, 'statuses': statuses})
-        else:
-            st.info(
-                f'{no_desc} topic(s) returned no detail text from the API — these embed by '
-                'title only.', icon='ℹ️',
-            )
+        st.info(
+            f'{no_desc} of {len(df_raw)} topic(s) returned no detail text. Open the '
+            'diagnostics below to see why — they embed by title only if saved.', icon='ℹ️',
+        )
 
-    _preview_cols = ['title', 'agency', 'program', 'status', 'posted_date', 'close_date']
-    st.dataframe(df_raw[_preview_cols].head(5), hide_index=True, use_container_width=True)
+    # Always-available detail-fetch diagnostics + a one-topic raw probe, so a missing
+    # description is explainable (rate-limited vs wrong field name vs genuinely empty)
+    # rather than a silent gap. The probe shows the live response shape from this
+    # server's egress, which is the decisive thing the WAF blocks us from seeing.
+    with st.expander('🔬 Detail-fetch diagnostics', expanded=no_desc > 0):
+        st.json({'retrieved_ok': report.get('ok', 0),
+                 'returned_200_but_empty': report.get('empty', 0),
+                 'failed': report.get('failed', 0),
+                 'status_breakdown': report.get('statuses') or {}})
+        st.caption(
+            'Probe one topic to see the **raw** detail response and its actual field '
+            'names — paste this back if descriptions are still blank.')
+        if st.button('Probe one topic’s raw detail', key='dsb_probe_btn'):
+            _tid = ''
+            if 'topic_id' in df_raw.columns:
+                _nonblank = df_raw['topic_id'].astype(str).str.strip()
+                _tid = next((t for t in _nonblank if t), '')
+            with st.spinner('Fetching one raw detail response…'):
+                probe = ds.probe_detail(_tid)
+            st.json({k: probe[k] for k in
+                     ('ok', 'http', 'status', 'extracted_len', 'top_level_keys', 'error')})
+            if probe.get('raw_snippet'):
+                st.code(probe['raw_snippet'][:1800], language='json')
+
+    _preview_cols = ['title', 'agency', 'program', 'status', 'posted_date', 'close_date', 'description']
+    st.dataframe(
+        df_raw[_preview_cols].head(5), hide_index=True, use_container_width=True,
+        column_config={'description': st.column_config.TextColumn('Description', width='large')},
+    )
 
 
     # ── Section 2 · Review & Save ───────────────────────────────────────────────
@@ -228,21 +238,23 @@ def render():
         'Untick **Include** to drop a topic, or tick **Rolling** for a continuously-open '
         'topic (blank close dates are auto-flagged).'
     )
-    _edit = new_rows[['title', 'agency', 'program', 'status', 'close_date']].reset_index(drop=True)
+    _edit = new_rows[['title', 'agency', 'program', 'status', 'close_date',
+                      'description']].reset_index(drop=True)
     _edit.insert(0, '_include', True)
     _edit['_is_rolling'] = False
     _ecfg = {
         '_include':    st.column_config.CheckboxColumn('Include', width='small'),
-        'title':       st.column_config.TextColumn('Title',   width='large'),
+        'title':       st.column_config.TextColumn('Title',   width='medium'),
         'agency':      st.column_config.TextColumn('Component', width='small'),
         'program':     st.column_config.TextColumn('Program', width='small'),
         'status':      st.column_config.TextColumn('Status',  width='small'),
         'close_date':  st.column_config.TextColumn('Close',   width='small'),
         '_is_rolling': st.column_config.CheckboxColumn('Rolling', width='small'),
+        'description': st.column_config.TextColumn('Description', width='large'),
     }
     edited = st.data_editor(
         _edit, hide_index=True, use_container_width=True, column_config=_ecfg,
-        disabled=['title', 'agency', 'program', 'status', 'close_date'],
+        disabled=['title', 'agency', 'program', 'status', 'close_date', 'description'],
         key='dsbir_review_editor',
     )
     new_rows['_is_rolling'] = edited['_is_rolling'].values
