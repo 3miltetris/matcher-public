@@ -16,6 +16,7 @@ Two modes:
   instantly — light homepage fetch + a 1-sample re-rank (richer; for campaigns)
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -26,6 +27,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import src.modules.aspect_profile as ap
 import src.modules.profile_build as pb
+from src.modules.roadmap import booking_hs as bk
 from src.modules.roadmap import deck, fetch
 from src.modules.roadmap import hubspot_roadmap as hr
 from src.modules.roadmap import matcher as mt
@@ -37,6 +39,7 @@ RUN_PREFIX     = 'roadmap/runs/'
 PDF_PREFIX     = 'roadmap/pdfs/'
 MODE_EVENT     = 'event'
 MODE_INSTANTLY = 'instantly'
+MODE_BOOKING   = 'booking'
 
 # A profile needs *something* to read; below this the description is too thin to
 # profile and we return no_match rather than hallucinate.
@@ -355,4 +358,293 @@ def generate_batch(deps: RoadmapDeps, ids: list[str], mode: str = MODE_EVENT,
                                             public_base=public_base))
         except Exception:
             log.exception('roadmap poll: generation failed for %s', cid)
+    return results
+
+
+# ── Call-booking roadmap (Stage 17 booking mode) ──────────────────────────────
+#
+# A booked outbound call fires this: match the company's website against the grant
+# store, EXCLUDE the program already pitched in the cold email, and write the top
+# three *additional* programs back as structured HubSpot properties (not a PDF).
+# The boss's HubSpot/Instantly workflows send the founder email on those
+# properties. Driven by a Cloud Scheduler poll (booking_hs queue), like the event
+# roadmap. Idempotent per contact: a re-run only does real work when the inputs
+# (website, pitched program, or a newly-sent materials deck) change.
+
+_TERMINAL_BOOKING = {'complete', 'no_match', 'no_input'}
+
+
+def _booking_run_id(key: str) -> str:
+    """One record per contact (not per day), so an unchanged booking reuses its
+    result across polls instead of rebuilding — and re-sending the founder email —
+    every day."""
+    slug = re.sub(r'[^a-zA-Z0-9]+', '-', str(key)).strip('-')[:60] or 'unknown'
+    return f'booking_{slug}'
+
+
+def _norm(text) -> str:
+    return re.sub(r'[^a-z0-9]+', '', str(text or '').lower())
+
+
+def _is_pitched(row, target: str) -> bool:
+    """Whether a candidate topic IS the already-pitched program. Exact topic
+    number first (the reliable key), else a length-guarded title containment both
+    ways, so 'DoD SBIR 26.2 Autonomy' and a stored 'Autonomy' still match."""
+    tnum = _norm(row.get('topic_number'))
+    if tnum and tnum == target:
+        return True
+    nt = _norm(row.get('title'))
+    if not nt:
+        return False
+    if nt == target:
+        return True
+    if len(target) >= 6 and target in nt:
+        return True
+    if len(nt) >= 6 and nt in target:
+        return True
+    return False
+
+
+def _exclude_pitched(candidates, pitched: str):
+    """(candidates without the pitched program, matched title). Never raises; an
+    unmatched or blank `pitched` returns the frame unchanged."""
+    if candidates is None or candidates.empty or not str(pitched).strip():
+        return candidates, ''
+    target = _norm(pitched)
+    if not target:
+        return candidates, ''
+    mask = candidates.apply(lambda r: _is_pitched(r, target), axis=1)
+    matched = ''
+    if mask.any() and 'title' in candidates.columns:
+        matched = str(candidates.loc[mask, 'title'].iloc[0])
+    return candidates.loc[~mask].reset_index(drop=True), matched
+
+
+def _booking_fingerprint(inp: dict) -> str:
+    """A stable hash of the inputs that should trigger a rebuild when they change:
+    the website, the pitched program, and any materials deck the founder sent."""
+    raw = '|'.join([inp.get('website', ''), inp.get('pitched', ''),
+                    inp.get('materials_url', '')]).strip().lower()
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+
+
+def _programs(opps: list[dict], narrative: dict) -> list[dict]:
+    """The matched opportunities as {name, summary, link} for the HubSpot
+    properties. `summary` is the 2–3 sentence plain-English why-it-fits (what the
+    program funds + why it fits this company); `link` is the official solicitation
+    source. Falls back to the grant text when the LLM narrative is missing."""
+    items = narrative.get('items') or {}
+    out = []
+    for n, o in enumerate(opps):
+        nar = items.get(n, {})
+        what = nar.get('what_it_is') or deck.truncate_clean(
+            deck.clean_copy(o.get('grant_summary') or ''), 220)
+        why = nar.get('why_it_fits') or ''
+        summary = ' '.join(x for x in (what, why) if x).strip()
+        out.append({
+            'name':    deck.clean_copy(o.get('title') or o.get('topic_number')
+                                       or 'Funding opportunity'),
+            'summary': summary,
+            'link':    str(o.get('source') or ''),
+            'agency':  deck.clean_copy(o.get('agency') or o.get('broad_agency') or ''),
+            'topic_number': str(o.get('topic_number') or ''),
+        })
+    return out
+
+
+def generate_booking_roadmap(deps: RoadmapDeps, *, contact_id: str | None = None,
+                             email: str | None = None,
+                             public_base: str = '') -> dict:
+    """Build (or reuse) the 3-program call roadmap for one contact and write it
+    back to HubSpot. Returns a result dict; never raises — failures become
+    call_roadmap_status='error' and a notify."""
+    today  = deps.now().date()
+    key    = contact_id or email or 'unknown'
+    run_id = _booking_run_id(str(key))
+    record = _load_record(deps, run_id)
+    record.setdefault('run_id', run_id)
+    record.update(mode=MODE_BOOKING, updated_at=deps.now().isoformat(timespec='seconds'))
+    warnings: list[str] = []
+
+    try:
+        contact = bk.get_contact(deps.hubspot, contact_id=contact_id, email=email)
+        inp     = bk.booking_inputs(contact)
+        cid     = inp['contact_id']
+        record['company'] = inp['company']
+        fp = _booking_fingerprint(inp)
+
+        # Idempotent reuse: same inputs already built -> just re-write and return.
+        if (record.get('fingerprint') == fp and record.get('programs') is not None
+                and record.get('status') in _TERMINAL_BOOKING):
+            bk.write_booking(deps.hubspot, cid, programs=record['programs'],
+                             pitched_name=record.get('pitched_name', ''),
+                             status=record['status'],
+                             generated_at=record.get('generated_at', today.isoformat()))
+            log.info('booking %s: reused existing result (%s)', run_id, record['status'])
+            return _finish_booking(deps, record, cid, warnings)
+
+        # 1 · material: the homepage always, the founder's materials deck if sent
+        site_text, site_reason = fetch.fetch_website_text(inp['website'])
+        if site_reason:
+            warnings.append(f'website: {site_reason}')
+        deck_text = ''
+        if inp['materials_url']:
+            deck_text, deck_reason = fetch.fetch_deck_text(
+                inp['materials_url'], getattr(deps.hubspot, 'token', None))
+            if deck_reason:
+                warnings.append(f'materials: {deck_reason}')
+
+        material = ' '.join(x for x in (inp['description'], deck_text) if x).strip()
+        if len(material) < _MIN_INPUT_CHARS and not site_text:
+            return _no_input_booking(deps, record, cid, today, fp, warnings)
+
+        texts = ap.notes_source_texts(material) if material else {}
+        if site_text:
+            texts['website'] = ap._cap(site_text, 12000)
+
+        # 2 · capability profile (same build as the instantly path)
+        prof_rec, prof_warn = pb.build_profile_from_texts(
+            deps.anth, deps.embed,
+            company_name=inp['company'] or 'Your company',
+            website=inp['website'], state='', texts=texts,
+            target_aspects=deps.target_aspects, max_markets=deps.max_markets,
+            assess_defense=deps.assess_defense, assess_unexplored=False,
+            max_unexplored=0, model=deps.model)
+        warnings += prof_warn
+
+        # 3 · match, then drop the already-pitched program before ranking
+        index = mt.get_topic_index(deps.storage_client, bucket=deps.bucket)
+        candidates, skipped = mt.match_profile(prof_rec, index)
+        warnings += skipped
+        candidates, pitched_matched = _exclude_pitched(candidates, inp['pitched'])
+        if inp['pitched'] and not pitched_matched:
+            warnings.append(f'pitched program not found among matches: {inp["pitched"]}')
+        pitched_name = pitched_matched or inp['pitched']
+
+        # 4 · re-rank and take the top 3
+        reranked = False
+        if not candidates.empty:
+            candidates = mt.rerank(candidates, deps.anthropic_api_key,
+                                   storage_client=deps.storage_client, samples=1)
+            reranked = True
+        opps = mt.top_opportunities(candidates, limit=bk.N_PROGRAMS, reranked=reranked)
+
+        # 5 · per-program copy, told to avoid restating the pitched program
+        narrative, nar_warn = deck.generate_narrative(
+            deps.anth, company_name=inp['company'] or 'Your company',
+            profile_summary=prof_rec.get('profile_summary', ''),
+            aspect_labels=prof_rec.get('aspect_labels', ''),
+            opportunities=opps, model=deps.model, avoid=pitched_name)
+        warnings += nar_warn
+        programs = _programs(opps, narrative)
+
+        status = 'complete' if programs else 'no_match'
+        record.update(fingerprint=fp, programs=programs, pitched_name=pitched_name,
+                      status=status, generated_at=today.isoformat(),
+                      opportunities=len(programs), warnings=warnings)
+        _save_record(deps, record)
+
+        # 6 · write the programs back (the boss's email-workflow trigger)
+        bk.write_booking(deps.hubspot, cid, programs=programs,
+                         pitched_name=pitched_name, status=status,
+                         generated_at=today.isoformat())
+        log.info('booking %s: %s (%d programs, pitched=%r)',
+                 run_id, status, len(programs), pitched_name)
+        return _finish_booking(deps, record, cid, warnings)
+
+    except Exception as e:
+        log.exception('booking %s: failed', run_id)
+        record.update(status='error', error=f'{type(e).__name__}: {e}'[:500],
+                      warnings=warnings)
+        _save_record(deps, record)
+        _mark_booking_error(deps, contact_id, email, today)
+        if deps.notify_fail:
+            deps.notify_fail(run_id, record.get('company', '(unknown)'),
+                             'booking-roadmap', record['error'])
+        return {'run_id': run_id, 'status': 'error', 'error': record['error']}
+
+
+def _finish_booking(deps: RoadmapDeps, record: dict, contact_id: str,
+                    warnings: list) -> dict:
+    record['warnings'] = warnings
+    _save_record(deps, record)
+    return {'run_id': record['run_id'], 'status': record.get('status'),
+            'contact_id': contact_id, 'programs': record.get('programs', []),
+            'opportunities': record.get('opportunities', 0), 'warnings': warnings}
+
+
+def _no_input_booking(deps: RoadmapDeps, record: dict, contact_id: str, today: date,
+                      fp: str, warnings: list) -> dict:
+    """No usable website or materials — record it so the flow is visible and a
+    follow-up can still ask for materials; writes no programs."""
+    warnings.append('no usable website or materials to profile')
+    record.update(fingerprint=fp, programs=[], pitched_name='', status='no_input',
+                  generated_at=today.isoformat(), opportunities=0)
+    bk.write_booking(deps.hubspot, contact_id, programs=[], pitched_name='',
+                     status='no_input', generated_at=today.isoformat())
+    return _finish_booking(deps, record, contact_id, warnings)
+
+
+def _mark_booking_error(deps: RoadmapDeps, contact_id, email, today: date) -> None:
+    """Best-effort error status on the contact, so a failed run is visible."""
+    try:
+        cid = contact_id
+        if not cid and email:
+            cid = bk.get_contact(deps.hubspot, email=email).get('_id')
+        if cid:
+            bk.write_booking(deps.hubspot, cid, programs=[], pitched_name='',
+                             status='error', generated_at=today.isoformat())
+    except Exception:
+        pass
+
+
+def claim_pending_bookings(deps: RoadmapDeps, *, limit: int = 10,
+                           stale_min: int = POLL_STALE_MIN) -> list[str]:
+    """Claim up to `limit` contacts needing a booking roadmap: new bookings first,
+    then re-run candidates whose inputs changed (a materials deck arrived), then
+    stale 'processing' claims to recover killed runs. Claiming synchronously here
+    lets the caller run generation in the background without two polls colliding."""
+    bk.ensure_output_properties(deps.hubspot)
+    now = deps.now()
+    picked = list(bk.pending_bookings(deps.hubspot, limit=limit))
+
+    if len(picked) < limit:
+        for c in bk.rerun_candidates(deps.hubspot, limit=limit):
+            if len(picked) >= limit:
+                break
+            inp = bk.booking_inputs(c)
+            rec = _load_record(deps, _booking_run_id(c.get('_id') or inp['email']))
+            if rec.get('fingerprint') != _booking_fingerprint(inp):
+                picked.append(c)          # inputs changed -> genuine re-run
+
+    if len(picked) < limit:
+        picked += [c for c in bk.processing_bookings(deps.hubspot, limit=limit)
+                   if _is_stale(c.get(bk.PROP_GENERATED_AT), now, stale_min)]
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for c in picked[:limit]:
+        cid = c.get('_id')
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            bk.claim(deps.hubspot, cid, now.isoformat(timespec='seconds'))
+            ids.append(cid)
+        except Exception:
+            log.exception('booking poll: claim failed for %s', cid)
+    return ids
+
+
+def generate_booking_batch(deps: RoadmapDeps, ids: list[str],
+                           public_base: str = '') -> list[dict]:
+    """Generate booking roadmaps for a claimed batch, one at a time. Isolated:
+    one failure never stops the rest."""
+    results = []
+    for cid in ids:
+        try:
+            results.append(generate_booking_roadmap(deps, contact_id=cid,
+                                                     public_base=public_base))
+        except Exception:
+            log.exception('booking poll: generation failed for %s', cid)
     return results

@@ -202,10 +202,13 @@ def _build_system() -> str:
 
 
 def _build_user(company_name: str, profile_summary: str, aspect_labels: str,
-                opportunities: list[dict]) -> str:
+                opportunities: list[dict], avoid: str = '') -> str:
     lines = [f'COMPANY: {company_name}', '', f'PROFILE: {profile_summary}']
     if aspect_labels:
         lines += ['', f'CAPABILITIES: {aspect_labels}']
+    if avoid:
+        lines += ['', f'ALREADY PITCHED (do not suggest, restate, or describe the '
+                      f'opportunities below as this same program): {avoid}']
     lines += ['', 'OPPORTUNITIES:']
     for n, o in enumerate(opportunities):
         title   = str(o.get('title') or o.get('topic_number') or 'Untitled')
@@ -244,17 +247,22 @@ def _parse_narrative(raw: str) -> dict:
 
 def generate_narrative(anth, *, company_name: str, profile_summary: str,
                        aspect_labels: str, opportunities: list[dict],
-                       model: str = DECK_MODEL) -> tuple[dict, list[str]]:
+                       model: str = DECK_MODEL, avoid: str = '') -> tuple[dict, list[str]]:
     """({why_now, items}, warnings). One Claude call, refusal-falls-back to the
     other model via the shared claude_json. Never raises for an empty shortlist —
-    returns empty narrative so the deck can still render the raw opportunities."""
+    returns empty narrative so the deck can still render the raw opportunities.
+
+    `avoid` names a program already pitched to this company (the call-booking
+    flow's cold-email program); the copy is told not to restate it, so the
+    shortlist reads as genuinely additional."""
     warnings: list[str] = []
     if not opportunities:
         return {'why_now': '', 'items': {}}, warnings
     try:
         parsed, built_by = pb.claude_json(
             anth, model, _build_system(),
-            _build_user(company_name, profile_summary, aspect_labels, opportunities),
+            _build_user(company_name, profile_summary, aspect_labels,
+                        opportunities, avoid),
             _parse_narrative,
         )
     except ValueError as e:

@@ -393,7 +393,7 @@ def _finish(session_id: str) -> None:
 # roadmap_pdf_url back onto the contact, which is the boss's HubSpot workflow
 # trigger for the email/text sequence.
 
-_ROADMAP_MODES = {rp.MODE_EVENT, rp.MODE_INSTANTLY}
+_ROADMAP_MODES = {rp.MODE_EVENT, rp.MODE_INSTANTLY, rp.MODE_BOOKING}
 _TOKEN_RE      = re.compile(r'^[A-Za-z0-9_-]{16,64}$')
 
 
@@ -464,6 +464,27 @@ def roadmap_poll(request: Request, background: BackgroundTasks):
     if ids:
         background.add_task(rp.generate_batch, rm_deps(), ids, mode, _public_base(request))
     log.info('roadmap poll: claimed %d (%s)', len(ids), mode)
+    return {'claimed': len(ids)}
+
+
+@app.post('/api/roadmap/booking-poll')
+def roadmap_booking_poll(request: Request, background: BackgroundTasks):
+    """Polling trigger for the call-booking roadmap. Cloud Scheduler hits this with
+    the shared secret; we claim up to `limit` contacts with a newly booked call
+    (or a changed materials deck) synchronously, so overlapping polls can't double-
+    process, and generate their 3-program roadmaps in the background. Separate from
+    /api/roadmap/poll because the booking queue keys on different properties."""
+    _limit(f'rmbook:{_client_ip(request)}', 30, 3600)
+    if not _roadmap_secret_ok(request):
+        raise HTTPException(401, 'unauthorized')
+    try:
+        limit = max(1, min(int(request.query_params.get('limit') or 10), 50))
+    except ValueError:
+        limit = 10
+    ids = rp.claim_pending_bookings(rm_deps(), limit=limit)
+    if ids:
+        background.add_task(rp.generate_booking_batch, rm_deps(), ids, _public_base(request))
+    log.info('booking poll: claimed %d', len(ids))
     return {'claimed': len(ids)}
 
 
