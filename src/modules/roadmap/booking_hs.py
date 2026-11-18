@@ -45,6 +45,7 @@ PROP_DESCRIPTION = os.environ.get('BOOKING_PROP_DESCRIPTION', '')
 # Output fields (fixed — the boss's workflow triggers on these).
 PROP_STATUS       = 'call_roadmap_status'
 PROP_GENERATED_AT = 'call_roadmap_generated_at'
+PROP_LASTMOD      = 'hs_lastmodifieddate'   # HubSpot-maintained; changes on any edit
 PROP_PITCHED_ECHO = 'call_pitched_program'
 
 STATUS_PROCESSING = 'processing'
@@ -172,7 +173,17 @@ def write_booking(hs: HubSpot, contact_id: str, *, programs: list[dict],
 def _poll_props() -> list[str]:
     return list(dict.fromkeys([
         'email', PROP_TRIGGER, PROP_WEBSITE, PROP_PITCHED, PROP_MATERIALS,
-        PROP_STATUS, PROP_GENERATED_AT]))
+        PROP_STATUS, PROP_GENERATED_AT, PROP_LASTMOD]))
+
+
+# The re-run / error-recovery searches page through results instead of reading one
+# capped page: contacts that will never qualify (unchanged inputs, an exhausted
+# retry budget) otherwise fill that page and hide the one that does. Newest-
+# modified first, because a genuine change — a website or deck arriving, a fresh
+# error — is itself an edit, so qualifying contacts sort to the front. The cap
+# bounds the HubSpot calls per poll.
+SCAN_CAP = 500
+_RECENT_FIRST = [{'propertyName': PROP_LASTMOD, 'direction': 'DESCENDING'}]
 
 
 def _search(hs: HubSpot, filter_groups: list, limit: int, sorts=None) -> list[dict]:
@@ -189,6 +200,30 @@ def _search(hs: HubSpot, filter_groups: list, limit: int, sorts=None) -> list[di
     return out
 
 
+def _search_iter(hs: HubSpot, filter_groups: list, *, sorts=None,
+                 cap: int = SCAN_CAP):
+    """Lazily page a contact search (HubSpot's `after` cursor) up to `cap` rows.
+    Lazy, so a caller that finds what it needs early stops paging."""
+    after, seen = None, 0
+    while seen < cap:
+        body = {'filterGroups': filter_groups, 'properties': _poll_props(),
+                'limit': max(1, min(100, cap - seen))}
+        if sorts:
+            body['sorts'] = sorts
+        if after:
+            body['after'] = after
+        res = hs._req('POST', '/crm/v3/objects/contacts/search', json=body)
+        results = res.get('results', [])
+        for r in results:
+            d = dict(r.get('properties') or {})
+            d['_id'] = r.get('id')
+            seen += 1
+            yield d
+        after = ((res.get('paging') or {}).get('next') or {}).get('after')
+        if not after or not results:
+            return
+
+
 def pending_bookings(hs: HubSpot, *, limit: int = 25) -> list[dict]:
     """Contacts with a booked call (trigger set) that have not been processed yet
     (no call_roadmap_status). Oldest first, so none starve."""
@@ -198,48 +233,47 @@ def pending_bookings(hs: HubSpot, *, limit: int = 25) -> list[dict]:
     ]}], limit, sorts=[{'propertyName': 'createdate', 'direction': 'ASCENDING'}])
 
 
-def rerun_candidates(hs: HubSpot, *, limit: int = 25) -> list[dict]:
-    """Already-complete bookings that now carry a materials URL. Whether a re-run
-    is actually warranted (the materials changed since the last build) is decided
-    by comparing the run-record fingerprint — this only narrows the search."""
-    return _search(hs, [{'filters': [
+def rerun_candidates(hs: HubSpot, *, cap: int = SCAN_CAP):
+    """Already-complete bookings that now carry a materials URL (lazy, newest-
+    modified first). Whether a re-run is actually warranted (the materials changed
+    since the last build) is decided by comparing the run-record fingerprint —
+    this only narrows the search."""
+    return _search_iter(hs, [{'filters': [
         {'propertyName': PROP_TRIGGER, 'operator': 'HAS_PROPERTY'},
         {'propertyName': PROP_STATUS, 'operator': 'EQ', 'value': STATUS_COMPLETE},
         {'propertyName': PROP_MATERIALS, 'operator': 'HAS_PROPERTY'},
-    ]}], limit)
+    ]}], sorts=_RECENT_FIRST, cap=cap)
 
 
-def reinput_candidates(hs: HubSpot, *, limit: int = 25) -> list[dict]:
+def reinput_candidates(hs: HubSpot, *, cap: int = SCAN_CAP):
     """Terminal bookings that produced no roadmap because the inputs were too thin
     at build time ('no_input') or matched nothing ('no_match'). If the founder's
     website or materials arrived since, the run-record fingerprint will differ and
     claim_pending_bookings re-runs them — these statuses are only ever written with
     a saved record, so that fingerprint gate is exact (no record ⇒ not re-run).
     Unlike rerun_candidates this does NOT require a materials URL: a bare website
-    added to a 'no_input' contact must re-run too."""
-    out: list[dict] = []
-    seen: set[str] = set()
-    for status in (STATUS_NO_INPUT, STATUS_NO_MATCH):
-        for c in _search(hs, [{'filters': [
+    added to a 'no_input' contact must re-run too. One search (the two statuses
+    OR'd as filter groups), lazy and newest-modified first."""
+    return _search_iter(hs, [
+        {'filters': [
             {'propertyName': PROP_TRIGGER, 'operator': 'HAS_PROPERTY'},
             {'propertyName': PROP_STATUS, 'operator': 'EQ', 'value': status},
-        ]}], limit):
-            cid = c.get('_id')
-            if cid and cid not in seen:
-                seen.add(cid)
-                out.append(c)
-    return out[:limit]
+        ]} for status in (STATUS_NO_INPUT, STATUS_NO_MATCH)
+    ], sorts=_RECENT_FIRST, cap=cap)
 
 
-def error_bookings(hs: HubSpot, *, limit: int = 25) -> list[dict]:
-    """Bookings whose last run errored. Excluded from pending/rerun/processing, so
-    without this a transient failure (an Anthropic 5xx, a flaky fetch) leaves the
-    contact stuck at 'error' forever. claim_pending_bookings recovers them under a
-    staleness gate and a bounded retry budget. Oldest first, so none starve."""
-    return _search(hs, [{'filters': [
+def error_bookings(hs: HubSpot, *, cap: int = SCAN_CAP):
+    """Bookings whose last run errored (lazy, newest-modified first). Excluded
+    from pending/rerun/processing, so without this a transient failure (an
+    Anthropic 5xx, a flaky fetch) leaves the contact stuck at 'error' forever.
+    claim_pending_bookings recovers them under a staleness gate and a bounded
+    retry budget. NOT oldest-first: contacts that exhausted their budget stop
+    being edited, so newest-modified sorts them behind the ones still retryable
+    instead of letting them hold the first page forever."""
+    return _search_iter(hs, [{'filters': [
         {'propertyName': PROP_TRIGGER, 'operator': 'HAS_PROPERTY'},
         {'propertyName': PROP_STATUS, 'operator': 'EQ', 'value': STATUS_ERROR},
-    ]}], limit, sorts=[{'propertyName': 'createdate', 'direction': 'ASCENDING'}])
+    ]}], sorts=_RECENT_FIRST, cap=cap)
 
 
 def processing_bookings(hs: HubSpot, *, limit: int = 25) -> list[dict]:

@@ -52,6 +52,7 @@ class FakeHubSpot:
         self.created_props: list[str] = []
         self.patched: dict = {}                 # last PATCH's properties (back-compat)
         self.patched_by_id: dict[str, dict] = {}
+        self.searches = 0
         # HubSpot Files upload surface
         self.http = _FakeHttp(self)
         self.file_uploads: list[dict] = []
@@ -83,7 +84,12 @@ class FakeHubSpot:
             self.existing_props.add(name)
             return {}
         if method == 'POST' and path == '/crm/v3/objects/contacts/search':
-            return {'results': self._run_search(kw['json'])}
+            self.searches += 1
+            results, nxt = self._run_search(kw['json'])
+            resp = {'results': results}
+            if nxt:
+                resp['paging'] = {'next': {'after': nxt}}
+            return resp
         if method == 'GET' and path.startswith('/crm/v3/objects/contacts/'):
             cid = path.rsplit('/', 1)[1]
             return {'id': cid, 'properties': dict(self.contacts.get(cid, {}))}
@@ -120,7 +126,10 @@ class FakeHubSpot:
                   if groups else True)
             if ok:
                 out.append({'id': cid, 'properties': dict(p)})
-        return out[:body.get('limit', 100)]
+        # Real HubSpot pages: `limit` per page, an opaque `after` cursor to continue.
+        start = int(body.get('after') or 0)
+        end = start + int(body.get('limit', 100))
+        return out[start:end], (str(end) if end < len(out) else None)
 
 
 @pytest.fixture

@@ -48,9 +48,14 @@ CONTACTS_PREFIX = s._CONTACTS_PREFIX
 INDEX_PREFIX = 'data/contact-index/'
 _META_COLS = ('company_key', 'company_name', 'website', 'industry', 'summary', 'blob')
 _SCORE_CHUNK = 50_000          # rows per float16 -> float32 matmul slice
+# Bump when the build output changes shape or meaning. A manifest of an older
+# format is rebuilt even though its blobs are unchanged (2: dedup keyed on the
+# website host, plus a per-source hosts.json for cross-folder `also_in`).
+INDEX_FORMAT = 2
 
 _CACHE: dict = {}
 _CACHE_LOCK = threading.Lock()
+_LOAD_LOCKS: dict = {}         # one per cache key: a miss is downloaded once
 
 
 def _manifest_path(source: str) -> str:
@@ -80,7 +85,8 @@ def build_source(gcs_client, source: str, *, bucket: str = BUCKET,
              if b.name.endswith('.parquet')]
     current = {b.name: str(b.generation) for b in blobs}
     old = load_manifest(gcs_client, source, bucket=bucket)
-    if not force and old and old.get('blobs') == current:
+    if (not force and old and old.get('blobs') == current
+            and old.get('format') == INDEX_FORMAT):
         return {'source': source, 'skipped': 'up to date'}
 
     parts: list[tuple[np.ndarray, list[dict]]] = []
@@ -125,6 +131,7 @@ def build_source(gcs_client, source: str, *, bucket: str = BUCKET,
     build_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     bucket_obj = gcs_client.bucket(bucket)
     n = 0
+    hosts = sorted({s._site_host(r['website']) for p in parts for r in p[1]} - {''})
     if parts:
         vecs = np.vstack([p[0] for p in parts])
         rows = [r for p in parts for r in p[1]]
@@ -138,8 +145,10 @@ def build_source(gcs_client, source: str, *, bucket: str = BUCKET,
         pq.write_table(meta, mbuf)
         bucket_obj.blob(f'{INDEX_PREFIX}{source}/{build_id}/meta.parquet') \
             .upload_from_string(mbuf.getvalue(), content_type='application/octet-stream')
+        bucket_obj.blob(f'{INDEX_PREFIX}{source}/{build_id}/hosts.json')             .upload_from_string(json.dumps(hosts), content_type='application/json')
 
     manifest = {
+        'format': INDEX_FORMAT,
         'source': source,
         'build_id': build_id if parts else None,
         'built_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -187,6 +196,48 @@ def build_all(gcs_client, *, bucket: str = BUCKET, force: bool = False,
 def clear_cache() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
+        _LOAD_LOCKS.clear()
+
+
+def _npy_from_bytes(data: bytes) -> np.ndarray:
+    """A read-only array VIEWING `data` (no copy). np.load(BytesIO(...)) copies,
+    so it briefly holds the index twice — ~1.1 GB for apollo alone."""
+    buf = io.BytesIO(data)
+    version = np.lib.format.read_magic(buf)
+    if version == (1, 0):
+        shape, fortran, dtype = np.lib.format.read_array_header_1_0(buf)
+    else:
+        shape, fortran, dtype = np.lib.format.read_array_header_2_0(buf)
+    if fortran or dtype.hasobject:
+        return np.load(io.BytesIO(data), allow_pickle=False)
+    count = int(np.prod(shape)) if shape else 1
+    return np.frombuffer(data, dtype=dtype, count=count, offset=buf.tell()).reshape(shape)
+
+
+def _cached(key, gen: str, loader):
+    """Single-flight cache: the first caller to miss on `key` runs `loader()`;
+    concurrent callers for the same key wait for it instead of each downloading
+    the same index (the boot prewarm and a first query would otherwise race)."""
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit and hit['gen'] == gen:
+            return hit
+        lock = _LOAD_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        with _CACHE_LOCK:
+            hit = _CACHE.get(key)
+        if hit and hit['gen'] == gen:
+            return hit
+        entry = loader()
+        if entry is not None:
+            entry['gen'] = gen
+            with _CACHE_LOCK:
+                _CACHE[key] = entry
+        return entry
+
+
+def _hosts_of_meta(meta) -> frozenset:
+    return frozenset(s._site_host(w) for w in meta.column('website').to_pylist()) - {''}
 
 
 def load_index(gcs_client, source: str, *, bucket: str = BUCKET) -> dict | None:
@@ -196,32 +247,58 @@ def load_index(gcs_client, source: str, *, bucket: str = BUCKET) -> dict | None:
     mblob = gcs_client.bucket(bucket).get_blob(_manifest_path(source))
     if mblob is None:
         return None
-    key = (id(gcs_client), bucket, source)
+
+    def loader():
+        try:
+            manifest = json.loads(mblob.download_as_bytes())
+            vecs = meta = codes = names = None
+            hosts = frozenset()
+            if manifest.get('has_embeddings') and manifest.get('build_id'):
+                base = f"{INDEX_PREFIX}{source}/{manifest['build_id']}/"
+                bkt = gcs_client.bucket(bucket)
+                vecs = _npy_from_bytes(bkt.blob(base + 'vectors.npy').download_as_bytes())
+                meta = pq.read_table(io.BytesIO(bkt.blob(base + 'meta.parquet').download_as_bytes()))
+                if vecs.shape[0] != meta.num_rows:
+                    return None
+                names, codes = np.unique(np.asarray(meta.column('blob').to_pylist(), dtype=object),
+                                         return_inverse=True)
+                hosts = _hosts_of_meta(meta)
+        except Exception:
+            return None
+        return {'manifest': manifest, 'vecs': vecs, 'meta': meta,
+                'blob_names': names, 'blob_codes': codes, 'hosts': hosts}
+
+    return _cached(('index', id(gcs_client), bucket, source), str(mblob.generation), loader)
+
+
+def load_hosts(gcs_client, source: str, *, bucket: str = BUCKET) -> frozenset:
+    """Just a source's set of website hosts — a few MB, for filling `also_in`
+    across folders a search was not scoped to, without loading their vectors.
+    Reuses a loaded full index when there is one. Empty when unavailable."""
+    mblob = gcs_client.bucket(bucket).get_blob(_manifest_path(source))
+    if mblob is None:
+        return frozenset()
     gen = str(mblob.generation)
     with _CACHE_LOCK:
-        hit = _CACHE.get(key)
-    if hit and hit['gen'] == gen:
-        return hit
-    try:
-        manifest = json.loads(mblob.download_as_bytes())
-        vecs = meta = codes = names = None
-        if manifest.get('has_embeddings') and manifest.get('build_id'):
-            base = f"{INDEX_PREFIX}{source}/{manifest['build_id']}/"
-            bkt = gcs_client.bucket(bucket)
-            vecs = np.load(io.BytesIO(bkt.blob(base + 'vectors.npy').download_as_bytes()),
-                           allow_pickle=False)
-            meta = pq.read_table(io.BytesIO(bkt.blob(base + 'meta.parquet').download_as_bytes()))
-            if vecs.shape[0] != meta.num_rows:
-                return None
-            names, codes = np.unique(np.asarray(meta.column('blob').to_pylist(), dtype=object),
-                                     return_inverse=True)
-    except Exception:
-        return None
-    entry = {'gen': gen, 'manifest': manifest, 'vecs': vecs, 'meta': meta,
-             'blob_names': names, 'blob_codes': codes}
-    with _CACHE_LOCK:
-        _CACHE[key] = entry
-    return entry
+        full = _CACHE.get(('index', id(gcs_client), bucket, source))
+    if full and full['gen'] == gen:
+        return full['hosts']
+
+    def loader():
+        try:
+            manifest = json.loads(mblob.download_as_bytes())
+            if not (manifest.get('has_embeddings') and manifest.get('build_id')):
+                return {'hosts': frozenset()}
+            blob = gcs_client.bucket(bucket).get_blob(
+                f"{INDEX_PREFIX}{source}/{manifest['build_id']}/hosts.json")
+            if blob is None:
+                return None              # pre-format-2 build: skip until rebuilt
+            return {'hosts': frozenset(json.loads(blob.download_as_bytes()))}
+        except Exception:
+            return None
+
+    entry = _cached(('hosts', id(gcs_client), bucket, source), gen, loader)
+    return entry['hosts'] if entry else frozenset()
 
 
 def score_index(entry: dict, source: str, qvec, valid_blobs: set, keep: int):

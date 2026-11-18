@@ -17,6 +17,7 @@ Two modes:
 """
 
 import hashlib
+import itertools
 import logging
 import os
 import re
@@ -388,6 +389,16 @@ _MAX_BOOKING_ATTEMPTS = 3
 _BOOKING_POLL_LOCK = 'roadmap-booking-poll'
 _POLL_LOCK_TTL_S   = 180
 
+# Contacts the poll already examined and found NOT eligible (unchanged inputs, or
+# an exhausted retry budget), keyed to their HubSpot last-modified time. The
+# candidate searches now page past such contacts instead of stopping at one page,
+# and deciding eligibility costs a GCS run-record read each — so without this
+# memo the steady state would re-read hundreds of unchanged records every 5-minute
+# poll. Any edit to a contact changes its last-modified time, so it is examined
+# again. Only touched under the poll lock, so two polls never race on it.
+_CHECKED_BLOB = 'roadmap/booking-poll-checked.json'
+_CHECKED_MAX  = 20_000
+
 
 def _booking_run_id(key: str) -> str:
     """One record per contact (not per day), so an unchanged booking reuses its
@@ -501,13 +512,19 @@ def generate_booking_roadmap(deps: RoadmapDeps, *, contact_id: str | None = None
         # Count this build attempt against the current inputs, and persist it
         # before the heavy work — so a run that errors (or is killed) still counts,
         # and claim_pending_bookings can stop retrying a permanently-failing contact
-        # after _MAX_BOOKING_ATTEMPTS. New inputs (changed fingerprint) reset the
-        # budget. Written here, after the idempotent-reuse check, so reuse is
-        # unaffected.
-        if record.get('fingerprint') != fp:
+        # after _MAX_BOOKING_ATTEMPTS. New inputs reset the budget.
+        #
+        # The attempt is keyed on its OWN `attempt_fingerprint`, and the record is
+        # marked 'building'. `fingerprint` is left alone: it only ever names the
+        # inputs of a FINISHED result. Overwriting it here (as this used to) left a
+        # killed run's record saying "status complete, these inputs" — so the next
+        # poll's reuse check matched and re-sent the OLD programs for the NEW
+        # inputs (a materials deck that was then never read).
+        if record.get('attempt_fingerprint') != fp:
             record['attempts'] = 0
-        record['fingerprint'] = fp
+        record['attempt_fingerprint'] = fp
         record['attempts'] = int(record.get('attempts') or 0) + 1
+        record['status'] = 'building'
         _save_record(deps, record)
 
         # 1 · material: the homepage always, the founder's materials deck if sent
@@ -584,7 +601,7 @@ def generate_booking_roadmap(deps: RoadmapDeps, *, contact_id: str | None = None
         record.update(status='error', error=f'{type(e).__name__}: {e}'[:500],
                       warnings=warnings)
         _save_record(deps, record)
-        _mark_booking_error(deps, contact_id, email, today)
+        _mark_booking_error(deps, contact_id, email, deps.now())
         if deps.notify_fail:
             deps.notify_fail(run_id, record.get('company', '(unknown)'),
                              'booking-roadmap', record['error'])
@@ -612,15 +629,21 @@ def _no_input_booking(deps: RoadmapDeps, record: dict, contact_id: str, today: d
     return _finish_booking(deps, record, contact_id, warnings)
 
 
-def _mark_booking_error(deps: RoadmapDeps, contact_id, email, today: date) -> None:
-    """Best-effort error status on the contact, so a failed run is visible."""
+def _mark_booking_error(deps: RoadmapDeps, contact_id, email, now: datetime) -> None:
+    """Best-effort error status on the contact, so a failed run is visible.
+
+    `generated_at` is a FULL timestamp: it is the staleness clock the error retry
+    waits on (POLL_STALE_MIN). A date-only value parses as midnight UTC, so every
+    error after 00:15 UTC read as already stale and the whole retry budget burned
+    in ~15 minutes of polls — no wait at all during an outage."""
     try:
         cid = contact_id
         if not cid and email:
             cid = bk.get_contact(deps.hubspot, email=email).get('_id')
         if cid:
             bk.write_booking(deps.hubspot, cid, programs=[], pitched_name='',
-                             status='error', generated_at=today.isoformat())
+                             status='error',
+                             generated_at=now.isoformat(timespec='seconds'))
     except Exception:
         pass
 
@@ -644,6 +667,21 @@ def claim_pending_bookings(deps: RoadmapDeps, *, limit: int = 10,
     if lock is None:
         log.info('booking poll: another poll holds the claim lock; skipping')
         return []
+    checked = _load_checked(deps)
+    dirty = False
+
+    def already_checked(c) -> bool:
+        mod = c.get(bk.PROP_LASTMOD)
+        return bool(mod) and checked.get(c.get('_id')) == mod
+
+    def remember(c) -> None:
+        nonlocal dirty
+        cid, mod = c.get('_id'), c.get(bk.PROP_LASTMOD)
+        if cid and mod:
+            checked.pop(cid, None)            # re-insert at the end (newest)
+            checked[cid] = mod
+            dirty = True
+
     try:
         picked = list(bk.pending_bookings(deps.hubspot, limit=limit))
 
@@ -651,16 +689,21 @@ def claim_pending_bookings(deps: RoadmapDeps, *, limit: int = 10,
         # 'complete' (rerun_candidates) or a late website/materials on a
         # 'no_input'/'no_match' (reinput_candidates). Both are gated the same way
         # — a differing saved-record fingerprint — so nothing unchanged re-runs.
+        # The streams page lazily (newest-modified first) so unchanged contacts
+        # can never crowd a changed one out of a single capped page.
         if len(picked) < limit:
-            changed = (list(bk.rerun_candidates(deps.hubspot, limit=limit))
-                       + list(bk.reinput_candidates(deps.hubspot, limit=limit)))
-            for c in changed:
+            for c in itertools.chain(bk.rerun_candidates(deps.hubspot),
+                                     bk.reinput_candidates(deps.hubspot)):
                 if len(picked) >= limit:
                     break
+                if already_checked(c):
+                    continue
                 inp = bk.booking_inputs(c)
                 rec = _load_record(deps, _booking_run_id(c.get('_id') or inp['email']))
                 if rec.get('fingerprint') != _booking_fingerprint(inp):
                     picked.append(c)          # inputs changed -> genuine re-run
+                else:
+                    remember(c)
 
         if len(picked) < limit:
             picked += [c for c in bk.processing_bookings(deps.hubspot, limit=limit)
@@ -671,15 +714,19 @@ def claim_pending_bookings(deps: RoadmapDeps, *, limit: int = 10,
         # contact that fails every run is not rebuilt forever. A changed
         # fingerprint resets the budget, so new inputs always get a fresh attempt.
         if len(picked) < limit:
-            for c in bk.error_bookings(deps.hubspot, limit=limit):
+            for c in bk.error_bookings(deps.hubspot):
                 if len(picked) >= limit:
                     break
                 if not _is_stale(c.get(bk.PROP_GENERATED_AT), now, stale_min):
+                    continue                  # not memoised: it becomes eligible later
+                if already_checked(c):
                     continue
                 inp = bk.booking_inputs(c)
                 rec = _load_record(deps, _booking_run_id(c.get('_id') or inp['email']))
-                same_inputs = rec.get('fingerprint') == _booking_fingerprint(inp)
+                tried = rec.get('attempt_fingerprint', rec.get('fingerprint'))
+                same_inputs = tried == _booking_fingerprint(inp)
                 if same_inputs and int(rec.get('attempts') or 0) >= _MAX_BOOKING_ATTEMPTS:
+                    remember(c)               # exhausted until the inputs change
                     continue
                 picked.append(c)
 
@@ -697,7 +744,27 @@ def claim_pending_bookings(deps: RoadmapDeps, *, limit: int = 10,
                 log.exception('booking poll: claim failed for %s', cid)
         return ids
     finally:
+        if dirty:
+            _save_checked(deps, checked)
         gcs_write.release_lock(lock)
+
+
+def _load_checked(deps: RoadmapDeps) -> dict:
+    try:
+        obj, _ = deps.bm.download_json(_CHECKED_BLOB)
+        return dict(obj or {})
+    except Exception:
+        return {}
+
+
+def _save_checked(deps: RoadmapDeps, checked: dict) -> None:
+    """Best effort: a lost memo only costs extra record reads next poll."""
+    if len(checked) > _CHECKED_MAX:
+        checked = dict(list(checked.items())[-_CHECKED_MAX:])
+    try:
+        deps.bm.upload_json(_CHECKED_BLOB, checked)
+    except Exception as e:
+        log.warning('booking poll: checked-memo save failed: %s', type(e).__name__)
 
 
 def generate_booking_batch(deps: RoadmapDeps, ids: list[str],

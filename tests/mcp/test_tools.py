@@ -441,6 +441,103 @@ def test_contact_index_skips_unchanged_and_records_no_embeddings(storage):
     assert out['sources_searched'] == ['apollo']
 
 
+def test_search_contacts_dedups_same_host_with_different_names(storage):
+    # Real case: one firm, two folders, two spellings of its name, same site.
+    put_parquet(storage, 'data/all-contacts/doe_teaming_partners/d.parquet', pd.DataFrame([
+        {'company_name': 'ionX Technologies, Inc.',
+         'companyWebsite': 'https://ionxtechnologies.com', 'summary': 'x',
+         'embeddings': [1.0, 0.0]}]))
+    put_parquet(storage, 'data/all-contacts/sam/s.parquet', pd.DataFrame([
+        {'company_name': 'IONX TECHNOLOGIES INC',
+         'companyWebsite': 'http://www.IonXTechnologies.com/about', 'summary': 'x',
+         'embeddings': [0.9, 0.1]}]))
+
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'x')
+    assert len(out['results']) == 1
+    r = out['results'][0]
+    assert r['source'] == 'doe_teaming_partners' and r['also_in'] == ['sam']
+
+
+def test_search_contacts_also_in_covers_folders_outside_the_scope(storage):
+    # sam ranks the company too low to surface, and the search is scoped to doe —
+    # also_in must still name sam, from sam's full host list.
+    put_parquet(storage, 'data/all-contacts/doe_teaming_partners/d.parquet', pd.DataFrame([
+        {'company_name': 'Montana Critical Metals',
+         'companyWebsite': 'https://montanacriticalmetals.com', 'summary': 'x',
+         'embeddings': [1.0, 0.0]}]))
+    put_parquet(storage, 'data/all-contacts/sec_raise/r.parquet', pd.DataFrame([
+        {'company_name': 'Montana Critical Metals Inc',
+         'companyWebsite': 'https://montanacriticalmetals.com/', 'summary': 'x',
+         'embeddings': [0.0, 1.0]}]))
+    for src in ('doe_teaming_partners', 'sec_raise'):
+        t_ci.build_source(storage, src)
+
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'x',
+                                   source='doe_teaming_partners')
+    assert out['results'][0]['also_in'] == ['sec_raise']
+
+
+def test_search_contacts_shared_hosts_never_merge_companies(storage):
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', pd.DataFrame([
+        {'company_name': 'Alpha', 'companyWebsite': 'https://www.linkedin.com/company/alpha',
+         'summary': 'x', 'embeddings': [1.0, 0.0]},
+        {'company_name': 'Beta', 'companyWebsite': 'https://linkedin.com/company/beta',
+         'summary': 'x', 'embeddings': [0.9, 0.1]}]))
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'x')
+    assert {r['company_name'] for r in out['results']} == {'Alpha', 'Beta'}
+
+
+def test_search_contacts_large_limit_fits_one_tool_result(storage):
+    rows = [{'company_name': f'Co {i}', 'companyWebsite': f'https://co{i}.com',
+             'summary': 'lithium extraction ' * 60, 'embeddings': [1.0, i / 100]}
+            for i in range(40)]
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', pd.DataFrame(rows))
+
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'x', limit=25)
+    assert len(out['results']) == 25                         # nothing halved away
+    assert len(json.dumps(out, default=str)) < 20_000        # under main._emit's cap
+    assert t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'x',
+                                    limit=500)['results'].__len__() <= 50
+
+
+def test_contact_index_rebuilds_an_older_format(storage):
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', _apollo_rows())
+    t_ci.build_source(storage, 'apollo')
+    # Simulate a manifest written by the previous (format-1) build.
+    blob = storage.bucket('cc-matcher-bucket-jeg-v1').blob(
+        'data/contact-index/apollo/manifest.json')
+    m = json.loads(blob.download_as_bytes())
+    m.pop('format')
+    blob.upload_from_string(json.dumps(m))
+    assert 'skipped' not in t_ci.build_source(storage, 'apollo')
+
+
+def test_contact_index_concurrent_misses_download_once(storage, monkeypatch):
+    import threading
+    import time as _time
+    from tests.gcs_fake import FakeBlob
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', _apollo_rows())
+    t_ci.build_source(storage, 'apollo')
+
+    calls = []
+    real = FakeBlob.download_as_bytes
+
+    def slow(self, *a, **k):
+        if self.name.endswith('vectors.npy'):
+            calls.append(self.name)
+            _time.sleep(0.2)                 # widen the race window
+        return real(self, *a, **k)
+    monkeypatch.setattr(FakeBlob, 'download_as_bytes', slow)
+
+    threads = [threading.Thread(target=t_ci.load_index, args=(storage, 'apollo'))
+               for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(calls) == 1
+
+
 def test_search_contacts_budget_returns_instead_of_waiting(storage):
     put_parquet(storage, 'data/all-contacts/apollo/a.parquet', _apollo_rows())
     out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'x',

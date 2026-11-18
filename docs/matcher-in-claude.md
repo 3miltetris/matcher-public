@@ -45,8 +45,15 @@ unit-normalised float16 vectors + a small metadata table under
 `data/contact-index/{source}/` (~1.2 GB total; apollo ~196k companies). The server
 loads it on boot and caches it; any blob imported since the last build is scanned
 live, so a new import is searchable immediately. Measured from GCP: cold ~20 s for
-all 14 sources, warm apollo ~1.5 s. A source whose blobs are unchanged is skipped
-on rebuild. Run it by hand after a big import with
+all 14 sources, warm apollo ~1.5 s. **4 GiB is required** (raised from 1 GiB): the
+cached index is ~1 GB, loads are single-flight and copy-free, but a 1 GiB instance
+would not hold it. A source whose blobs are unchanged is skipped on rebuild, unless
+its manifest predates the current `INDEX_FORMAT` (then it is rebuilt).
+Companies are deduped on their website **host**, not name+URL: the same firm is
+"ionX Technologies, Inc." in doe_teaming_partners and "IONX TECHNOLOGIES INC" in
+sam. Each build writes `hosts.json` so `also_in` names every folder holding the
+company, even ones the search was not scoped to — 2,315 companies sit in more than
+one of just doe/sam/sec_raise/sba, so this is what prevents double outreach. Run it by hand after a big import with
 `gcloud run jobs execute contact-index-job --region us-central1 --project cc-matcher-v1`
 (add `--args=-m,src.modules.tools.contact_index,--force` to rebuild everything).
 Nightly schedule (3 AM Central):
@@ -125,7 +132,7 @@ gcloud run deploy matcher-mcp \
   --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matcher-mcp:latest \
   --region us-central1 --project cc-matcher-v1 \
   --service-account matcher-mcp@cc-matcher-v1.iam.gserviceaccount.com \
-  --no-invoker-iam-check --max-instances 2 --memory 1Gi \
+  --no-invoker-iam-check --max-instances 2 --memory 4Gi --cpu 2 \
   --set-secrets=OPENAI_API_KEY=openai-api-key:latest,GOOGLE_CLIENT_ID=mcp-google-client-id:latest,GOOGLE_CLIENT_SECRET=mcp-google-client-secret:latest,MCP_JWT_SIGNING_KEY=mcp-jwt-signing-key:latest,MCP_STORAGE_ENCRYPTION_KEY=mcp-storage-encryption-key:latest \
   --set-env-vars=MCP_BASE_URL=https://matcher-mcp-998055288572.us-central1.run.app
 ```

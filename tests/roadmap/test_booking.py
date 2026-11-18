@@ -7,6 +7,7 @@ under test is the exclusion, the property writeback, and the fingerprint gate.""
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import pytest
 
 import src.modules.profile_build as pb
 import src.modules.roadmap.booking_hs as bk
@@ -198,10 +199,14 @@ def test_failure_marks_error_on_contact(storage, bm, monkeypatch):
     res = rp.generate_booking_roadmap(_deps(storage, bm, hs), contact_id='c1')
     assert res['status'] == 'error'
     assert hs.patched_by_id['c1']['call_roadmap_status'] == 'error'
-    # The failed attempt is counted and the fingerprint persisted, so a later poll
-    # can stop retrying this contact once the budget is spent.
+    # The failed attempt is counted against these inputs, so a later poll can stop
+    # retrying this contact once the budget is spent. It is recorded as the
+    # ATTEMPT's fingerprint — `fingerprint` only ever names a finished result.
     rec, _ = bm.download_json('roadmap/runs/booking_c1.json')
-    assert rec['attempts'] == 1 and rec['fingerprint']
+    assert rec['attempts'] == 1 and rec['attempt_fingerprint']
+    assert 'fingerprint' not in rec
+    # Full timestamp, so the retry's 15-minute staleness wait actually waits.
+    assert 'T' in hs.patched_by_id['c1']['call_roadmap_generated_at']
 
 
 # ── Error recovery + changed-input re-runs (claim queue) ──────────────────────
@@ -310,3 +315,99 @@ def test_booking_poll_endpoint_guard_and_count(monkeypatch):
     r = c.post('/api/roadmap/booking-poll?secret=s3cret&limit=10')
     assert r.status_code == 200 and r.json()['claimed'] == 2
     assert ran.get('n') == 2
+
+
+# ── Review fixes: killed re-run, retry clock, crowding, checked memo ──────────
+
+def test_killed_rerun_rebuilds_instead_of_resending_old_programs(storage, bm, monkeypatch):
+    counter = {'n': 0}
+    _stub(monkeypatch, build_counter=counter)
+    hs = _booked()
+    deps = _deps(storage, bm, hs)
+    assert rp.generate_booking_roadmap(deps, contact_id='c1')['status'] == 'complete'
+    assert counter['n'] == 1
+
+    # The founder sends a deck; the re-run is claimed, then the container is
+    # killed mid-build (no `except` runs — modelled with SystemExit).
+    hs.contacts['c1']['call_materials_url'] = 'https://files.example/deck.pdf'
+    monkeypatch.setattr(pb, 'build_profile_from_texts',
+                        lambda *a, **k: (_ for _ in ()).throw(SystemExit()))
+    with pytest.raises(SystemExit):
+        rp.generate_booking_roadmap(deps, contact_id='c1')
+
+    # The recovery poll must BUILD with the deck, not re-send the old programs.
+    _stub(monkeypatch, build_counter=counter)
+    res = rp.generate_booking_roadmap(deps, contact_id='c1')
+    assert counter['n'] == 2                       # rebuilt, not reused
+    assert res['status'] == 'complete'
+
+
+def _error_contact(cid, *, website):
+    return {'email': f'{cid}@x.com', 'call_booked_at': 't', 'website': website,
+            'pitched_program': 'P', 'call_roadmap_status': 'error',
+            'call_roadmap_generated_at': (_NOW - timedelta(minutes=30)).isoformat(),
+            'hs_lastmodifieddate': '2026-01-01T11:00:00Z'}
+
+
+def test_exhausted_errors_do_not_crowd_out_a_retryable_one(storage, bm, monkeypatch):
+    _stub(monkeypatch)
+    hs = FakeHubSpot()
+    for i in range(30):                            # more than a whole claim batch
+        props = _error_contact(f'dead{i}', website=f'dead{i}.com')
+        hs.add(f'dead{i}', props)
+        _seed_record(bm, f'dead{i}', props, attempts=rp._MAX_BOOKING_ATTEMPTS)
+    live = _error_contact('live', website='live.com')
+    hs.add('live', live)
+    _seed_record(bm, 'live', live, attempts=1)
+
+    ids = rp.claim_pending_bookings(_deps(storage, bm, hs), limit=10, stale_min=15)
+    assert ids == ['live']
+
+
+def _no_input_contact(cid, *, website):
+    return {'email': f'{cid}@x.com', 'call_booked_at': 't', 'website': website,
+            'pitched_program': 'P', 'call_roadmap_status': 'no_input',
+            'hs_lastmodifieddate': '2026-01-01T11:00:00Z'}
+
+
+def test_unchanged_no_input_contacts_do_not_hide_a_changed_one(storage, bm, monkeypatch):
+    _stub(monkeypatch)
+    hs = FakeHubSpot()
+    for i in range(30):
+        props = _no_input_contact(f'same{i}', website='')
+        hs.add(f'same{i}', props)
+        _seed_record(bm, f'same{i}', props, attempts=1)      # fingerprint == inputs
+    late = _no_input_contact('late', website='late-site.com')
+    hs.add('late', late)
+    _seed_record(bm, 'late', late, attempts=1, fingerprint='built-without-site')
+
+    ids = rp.claim_pending_bookings(_deps(storage, bm, hs), limit=10)
+    assert ids == ['late']
+
+
+def test_checked_memo_skips_unchanged_contacts_until_they_change(storage, bm, monkeypatch):
+    _stub(monkeypatch)
+    hs = FakeHubSpot()
+    for i in range(5):
+        props = _no_input_contact(f'same{i}', website='')
+        hs.add(f'same{i}', props)
+        _seed_record(bm, f'same{i}', props, attempts=1)
+    deps = _deps(storage, bm, hs)
+
+    reads = []
+    real = rp._load_record
+    monkeypatch.setattr(rp, '_load_record',
+                        lambda d, run_id: reads.append(run_id) or real(d, run_id))
+
+    assert rp.claim_pending_bookings(deps, limit=10) == []
+    assert len(reads) == 5                         # first poll examines each once
+    reads.clear()
+    assert rp.claim_pending_bookings(deps, limit=10) == []
+    assert reads == []                             # unchanged: no record reads at all
+
+    # A website arrives on one contact — HubSpot bumps its last-modified time.
+    hs.contacts['same3'].update(website='now-has-site.com',
+                                hs_lastmodifieddate='2026-01-01T11:30:00Z')
+    reads.clear()
+    assert rp.claim_pending_bookings(deps, limit=10) == ['same3']
+    assert len(reads) == 1

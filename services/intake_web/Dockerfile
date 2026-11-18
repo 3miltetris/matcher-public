@@ -43,6 +43,9 @@ COPY src/modules/anthropic_utils.py src/modules/anthropic_utils.py
 COPY src/modules/aspect_matching.py src/modules/aspect_matching.py
 COPY src/modules/profile_build.py src/modules/profile_build.py
 COPY src/modules/grant_utils.py src/modules/grant_utils.py
+# gcs_write: the booking poll's claim run-lock (roadmap/pipeline.py imports it at
+# module level, so leaving it out fails the import smoke check below).
+COPY src/modules/gcs_write.py src/modules/gcs_write.py
 COPY src/modules/roadmap src/modules/roadmap
 
 COPY src/modules/Embedding/__init__.py src/modules/Embedding/__init__.py

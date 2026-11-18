@@ -14,6 +14,7 @@ OpenAI key (text-embedding-ada-002, the model every stored vector was built with
 from __future__ import annotations
 
 import io
+import json
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
@@ -319,24 +320,43 @@ _CONTACTS_WORKERS = 8
 _CONTACTS_BUDGET_S = 25.0
 
 
-def _norm_site(url) -> str:
-    """A website reduced to a dedup identity: scheme, leading www. and trailing
-    slashes dropped, lowercased. Collapses http/https, www/non-www and trailing-
-    slash variants that would otherwise be separate company keys."""
+# Hosts many unrelated companies list as their "website" (a profile page, a site
+# builder). Keying on these would merge different companies, so they fall back
+# to the name identity instead.
+_SHARED_HOSTS = {'linkedin.com', 'facebook.com', 'twitter.com', 'x.com',
+                 'instagram.com', 'youtube.com', 'google.com', 'sites.google.com',
+                 'crunchbase.com', 'angel.co', 'wellfound.com', 'github.com'}
+_SHARED_HOST_SUFFIXES = ('.wixsite.com', '.wordpress.com', '.squarespace.com',
+                         '.godaddysites.com', '.weebly.com', '.business.site')
+
+
+def _site_host(url) -> str:
+    """A website reduced to its host: scheme, path/query, port and a leading
+    `www.` dropped, lowercased. '' when blank or a shared host (see above)."""
     s = str(url or '').strip().lower()
-    for p in ('https://', 'http://'):
-        if s.startswith(p):
-            s = s[len(p):]
-            break
+    if not s or s in ('nan', 'none'):
+        return ''
+    if '://' in s:
+        s = s.split('://', 1)[1]
+    for sep in ('/', '?', '#'):
+        s = s.split(sep, 1)[0]
+    s = s.split('@')[-1].split(':', 1)[0].strip('.')
     if s.startswith('www.'):
         s = s[4:]
-    return s.rstrip('/')
+    if not s or '.' not in s or s in _SHARED_HOSTS or s.endswith(_SHARED_HOST_SUFFIXES):
+        return ''
+    return s
 
 
 def _dedup_identity(name: str, website: str) -> str:
-    """Normalised (name, site) identity for collapsing the same company listed
-    under www/non-www/trailing-slash variants or across folders."""
-    return f'{" ".join(str(name).lower().split())}||{_norm_site(website)}'
+    """The identity one company keeps across folders and spellings: its website
+    HOST when it has a usable one — the same firm is 'ionX Technologies, Inc.'
+    in one folder and 'IONX TECHNOLOGIES INC' in another, but the same
+    ionxtechnologies.com in both — else its whitespace/case-normalised name."""
+    host = _site_host(website)
+    if host:
+        return f'd::{host}'
+    return f'n::{" ".join(str(name).lower().split())}'
 
 
 def _embeddings_matrix(table) -> tuple[np.ndarray, list[int]]:
@@ -446,6 +466,52 @@ def _index_task(gcs_client, folder: str, blobs: list, qvec, keep: int, bucket: s
     return cands, stale, any_rows
 
 
+_CONTACTS_MAX_LIMIT = 50
+# Room the result rows may use inside the server's 20k-char tool-result cap
+# (main._emit halves the longest list when a result is over it — which is what
+# turned 25 requested rows into ~12). The rest is the envelope + coverage lists.
+_CONTACTS_RESULTS_CHARS = 16_500
+
+
+def _fill_also_in(gcs_client, results: list[dict], seen_in: dict, bucket: str) -> None:
+    """Set each result's `also_in` to every OTHER folder holding the same company:
+    the folders whose prebuilt host list contains its website host (all indexed
+    folders, whatever this search was scoped to), plus any folder it surfaced in
+    during this search (covers name-only identities and blobs not indexed yet)."""
+    from src.modules.tools import contact_index as ci
+    try:
+        indexed = cm.list_subfolders(gcs_client, ci.INDEX_PREFIX, bucket=bucket)
+    except Exception:
+        indexed = []
+    host_sets = {}
+    for folder in indexed:
+        try:
+            host_sets[folder] = ci.load_hosts(gcs_client, folder, bucket=bucket)
+        except Exception:
+            host_sets[folder] = frozenset()
+    for c in results:
+        ident = c.pop('_ident', '')
+        folders = set(seen_in.get(ident, set()))
+        host = _site_host(c['website'])
+        if host:
+            folders |= {f for f, hosts in host_sets.items() if host in hosts}
+        c['also_in'] = sorted(folders - {c['source']})
+
+
+def _fit_summaries(results: list[dict]) -> None:
+    """Shrink summaries just enough that all rows fit in _CONTACTS_RESULTS_CHARS,
+    so a large `limit` returns every row with a shorter summary rather than half
+    the rows. Never below 120 chars, never above the stored 600."""
+    if not results:
+        return
+    overhead = sum(len(json.dumps({k: v for k, v in c.items() if k != 'summary'},
+                                  default=str)) + 16 for c in results)
+    per_row = (_CONTACTS_RESULTS_CHARS - overhead) // len(results)
+    cap = max(120, min(600, per_row))
+    for c in results:
+        c['summary'] = cm.cap_text(c.get('summary', ''), cap)
+
+
 def search_contacts(gcs_client, embed_query, query: str, *, source: str | None = None,
                     limit: int = 10, bucket: str = BUCKET,
                     max_workers: int = _CONTACTS_WORKERS,
@@ -462,18 +528,23 @@ def search_contacts(gcs_client, embed_query, query: str, *, source: str | None =
     query, so each folder is scored from its prebuilt index (contact_index.py,
     rebuilt nightly, cached in-process). Any blob imported since the last build
     is scanned live, so nothing new is missed. Results are deduped to one row per
-    company (by a normalised name+domain identity, so www/non-www variants
-    collapse) with `also_in` naming the other folders it appears in and a 0-1
-    cosine `score`; `company_key` is a real stored key, so get_company /
-    get_profile accept it unchanged.
+    company, keyed on the website HOST (so 'ionX Technologies, Inc.' and 'IONX
+    TECHNOLOGIES INC' at ionxtechnologies.com are one company), with `also_in`
+    naming EVERY other folder holding that host — checked against each folder's
+    full host list, not just this query's hits, and across all folders even when
+    `source` narrows the search — so outreach never double-contacts a company.
+    `company_key` is a real stored key, so get_company / get_profile accept it.
+    `limit` is capped at 50; summaries shrink as `limit` grows so every requested
+    row fits in one tool result instead of the list being cut.
 
     Everything runs under a wall-clock budget: if the budget runs out, it returns
     what it has and names the unfinished folders in `sources_incomplete`.
     Coverage is reported by folder NAME only — no row/contact counts are ever
     exposed. `scores_note` warns that scores compare only within a source."""
+    limit = max(1, min(int(limit), _CONTACTS_MAX_LIMIT))
     qvec = embed_query(query)
     want = source.strip().strip('/') if source else None
-    keep = max(2 * int(limit), 20)
+    keep = max(2 * limit, 20)
 
     by_folder: dict[str, list] = {}
     for blob in gcs_client.list_blobs(bucket, prefix=_CONTACTS_PREFIX):
@@ -538,9 +609,9 @@ def search_contacts(gcs_client, embed_query, query: str, *, source: str | None =
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
 
-    results = sorted(best.values(), key=lambda c: c['score'], reverse=True)[:max(1, int(limit))]
-    for c in results:
-        c['also_in'] = sorted(seen_in.get(c.pop('_ident', ''), set()) - {c['source']})
+    results = sorted(best.values(), key=lambda c: c['score'], reverse=True)[:limit]
+    _fill_also_in(gcs_client, results, seen_in, bucket)
+    _fit_summaries(results)
 
     searched, no_emb, incomplete = [], [], []
     for folder in sorted(state):
