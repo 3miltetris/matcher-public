@@ -77,3 +77,23 @@ def test_poll_endpoint_guard_and_count(monkeypatch):
     r = c.post('/api/roadmap/poll?secret=s3cret&mode=event&limit=10')
     assert r.status_code == 200 and r.json()['claimed'] == 2
     assert ran.get('n') == 2                         # background batch ran
+
+
+def test_event_poll_rejects_booking_mode(monkeypatch):
+    """`?mode=booking` must NOT reach the event poll as a booking: the event poll
+    runs the event (PDF) pipeline, so it falls back to event rather than silently
+    running the wrong path under a 'booking' label."""
+    from fastapi.testclient import TestClient
+
+    import services.intake_web.main as main
+    assert main.rp.MODE_BOOKING not in main._ROADMAP_MODES
+    monkeypatch.setenv('ROADMAP_WEBHOOK_SECRET', 's3cret')
+    monkeypatch.setattr(main, 'rm_deps', lambda: object())
+    monkeypatch.setattr(main.rp, 'claim_pending', lambda deps, limit=10: ['p1'])
+    seen = {}
+    monkeypatch.setattr(main.rp, 'generate_batch',
+                        lambda deps, ids, mode, base: seen.setdefault('mode', mode))
+    c = TestClient(main.app)
+    r = c.post('/api/roadmap/poll?secret=s3cret&mode=booking&limit=10')
+    assert r.status_code == 200
+    assert seen['mode'] == main.rp.MODE_EVENT         # coerced, not 'booking'

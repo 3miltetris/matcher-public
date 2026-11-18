@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 from google.cloud import storage
 
@@ -73,15 +74,112 @@ def _make_embed_query():
     return embed_query
 
 
+def _prewarm_contact_index(gcs) -> None:
+    """Start loading the search_contacts index (~1 GB of float16 vectors across
+    sources) on a daemon thread at boot. A cold load measured ~20s; matcher-mcp
+    scales to zero, so without this the first search_contacts after idle pays it
+    inside the call's 25s budget. Started here, it overlaps the OAuth/initialize
+    handshake claude.ai does before any tool call. Best-effort: a failure just
+    leaves the first query to load the index itself."""
+    def _run():
+        try:
+            from src.modules.tools import _common as cm, contact_index as ci
+            for src in cm.list_subfolders(gcs, ci.INDEX_PREFIX, bucket=_BUCKET):
+                ci.load_index(gcs, src, bucket=_BUCKET)
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=_run, name='contact-index-prewarm', daemon=True).start()
+
+
 # ── FastMCP auth + claims integration point ──────────────────────────────────
+
+def _oauth_client_storage():
+    """Persistent, encrypted store for the OAuth proxy's state — the DCR client
+    registration claude.ai creates AND the mapping from the server's own tokens to
+    the upstream Google tokens.
+
+    Why this exists: FastMCP's OAuthProxy keeps that state IN MEMORY by default,
+    and on Linux it also signs its JWTs with a salt generated fresh at process
+    start. matcher-mcp scales to zero when idle (--max-instances 2, no min), so
+    every cold start wipes both — the token claude.ai still holds then resolves to
+    nothing (`invalid_grant` on refresh), and claude.ai is forced to run the whole
+    Google login again. That is the "reconnect every time" symptom. A stable
+    signing key alone is NOT enough: the refresh token is only a reference into
+    this store, so the store has to survive the restart too.
+
+    Firestore is serverless (ADC on Cloud Run, no always-on instance) and
+    effectively free at this volume. Values are encrypted at rest with a Fernet
+    key so the upstream Google tokens never sit in Firestore in plaintext;
+    raise_on_decryption_error=False means a rotated key degrades to a one-time
+    re-auth instead of 500-ing the token endpoint. Returns None only when the
+    encryption key is absent (dev/misconfig) — the caller treats that as fatal in
+    production."""
+    enc_key = os.environ.get('MCP_STORAGE_ENCRYPTION_KEY', '')
+    if not enc_key:
+        return None
+    # Lazy imports (like fastmcp/openai) so the module import graph — and the
+    # Dockerfile's import smoke check — does not need these at import time.
+    from key_value.aio.stores.firestore import (
+        FirestoreStore, FirestoreV1KeySanitizationStrategy,
+        FirestoreV1CollectionSanitizationStrategy)
+    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+    from cryptography.fernet import Fernet
+
+    store = FirestoreStore(
+        project=os.environ.get('GOOGLE_CLOUD_PROJECT') or 'cc-matcher-v1',
+        default_collection='mcp_oauth',
+        # OAuthProxy keys an entry by the OAuth client_id, which for claude.ai is a
+        # URL ("https://claude.ai/oauth/..."). A Firestore document id cannot
+        # contain '/', so without this the authorize handler 500s with
+        # "Document name ... lacks a collection id". These Firestore-specific
+        # strategies make the id slash-free (and length-safe) deterministically.
+        key_sanitization_strategy=FirestoreV1KeySanitizationStrategy(),
+        collection_sanitization_strategy=FirestoreV1CollectionSanitizationStrategy(),
+    )
+    key = enc_key.encode() if isinstance(enc_key, str) else enc_key
+    return FernetEncryptionWrapper(store, fernet=Fernet(key),
+                                   raise_on_decryption_error=False)
+
 
 def _build_auth():
     """GoogleProvider for production; None in MCP_DEV (no OAuth, dev identity).
-    Verify the GoogleProvider kwargs against the installed fastmcp on first
-    deploy (the house 'check the signature before trusting it' rule)."""
+
+    Production passes a STABLE `jwt_signing_key` and a persistent `client_storage`
+    (see _oauth_client_storage) so OAuth state survives Cloud Run cold starts and
+    the connector does not have to be reconnected on every use. Both are required:
+    the service fails to boot (loudly) if either is missing, rather than silently
+    reverting to the ephemeral in-memory behaviour.
+
+    Verify the GoogleProvider kwargs against the installed fastmcp on first deploy
+    (the house 'check the signature before trusting it' rule). We do that check
+    here at boot too: if the installed fastmcp is too old to accept these kwargs,
+    raise a clear upgrade message instead of a bare TypeError or (worse) silently
+    dropping them."""
     if os.environ.get('MCP_DEV') == '1':
         return None
     from fastmcp.server.auth.providers.google import GoogleProvider
+
+    signing_key = os.environ.get('MCP_JWT_SIGNING_KEY', '')
+    storage = _oauth_client_storage()
+    if not signing_key or storage is None:
+        missing = [n for n, ok in (
+            ('MCP_JWT_SIGNING_KEY', signing_key),
+            ('MCP_STORAGE_ENCRYPTION_KEY', storage is not None)) if not ok]
+        raise RuntimeError(
+            'matcher-mcp OAuth persistence is not configured: missing '
+            f'{", ".join(missing)}. Without it the connector reverts to '
+            '"reconnect every time" (see docs/matcher-in-claude.md §Persistent '
+            'OAuth). Mount the secrets, or set MCP_DEV=1 for local dev only.')
+
+    import inspect
+    unsupported = ({'jwt_signing_key', 'client_storage'}
+                   - set(inspect.signature(GoogleProvider.__init__).parameters))
+    if unsupported:
+        raise RuntimeError(
+            f"installed fastmcp's GoogleProvider lacks {sorted(unsupported)}; bump "
+            'fastmcp in requirements.matcher_mcp.txt to a version with persistent '
+            'OAuth storage (then re-verify the signature per the house rule).')
+
     return GoogleProvider(
         client_id=os.environ['GOOGLE_CLIENT_ID'],
         client_secret=os.environ['GOOGLE_CLIENT_SECRET'],
@@ -93,6 +191,10 @@ def _build_auth():
         # The OAuth callback path the Google client must list as its authorized
         # redirect URI: {MCP_BASE_URL}/auth/callback.
         redirect_path='/auth/callback',
+        # Stable across restarts so issued tokens stay valid; the store keeps the
+        # token<->Google mapping and DCR registrations so refresh survives too.
+        jwt_signing_key=signing_key,
+        client_storage=storage,
     )
 
 
@@ -149,6 +251,7 @@ def build_server():
     embed_query = _make_embed_query()
     secret = _confirm_secret()
     mcp = FastMCP(name='matcher-mcp', auth=_build_auth())
+    _prewarm_contact_index(gcs)
 
     _jobs_box: dict = {}
 
@@ -219,6 +322,25 @@ def build_server():
         args = {'company_key': company_key}
         r = run_tool('get_company', lambda: t_co.get_company(gcs, company_key),
                      args)
+        return _emit(r)
+
+    @mcp.tool()
+    def search_contacts(query: str, source: str = '', limit: int = 10) -> str:
+        """Semantically find companies in the contact store (all lead sources
+        AND the clients/prospects pools) whose company summary best matches a
+        natural-language `query` — e.g. 'autonomous underwater drones' or
+        'mRNA thermostable vaccine manufacturing'. This ranks by embedding
+        similarity, unlike search_companies which matches on the company NAME.
+        Set `source` to one folder (e.g. 'apollo', 'clients') to narrow, or
+        leave empty for all. Each result carries the company_key, the folder it
+        was found in, `also_in` naming any other folders it appears in, and a
+        0-1 relevance score. Coverage is reported by folder name in
+        `sources_searched` / `sources_no_embeddings` / `sources_incomplete`; if
+        `complete` is false, say which folders were not finished. Scores are
+        comparable only within one source."""
+        args = {'query': query, 'source': source, 'limit': limit}
+        r = run_tool('search_contacts', lambda: t_search.search_contacts(
+            gcs, embed_query, query, source=(source or None), limit=limit), args)
         return _emit(r)
 
     @mcp.tool()

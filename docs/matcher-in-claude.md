@@ -27,11 +27,36 @@ transport-agnostic, unit-tested functions in `src/modules/tools/` — the server
 just the wiring. See `docs/spikes/mcp-connector.md` for the researched OAuth/connector
 answers.
 
-**Tier 1 tools:** `search_grants`, `search_companies`, `get_company`, `get_profile`,
+**Tier 1 tools:** `search_grants`, `search_companies` (match on company NAME),
+`search_contacts` (semantic/embedding search of the contact store — lead sources
++ clients/prospects — for companies whose summary fits a technology description),
+`get_company`, `get_profile`,
 `search_resumes`, `list_runs`, `get_run_status`, `get_match_results`, `whats_new`,
 `list_attention`, `list_onboarding_proposals`, `get_onboarding_proposal`,
 `list_match_options` (the available contact sources + agency folders, by name, to
 feed a `run_matching` request).
+
+**`search_contacts` runs off a prebuilt index.** `data/all-contacts/` is ~3.7 GB
+(~79% of it embedding vectors), far too much to download per query — scanning it
+live took 100+ s and timed out on apollo/sba/sam/vc/crunchbase. The
+**`contact-index-job`** (the matcher-mcp image running
+`python -m src.modules.tools.contact_index`) condenses each source into
+unit-normalised float16 vectors + a small metadata table under
+`data/contact-index/{source}/` (~1.2 GB total; apollo ~196k companies). The server
+loads it on boot and caches it; any blob imported since the last build is scanned
+live, so a new import is searchable immediately. Measured from GCP: cold ~20 s for
+all 14 sources, warm apollo ~1.5 s. A source whose blobs are unchanged is skipped
+on rebuild. Run it by hand after a big import with
+`gcloud run jobs execute contact-index-job --region us-central1 --project cc-matcher-v1`
+(add `--args=-m,src.modules.tools.contact_index,--force` to rebuild everything).
+Nightly schedule (3 AM Central):
+```
+gcloud scheduler jobs create http contact-index-daily --schedule="0 3 * * *" \
+  --uri="https://run.googleapis.com/v2/projects/cc-matcher-v1/locations/us-central1/jobs/contact-index-job:run" \
+  --http-method=POST --message-body='{}' \
+  --oauth-service-account-email=matching-job@cc-matcher-v1.iam.gserviceaccount.com \
+  --location=us-central1 --time-zone="America/Chicago" --project cc-matcher-v1
+```
 
 **Tier 2 tools (triggers):** `run_matching`, `build_profiles`, `sync_drive`,
 `sync_fathom`, `run_onboarding_agent`. `run_matching` takes the match axes
@@ -101,9 +126,12 @@ gcloud run deploy matcher-mcp \
   --region us-central1 --project cc-matcher-v1 \
   --service-account matcher-mcp@cc-matcher-v1.iam.gserviceaccount.com \
   --no-invoker-iam-check --max-instances 2 --memory 1Gi \
-  --set-secrets=OPENAI_API_KEY=openai-api-key:latest,GOOGLE_CLIENT_ID=mcp-google-client-id:latest,GOOGLE_CLIENT_SECRET=mcp-google-client-secret:latest \
+  --set-secrets=OPENAI_API_KEY=openai-api-key:latest,GOOGLE_CLIENT_ID=mcp-google-client-id:latest,GOOGLE_CLIENT_SECRET=mcp-google-client-secret:latest,MCP_JWT_SIGNING_KEY=mcp-jwt-signing-key:latest,MCP_STORAGE_ENCRYPTION_KEY=mcp-storage-encryption-key:latest \
   --set-env-vars=MCP_BASE_URL=https://matcher-mcp-998055288572.us-central1.run.app
 ```
+`MCP_JWT_SIGNING_KEY` + `MCP_STORAGE_ENCRYPTION_KEY` are **required** (the service
+refuses to boot without them) — they are what keep the connector connected across
+cold starts; see **§ Persistent OAuth** below for why and the one-time setup.
 Two gotchas learned on the first deploy:
 - **Public access:** `--allow-unauthenticated` tries an `allUsers` IAM binding, which the
   DRS org policy **refuses**. Use **`--no-invoker-iam-check`** instead (sets
@@ -154,6 +182,72 @@ misconfigured" message rather than running uncapped — fail closed. Without the
 `run.admin` grants the config is still staged but the `run_job` call 403s, and the
 tool reports "triggered spend but the job failed to start" (so re-grant, then the
 same run_id can be re-triggered).
+
+### 3c. Persistent OAuth — so the connector stays connected (LIVE 2026-11-11, rev `matcher-mcp-00008-xdh`)
+
+Done and live: Firestore `(default)` database created (Native, us-central1, free
+tier), secrets `mcp-jwt-signing-key` + `mcp-storage-encryption-key` created,
+`matcher-mcp@` granted `roles/datastore.user`, service redeployed with both mounted.
+Verified: OAuth discovery 200, `/mcp` 401, both secrets present on the revision, and
+the service boots (so `GoogleProvider` accepts the kwargs on the installed fastmcp).
+
+**Symptom it fixes:** having to reconnect the connector in claude.ai on almost every
+use. The connector was not the problem — the **server was discarding its OAuth state**.
+FastMCP's `GoogleProvider` (an `OAuthProxy`) on Linux/Cloud Run (1) signs the JWTs it
+issues with a key generated **fresh at each process start** (no keyring on Linux → an
+ephemeral salt), and (2) keeps the proxy↔Google token mapping and the DCR client
+registration **in memory**. `matcher-mcp` runs `--max-instances 2` with **no min
+instances**, so it scales to zero when idle; every cold start after a gap wipes both,
+the token claude.ai still holds "resolves to nothing" (`invalid_grant` on refresh), and
+claude.ai is forced to redo the whole Google login. A stable signing key alone is **not
+enough** — the refresh token is only a reference into a key-value store that also has to
+survive the restart.
+
+**The fix (both parts, in `services/matcher_mcp/main.py`):**
+- a **stable `jwt_signing_key`** from Secret Manager (`mcp-jwt-signing-key`), so issued
+  tokens stay valid across restarts; and
+- a persistent, encrypted **`client_storage`** — a **Firestore** `FirestoreStore`
+  (serverless, ADC, ~$0 at this volume) wrapped in a `FernetEncryptionWrapper` keyed by
+  `mcp-storage-encryption-key`, so the token↔Google mapping and client registration
+  survive cold starts (and redeploys) and refresh keeps working. Data lives in the
+  Firestore `mcp_oauth` collection, encrypted at rest.
+
+`_build_auth()` **requires both** env vars in production and refuses to boot without
+them (fail loud, never silent reversion), and it signature-checks that the installed
+fastmcp's `GoogleProvider` accepts `jwt_signing_key` + `client_storage`, raising an
+"upgrade fastmcp" message if not. Dependencies: `py-key-value-aio[firestore]` +
+`cryptography` (added to `requirements.matcher_mcp.txt`).
+
+**One-time setup** (run once; `! gcloud auth login` first if tokens are stale — local
+gcloud defaults to the wrong project, so every command passes `--project cc-matcher-v1`):
+```bash
+# (a) Enable Firestore and create the database in Native mode (one region; us-central1
+#     to sit with everything else). Skip the create if a (default) database exists.
+gcloud services enable firestore.googleapis.com --project cc-matcher-v1
+gcloud firestore databases create --location=us-central1 --project cc-matcher-v1
+
+# (b) Two secrets. Generate fresh values if rebuilding — the signing key is any strong
+#     random string; the encryption key MUST be a urlsafe-base64 32-byte Fernet key
+#     (python -c "import os,base64;print(base64.urlsafe_b64encode(os.urandom(32)).decode())").
+printf %s '<MCP_JWT_SIGNING_KEY value>' \
+  | gcloud secrets create mcp-jwt-signing-key --data-file=- --project cc-matcher-v1
+printf %s '<MCP_STORAGE_ENCRYPTION_KEY value>' \
+  | gcloud secrets create mcp-storage-encryption-key --data-file=- --project cc-matcher-v1
+
+# (c) Let matcher-mcp@ read/write Firestore (secretAccessor it already has from §2).
+gcloud projects add-iam-policy-binding cc-matcher-v1 \
+  --member="serviceAccount:matcher-mcp@cc-matcher-v1.iam.gserviceaccount.com" \
+  --role="roles/datastore.user"
+
+# (d) Rebuild + redeploy mounting the two new secrets (keep the existing ones).
+gcloud builds submit --config cloudbuild.matcher_mcp.yaml --project cc-matcher-v1 .
+gcloud run services update matcher-mcp --region us-central1 --project cc-matcher-v1 \
+  --image us-central1-docker.pkg.dev/cc-matcher-v1/matcher/matcher-mcp:latest \
+  --update-secrets=MCP_JWT_SIGNING_KEY=mcp-jwt-signing-key:latest,MCP_STORAGE_ENCRYPTION_KEY=mcp-storage-encryption-key:latest
+```
+After this, reconnect the connector **once** in claude.ai (to mint a token under the new
+stable key); it should then stay connected. **Never rotate these two secrets casually** —
+rotating either invalidates every live session and forces everyone to reconnect once.
 
 ### 4. Verify the fastmcp signatures (house rule — before trusting a deploy)
 ```python

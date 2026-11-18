@@ -393,7 +393,14 @@ def _finish(session_id: str) -> None:
 # roadmap_pdf_url back onto the contact, which is the boss's HubSpot workflow
 # trigger for the email/text sequence.
 
-_ROADMAP_MODES = {rp.MODE_EVENT, rp.MODE_INSTANTLY, rp.MODE_BOOKING}
+# The event webhook/poll (`/api/roadmap/webhook`, `/api/roadmap/poll`) validate
+# their `mode` against this set and dispatch to generate_roadmap/generate_batch.
+# MODE_BOOKING is deliberately NOT here: the booking flow has its own endpoint
+# (`/api/roadmap/booking-poll`) and its own queue/pipeline, and does not read this
+# set. Including it would only let `?mode=booking` pass validation on the event
+# endpoints and silently run the event PDF path under a "booking" label, writing
+# roadmap_* properties instead of the booking call_* ones.
+_ROADMAP_MODES = {rp.MODE_EVENT, rp.MODE_INSTANTLY}
 _TOKEN_RE      = re.compile(r'^[A-Za-z0-9_-]{16,64}$')
 
 

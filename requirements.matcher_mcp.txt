@@ -4,6 +4,14 @@
 # GoogleProvider kwargs + the auth-dependency claims shape against the installed
 # version on first deploy (the house 'check the signature before trusting it' rule).
 fastmcp>=3.3.0,<4
+# Persistent, encrypted OAuth state so the connector survives Cloud Run cold
+# starts instead of forcing a reconnect every use (services/matcher_mcp/main.py
+# _oauth_client_storage). fastmcp already pulls py-key-value-aio; the [firestore]
+# extra adds google-cloud-firestore, and cryptography backs the Fernet wrapper.
+# Pin matches fastmcp-slim[server]'s own py-key-value-aio range (>=0.4.4,<0.5.0)
+# so pip just adds the firestore extra to the version fastmcp already resolves.
+py-key-value-aio[firestore]>=0.4.4,<0.5.0
+cryptography>=42,<46
 openai>=3.7.0,<4
 pandas>=2.0.0
 numpy>=1.26.0

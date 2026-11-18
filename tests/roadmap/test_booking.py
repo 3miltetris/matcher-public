@@ -198,6 +198,98 @@ def test_failure_marks_error_on_contact(storage, bm, monkeypatch):
     res = rp.generate_booking_roadmap(_deps(storage, bm, hs), contact_id='c1')
     assert res['status'] == 'error'
     assert hs.patched_by_id['c1']['call_roadmap_status'] == 'error'
+    # The failed attempt is counted and the fingerprint persisted, so a later poll
+    # can stop retrying this contact once the budget is spent.
+    rec, _ = bm.download_json('roadmap/runs/booking_c1.json')
+    assert rec['attempts'] == 1 and rec['fingerprint']
+
+
+# ── Error recovery + changed-input re-runs (claim queue) ──────────────────────
+
+def _seed_record(bm, cid: str, props: dict, *, attempts: int, fingerprint=None):
+    """Write a run record as the pipeline would, so _load_record sees it."""
+    fp = fingerprint if fingerprint is not None else rp._booking_fingerprint(
+        bk.booking_inputs({**props, '_id': cid}))
+    bm.upload_json(f'roadmap/runs/{rp._booking_run_id(cid)}.json',
+                   {'run_id': rp._booking_run_id(cid), 'fingerprint': fp,
+                    'attempts': attempts})
+    return fp
+
+
+def test_stale_error_recovered_under_budget_not_over(storage, bm, monkeypatch):
+    _stub(monkeypatch)
+    hs = FakeHubSpot()
+    stale = (_NOW - timedelta(minutes=30)).isoformat()
+    # Two errored bookings, both stale; one has spent its retry budget.
+    under = {'email': 'u@x.com', 'call_booked_at': 't', 'website': 'u.com',
+             'pitched_program': 'P', 'call_roadmap_status': 'error',
+             'call_roadmap_generated_at': stale}
+    over  = {'email': 'o@x.com', 'call_booked_at': 't', 'website': 'o.com',
+             'pitched_program': 'P', 'call_roadmap_status': 'error',
+             'call_roadmap_generated_at': stale}
+    hs.add('under', under)
+    hs.add('over', over)
+    _seed_record(bm, 'under', under, attempts=1)                       # budget left
+    _seed_record(bm, 'over', over, attempts=rp._MAX_BOOKING_ATTEMPTS)  # spent
+
+    ids = rp.claim_pending_bookings(_deps(storage, bm, hs), limit=10, stale_min=15)
+    assert ids == ['under']                       # 'over' is left stuck by design
+
+
+def test_fresh_error_is_not_retried_yet(storage, bm, monkeypatch):
+    _stub(monkeypatch)
+    hs = FakeHubSpot()
+    fresh = {'email': 'f@x.com', 'call_booked_at': 't', 'website': 'f.com',
+             'pitched_program': 'P', 'call_roadmap_status': 'error',
+             'call_roadmap_generated_at': _NOW.isoformat()}
+    hs.add('fresh', fresh)
+    _seed_record(bm, 'fresh', fresh, attempts=1)
+    ids = rp.claim_pending_bookings(_deps(storage, bm, hs), limit=10, stale_min=15)
+    assert ids == []                              # wait out the transient fault first
+
+
+def test_over_budget_error_retries_again_when_inputs_change(storage, bm, monkeypatch):
+    _stub(monkeypatch)
+    hs = FakeHubSpot()
+    stale = (_NOW - timedelta(minutes=30)).isoformat()
+    props = {'email': 'o@x.com', 'call_booked_at': 't', 'website': 'new-site.com',
+             'pitched_program': 'P', 'call_roadmap_status': 'error',
+             'call_roadmap_generated_at': stale}
+    hs.add('o', props)
+    # Record is over budget but against a DIFFERENT (old) fingerprint.
+    _seed_record(bm, 'o', props, attempts=rp._MAX_BOOKING_ATTEMPTS,
+                 fingerprint='old-inputs')
+    ids = rp.claim_pending_bookings(_deps(storage, bm, hs), limit=10, stale_min=15)
+    assert ids == ['o']                           # new inputs -> fresh attempt
+
+
+def test_no_input_rerun_when_website_arrives(storage, bm, monkeypatch):
+    _stub(monkeypatch)
+    hs = FakeHubSpot()
+    # Built 'no_input' earlier (empty website); a website has since been added.
+    props = {'email': 'n@x.com', 'call_booked_at': 't', 'website': 'added-later.com',
+             'pitched_program': 'P', 'call_roadmap_status': 'no_input'}
+    hs.add('n', props)
+    _seed_record(bm, 'n', props, attempts=1, fingerprint='was-empty')  # old fingerprint
+    ids = rp.claim_pending_bookings(_deps(storage, bm, hs), limit=10)
+    assert ids == ['n']                           # reinput_candidates picked it up
+
+
+def test_concurrent_poll_blocked_by_claim_lock(storage, bm, monkeypatch):
+    from src.modules import gcs_write
+    _stub(monkeypatch)
+    hs = _booked('new')                           # a claimable new booking
+    # Another poll already holds the booking-poll claim lock.
+    held = gcs_write.acquire_lock(storage.bucket('test-bucket'),
+                                  rp._BOOKING_POLL_LOCK, 'other-poll', ttl_seconds=180)
+    assert held is not None
+    ids = rp.claim_pending_bookings(_deps(storage, bm, hs), limit=10)
+    assert ids == []                              # did not double-claim
+    assert hs.contacts['new'].get('call_roadmap_status') != 'processing'
+    # Once the holder releases, the next poll claims normally.
+    gcs_write.release_lock(held)
+    ids2 = rp.claim_pending_bookings(_deps(storage, bm, hs), limit=10)
+    assert ids2 == ['new']
 
 
 # ── Endpoint ──────────────────────────────────────────────────────────────────

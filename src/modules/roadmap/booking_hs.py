@@ -49,6 +49,9 @@ PROP_PITCHED_ECHO = 'call_pitched_program'
 
 STATUS_PROCESSING = 'processing'
 STATUS_COMPLETE   = 'complete'
+STATUS_NO_MATCH   = 'no_match'
+STATUS_NO_INPUT   = 'no_input'
+STATUS_ERROR      = 'error'
 
 # How many programs the roadmap emails. Three per the feature request.
 N_PROGRAMS = 3
@@ -204,6 +207,39 @@ def rerun_candidates(hs: HubSpot, *, limit: int = 25) -> list[dict]:
         {'propertyName': PROP_STATUS, 'operator': 'EQ', 'value': STATUS_COMPLETE},
         {'propertyName': PROP_MATERIALS, 'operator': 'HAS_PROPERTY'},
     ]}], limit)
+
+
+def reinput_candidates(hs: HubSpot, *, limit: int = 25) -> list[dict]:
+    """Terminal bookings that produced no roadmap because the inputs were too thin
+    at build time ('no_input') or matched nothing ('no_match'). If the founder's
+    website or materials arrived since, the run-record fingerprint will differ and
+    claim_pending_bookings re-runs them — these statuses are only ever written with
+    a saved record, so that fingerprint gate is exact (no record ⇒ not re-run).
+    Unlike rerun_candidates this does NOT require a materials URL: a bare website
+    added to a 'no_input' contact must re-run too."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for status in (STATUS_NO_INPUT, STATUS_NO_MATCH):
+        for c in _search(hs, [{'filters': [
+            {'propertyName': PROP_TRIGGER, 'operator': 'HAS_PROPERTY'},
+            {'propertyName': PROP_STATUS, 'operator': 'EQ', 'value': status},
+        ]}], limit):
+            cid = c.get('_id')
+            if cid and cid not in seen:
+                seen.add(cid)
+                out.append(c)
+    return out[:limit]
+
+
+def error_bookings(hs: HubSpot, *, limit: int = 25) -> list[dict]:
+    """Bookings whose last run errored. Excluded from pending/rerun/processing, so
+    without this a transient failure (an Anthropic 5xx, a flaky fetch) leaves the
+    contact stuck at 'error' forever. claim_pending_bookings recovers them under a
+    staleness gate and a bounded retry budget. Oldest first, so none starve."""
+    return _search(hs, [{'filters': [
+        {'propertyName': PROP_TRIGGER, 'operator': 'HAS_PROPERTY'},
+        {'propertyName': PROP_STATUS, 'operator': 'EQ', 'value': STATUS_ERROR},
+    ]}], limit, sorts=[{'propertyName': 'createdate', 'direction': 'ASCENDING'}])
 
 
 def processing_bookings(hs: HubSpot, *, limit: int = 25) -> list[dict]:

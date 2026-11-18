@@ -24,9 +24,15 @@ which tool to use for which job.
 
 ## The tools at a glance
 
-- **Find a company:** `search_companies` → then `get_company` (summary, website,
-  pool, Drive assignment, intake) or `get_profile` (capability aspects, confirmed
-  and unexplored markets).
+- **Find a company by name:** `search_companies` → then `get_company` (summary,
+  website, pool, Drive assignment, intake) or `get_profile` (capability aspects,
+  confirmed and unexplored markets).
+- **Find companies by what they do:** `search_contacts` — semantic/embedding
+  search across the whole contact store (lead sources + clients/prospects) for
+  companies whose summary fits a technology description (e.g. "autonomous
+  underwater drones"). Returns one row per company with the folder it is in and a
+  0-1 score. Use this when you have a capability in mind but not a name;
+  `search_companies` is for when you know the name.
 - **Find grants:** `search_grants` — ranks open grant topics against a typed
   technology description.
 - **Find a person:** `search_resumes`.

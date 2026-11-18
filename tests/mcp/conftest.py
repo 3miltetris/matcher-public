@@ -16,6 +16,15 @@ def storage():
     return FakeStorage()
 
 
+@pytest.fixture(autouse=True)
+def _clear_contact_index_cache():
+    """The contact index is cached in-process; never let one test see another's."""
+    from src.modules.tools import contact_index
+    contact_index.clear_cache()
+    yield
+    contact_index.clear_cache()
+
+
 def put_parquet(storage, path: str, df: pd.DataFrame, *, bucket: str = BUCKET):
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)

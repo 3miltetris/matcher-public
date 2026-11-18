@@ -11,8 +11,8 @@ import pandas as pd
 
 from src.modules import attention as aq, onboarding as ob
 from src.modules.tools import (
-    _common as cm, attention as t_att, match_options as t_mo, onboarding as t_ob,
-    runs as t_runs, search as t_search,
+    _common as cm, attention as t_att, contact_index as t_ci, match_options as t_mo,
+    onboarding as t_ob, runs as t_runs, search as t_search,
 )
 from tests.mcp.conftest import put_csv, put_json, put_parquet
 
@@ -310,6 +310,143 @@ def test_search_resumes(storage):
     out = t_search.search_resumes(storage, _fake_embedder([1.0, 0.05]), 'optics')
     assert out['resumes_searched'] == 2
     assert out['results'][0]['name'] == 'Ada Lovelace'
+
+
+def test_search_contacts(storage):
+    # A lead-source folder (camelCase convention) and a pool (clients convention).
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', pd.DataFrame([
+        {'companyName': 'Optica Labs', 'companyWebsite': 'https://optica.com',
+         'company_summary': 'hyperspectral imaging sensors', 'segment': 'Optics',
+         'embeddings': [1.0, 0.0]},
+        {'companyName': 'Volt Cells', 'companyWebsite': 'https://volt.com',
+         'company_summary': 'battery chemistry', 'segment': 'Energy',
+         'embeddings': [0.0, 1.0]},
+    ]))
+    put_parquet(storage, 'data/all-contacts/clients/c.parquet', pd.DataFrame([
+        {'company_name': 'Sensor Co', 'companyWebsite': 'https://sensor.com',
+         'summary': 'imaging payloads', 'embeddings': [0.9, 0.1]},
+    ]))
+
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]),
+                                   'imaging', limit=10)
+    # Store size is deliberately NOT exposed (hidden until the feature is signed off).
+    assert 'contacts_searched' not in out
+    names = [r['company_name'] for r in out['results']]
+    assert names[:2] == ['Optica Labs', 'Sensor Co']          # best cosine first
+    top = out['results'][0]
+    assert top['source'] == 'apollo'
+    assert top['company_key'] == 'Optica Labs||https://optica.com'
+    assert top['industry'] == 'Optics'                        # segment -> industry
+    assert 'hyperspectral' in top['summary']                  # company_summary read
+    # coverage is reported by folder NAME only (no counts), and the run completed.
+    assert set(out['sources_searched']) == {'apollo', 'clients'}
+    assert out['complete'] is True and out['sources_incomplete'] == []
+
+    # `source` restricts to one folder.
+    scoped = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]),
+                                      'x', source='clients')
+    assert [r['company_name'] for r in scoped['results']] == ['Sensor Co']
+    assert scoped['sources_searched'] == ['clients']
+
+
+def test_search_contacts_reports_sources_without_embeddings(storage):
+    put_parquet(storage, 'data/all-contacts/clients/c.parquet', pd.DataFrame([
+        {'company_name': 'Has Vec', 'companyWebsite': 'https://hasvec.com',
+         'summary': 'x', 'embeddings': [1.0, 0.0]}]))
+    # A raw lead folder with no embeddings column at all (not yet profiled).
+    put_parquet(storage, 'data/all-contacts/linkedin_connections/l.parquet',
+                pd.DataFrame([{'company_name': 'No Vec',
+                               'companyWebsite': 'https://novec.com'}]))
+
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'x')
+    assert out['sources_searched'] == ['clients']
+    assert out['sources_no_embeddings'] == ['linkedin_connections']
+    assert [r['company_name'] for r in out['results']] == ['Has Vec']
+
+
+def test_search_contacts_dedups_www_variants(storage):
+    # Same company, www vs non-www + trailing slash — must collapse to one row.
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', pd.DataFrame([
+        {'companyName': 'Dual Inc', 'companyWebsite': 'https://dual.com',
+         'company_summary': 'robotics', 'embeddings': [1.0, 0.0]}]))
+    put_parquet(storage, 'data/all-contacts/clients/c.parquet', pd.DataFrame([
+        {'company_name': 'Dual Inc', 'companyWebsite': 'https://www.dual.com/',
+         'summary': 'robotics', 'embeddings': [1.0, 0.0]}]))
+
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]),
+                                   'robotics', limit=10)
+    assert len(out['results']) == 1
+    r = out['results'][0]
+    assert sorted([r['source'], *r['also_in']]) == ['apollo', 'clients']
+    # the returned key is one of the real stored keys (usable by get_company)
+    assert r['company_key'] in ('Dual Inc||https://dual.com',
+                                'Dual Inc||https://www.dual.com/')
+
+
+def _apollo_rows():
+    return pd.DataFrame([
+        {'company_name': 'Optica Labs', 'companyWebsite': 'https://optica.com',
+         'summary': 'imaging sensors', 'segment': 'Optics', 'embeddings': [1.0, 0.0]},
+        # same company twice in one blob (contact rows) -> one index row
+        {'company_name': 'Optica Labs', 'companyWebsite': 'https://optica.com',
+         'summary': 'imaging sensors', 'segment': 'Optics', 'embeddings': [1.0, 0.0]},
+        {'company_name': 'Volt Cells', 'companyWebsite': 'https://volt.com',
+         'summary': 'battery chemistry', 'segment': 'Energy', 'embeddings': [0.0, 1.0]},
+    ])
+
+
+def test_contact_index_serves_covered_blobs_without_live_scan(storage, monkeypatch):
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', _apollo_rows())
+    built = t_ci.build_source(storage, 'apollo')
+    assert built['rows'] == 2                       # deduped per company within the blob
+
+    def no_live(*a, **k):
+        raise AssertionError('covered blob must be served from the index')
+    monkeypatch.setattr(t_search, '_score_contacts_blob', no_live)
+
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'imaging')
+    assert [r['company_name'] for r in out['results']][0] == 'Optica Labs'
+    top = out['results'][0]
+    assert top['company_key'] == 'Optica Labs||https://optica.com'
+    assert top['industry'] == 'Optics' and top['score'] > 0.99
+    assert out['sources_searched'] == ['apollo'] and out['complete'] is True
+
+
+def test_contact_index_live_scans_blobs_imported_after_the_build(storage):
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', _apollo_rows())
+    t_ci.build_source(storage, 'apollo')
+    # A new import lands after the nightly build — it must still be searchable.
+    put_parquet(storage, 'data/all-contacts/apollo/b.parquet', pd.DataFrame([
+        {'company_name': 'New Co', 'companyWebsite': 'https://new.co',
+         'summary': 'fresh import', 'embeddings': [0.0, 1.0]}]))
+
+    out = t_search.search_contacts(storage, _fake_embedder([0.0, 1.0]), 'x')
+    names = {r['company_name'] for r in out['results']}
+    assert {'New Co', 'Volt Cells'} <= names
+    assert out['complete'] is True
+
+
+def test_contact_index_skips_unchanged_and_records_no_embeddings(storage):
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', _apollo_rows())
+    put_parquet(storage, 'data/all-contacts/linkedin_connections/l.parquet',
+                pd.DataFrame([{'company_name': 'No Vec',
+                               'companyWebsite': 'https://novec.com'}]))
+    assert t_ci.build_source(storage, 'apollo').get('build_id')
+    assert t_ci.build_source(storage, 'apollo') == {'source': 'apollo',
+                                                    'skipped': 'up to date'}
+    t_ci.build_source(storage, 'linkedin_connections')
+
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'x')
+    assert out['sources_no_embeddings'] == ['linkedin_connections']
+    assert out['sources_searched'] == ['apollo']
+
+
+def test_search_contacts_budget_returns_instead_of_waiting(storage):
+    put_parquet(storage, 'data/all-contacts/apollo/a.parquet', _apollo_rows())
+    out = t_search.search_contacts(storage, _fake_embedder([1.0, 0.0]), 'x',
+                                   time_budget_s=0)
+    assert out['complete'] is False
+    assert out['sources_incomplete'] == ['apollo']
 
 
 def test_get_profile(storage):

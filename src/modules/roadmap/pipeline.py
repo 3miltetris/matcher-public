@@ -27,6 +27,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import src.modules.aspect_profile as ap
 import src.modules.profile_build as pb
+from src.modules import gcs_write
 from src.modules.roadmap import booking_hs as bk
 from src.modules.roadmap import deck, fetch
 from src.modules.roadmap import hubspot_roadmap as hr
@@ -373,6 +374,20 @@ def generate_batch(deps: RoadmapDeps, ids: list[str], mode: str = MODE_EVENT,
 
 _TERMINAL_BOOKING = {'complete', 'no_match', 'no_input'}
 
+# A booking whose last run errored is retried (stale-gated) at most this many
+# times for the SAME inputs; a changed fingerprint resets the budget. Bounds the
+# spend on a contact that fails every run (an unreachable site, a hard refusal)
+# instead of re-building it on every poll forever.
+_MAX_BOOKING_ATTEMPTS = 3
+
+# One poll claims at a time. The booking-poll claim is search-then-PATCH, which is
+# not atomic on its own: two overlapping polls could both read the same unclaimed
+# contact before either marks it processing, double-building and double-emailing.
+# A short GCS run-lock around the claim selection serialises them; a poll that dies
+# holding it is taken over after the ttl.
+_BOOKING_POLL_LOCK = 'roadmap-booking-poll'
+_POLL_LOCK_TTL_S   = 180
+
 
 def _booking_run_id(key: str) -> str:
     """One record per contact (not per day), so an unchanged booking reuses its
@@ -482,6 +497,18 @@ def generate_booking_roadmap(deps: RoadmapDeps, *, contact_id: str | None = None
                              generated_at=record.get('generated_at', today.isoformat()))
             log.info('booking %s: reused existing result (%s)', run_id, record['status'])
             return _finish_booking(deps, record, cid, warnings)
+
+        # Count this build attempt against the current inputs, and persist it
+        # before the heavy work — so a run that errors (or is killed) still counts,
+        # and claim_pending_bookings can stop retrying a permanently-failing contact
+        # after _MAX_BOOKING_ATTEMPTS. New inputs (changed fingerprint) reset the
+        # budget. Written here, after the idempotent-reuse check, so reuse is
+        # unaffected.
+        if record.get('fingerprint') != fp:
+            record['attempts'] = 0
+        record['fingerprint'] = fp
+        record['attempts'] = int(record.get('attempts') or 0) + 1
+        _save_record(deps, record)
 
         # 1 · material: the homepage always, the founder's materials deck if sent
         site_text, site_reason = fetch.fetch_website_text(inp['website'])
@@ -601,39 +628,76 @@ def _mark_booking_error(deps: RoadmapDeps, contact_id, email, today: date) -> No
 def claim_pending_bookings(deps: RoadmapDeps, *, limit: int = 10,
                            stale_min: int = POLL_STALE_MIN) -> list[str]:
     """Claim up to `limit` contacts needing a booking roadmap: new bookings first,
-    then re-run candidates whose inputs changed (a materials deck arrived), then
-    stale 'processing' claims to recover killed runs. Claiming synchronously here
-    lets the caller run generation in the background without two polls colliding."""
+    then re-run candidates whose inputs changed (a materials deck or website
+    arrived), then stale 'processing' claims to recover killed runs, then stale
+    'error' bookings so a transient failure is not permanent. The whole selection
+    runs under a short GCS lock, so two overlapping polls cannot both claim the
+    same contact (the search-then-PATCH claim is not atomic on its own); a poll
+    that cannot take the lock returns nothing and lets the holder proceed."""
     bk.ensure_output_properties(deps.hubspot)
     now = deps.now()
-    picked = list(bk.pending_bookings(deps.hubspot, limit=limit))
 
-    if len(picked) < limit:
-        for c in bk.rerun_candidates(deps.hubspot, limit=limit):
-            if len(picked) >= limit:
-                break
-            inp = bk.booking_inputs(c)
-            rec = _load_record(deps, _booking_run_id(c.get('_id') or inp['email']))
-            if rec.get('fingerprint') != _booking_fingerprint(inp):
-                picked.append(c)          # inputs changed -> genuine re-run
+    bucket = deps.storage_client.bucket(deps.bucket)
+    lock = gcs_write.acquire_lock(bucket, _BOOKING_POLL_LOCK,
+                                  now.isoformat(timespec='seconds'),
+                                  ttl_seconds=_POLL_LOCK_TTL_S)
+    if lock is None:
+        log.info('booking poll: another poll holds the claim lock; skipping')
+        return []
+    try:
+        picked = list(bk.pending_bookings(deps.hubspot, limit=limit))
 
-    if len(picked) < limit:
-        picked += [c for c in bk.processing_bookings(deps.hubspot, limit=limit)
-                   if _is_stale(c.get(bk.PROP_GENERATED_AT), now, stale_min)]
+        # Re-run terminal bookings whose inputs changed: a materials deck on a
+        # 'complete' (rerun_candidates) or a late website/materials on a
+        # 'no_input'/'no_match' (reinput_candidates). Both are gated the same way
+        # — a differing saved-record fingerprint — so nothing unchanged re-runs.
+        if len(picked) < limit:
+            changed = (list(bk.rerun_candidates(deps.hubspot, limit=limit))
+                       + list(bk.reinput_candidates(deps.hubspot, limit=limit)))
+            for c in changed:
+                if len(picked) >= limit:
+                    break
+                inp = bk.booking_inputs(c)
+                rec = _load_record(deps, _booking_run_id(c.get('_id') or inp['email']))
+                if rec.get('fingerprint') != _booking_fingerprint(inp):
+                    picked.append(c)          # inputs changed -> genuine re-run
 
-    ids: list[str] = []
-    seen: set[str] = set()
-    for c in picked[:limit]:
-        cid = c.get('_id')
-        if not cid or cid in seen:
-            continue
-        seen.add(cid)
-        try:
-            bk.claim(deps.hubspot, cid, now.isoformat(timespec='seconds'))
-            ids.append(cid)
-        except Exception:
-            log.exception('booking poll: claim failed for %s', cid)
-    return ids
+        if len(picked) < limit:
+            picked += [c for c in bk.processing_bookings(deps.hubspot, limit=limit)
+                       if _is_stale(c.get(bk.PROP_GENERATED_AT), now, stale_min)]
+
+        # Recover errored bookings: only when stale (so a retry waits out the
+        # transient fault) and under the retry budget for the SAME inputs, so a
+        # contact that fails every run is not rebuilt forever. A changed
+        # fingerprint resets the budget, so new inputs always get a fresh attempt.
+        if len(picked) < limit:
+            for c in bk.error_bookings(deps.hubspot, limit=limit):
+                if len(picked) >= limit:
+                    break
+                if not _is_stale(c.get(bk.PROP_GENERATED_AT), now, stale_min):
+                    continue
+                inp = bk.booking_inputs(c)
+                rec = _load_record(deps, _booking_run_id(c.get('_id') or inp['email']))
+                same_inputs = rec.get('fingerprint') == _booking_fingerprint(inp)
+                if same_inputs and int(rec.get('attempts') or 0) >= _MAX_BOOKING_ATTEMPTS:
+                    continue
+                picked.append(c)
+
+        ids: list[str] = []
+        seen: set[str] = set()
+        for c in picked[:limit]:
+            cid = c.get('_id')
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            try:
+                bk.claim(deps.hubspot, cid, now.isoformat(timespec='seconds'))
+                ids.append(cid)
+            except Exception:
+                log.exception('booking poll: claim failed for %s', cid)
+        return ids
+    finally:
+        gcs_write.release_lock(lock)
 
 
 def generate_booking_batch(deps: RoadmapDeps, ids: list[str],
