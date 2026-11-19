@@ -14,6 +14,7 @@ consultant can see the state of the pipeline without opening Streamlit.
 from __future__ import annotations
 
 import io
+import json
 
 import pandas as pd
 
@@ -120,6 +121,24 @@ def _match_segments(gcs_client, run_id: str, *, bucket: str) -> list[str]:
 
 _MATCH_COLS = ['companyName', 'companyWebsite', 'source', 'topic_number', 'agency',
                'broad_agency', 'title', 'due_date', 'good_match', 'subject_line']
+_MESSAGE_CAP = 1200  # written-message columns are the deliverable; cap them looser
+
+
+def _message_columns(gcs_client, run_id: str, *, bucket: str) -> list[str]:
+    """The written-message columns of this run: ai_message plus the run's own
+    custom message columns, read from its job config (names are user-chosen, so
+    they cannot be in a fixed list). A missing config just yields ai_message."""
+    cols = ['ai_message']
+    try:
+        cfg = json.loads(gcs_client.bucket(bucket).blob(
+            f'job-configs/{run_id}.json').download_as_bytes())
+        for cp in (cfg.get('email_config') or {}).get('custom_prompts', []) or []:
+            name = str(cp.get('output_column', '') or '').strip()
+            if name and name not in cols:
+                cols.append(name)
+    except Exception:
+        pass
+    return cols
 
 
 def get_match_results(gcs_client, run_id: str, *, company_key: str | None = None,
@@ -159,7 +178,10 @@ def get_match_results(gcs_client, run_id: str, *, company_key: str | None = None
     off = cm.decode_cursor(cursor)
     page = df.iloc[off:off + max(1, int(limit))]
     cols = [c for c in _MATCH_COLS if c in df.columns]
-    rows = [{c: cm.cap_text(r.get(c), 300) for c in cols}
+    msg_cols = [c for c in _message_columns(gcs_client, run_id, bucket=bucket)
+                if c in df.columns and c not in cols]
+    rows = [{**{c: cm.cap_text(r.get(c), 300) for c in cols},
+             **{c: cm.cap_text(r.get(c), _MESSAGE_CAP) for c in msg_cols}}
             for r in page.to_dict('records')]
     nxt = cm.encode_cursor(off + len(page)) if off + len(page) < total else None
     return {'run_id': run_id, 'found': True, 'total': int(total),

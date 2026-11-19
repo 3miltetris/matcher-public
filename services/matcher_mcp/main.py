@@ -477,7 +477,8 @@ def build_server():
                      top_k: int = 5, ai_validation: bool = True,
                      prewrite_email: bool = False, include_procurement: bool = False,
                      date_column: str = '', date_from: str = '', date_to: str = '',
-                     include_undated: bool = True, confirm_token: str = '') -> str:
+                     include_undated: bool = True, custom_messages: str = '',
+                     confirm_token: str = '') -> str:
         """Start a bulk matching run (contacts × grant topics). `agencies` and
         `sources` are comma-separated (e.g. 'DOD,HHS' / 'apollo,sba'); get the real
         options from list_match_options first. Optional grant date filter: set
@@ -485,15 +486,37 @@ def build_server():
         (ISO YYYY-MM-DD; either side may be omitted for a one-sided range), and
         `include_undated` (default true) to keep rolling/undated grants.
         `include_procurement` (default false) opts supply/sources-sought notices
-        back in. Call once WITHOUT confirm_token to get an estimate and a
-        confirm_token, then call again with the SAME arguments plus that
-        confirm_token to start the run."""
+        back in.
+
+        CUSTOM MESSAGES — `custom_messages` adds AI-written columns to every
+        matched row (the Bulk Matching "custom prompts"). It is a JSON array of
+        {"name": "intro_line", "instructions": "...", "example": "...",
+        "columns": ["company_summary","grant_summary"], "word_limit": 60}.
+        `name` is the lowercase output column; `example` is a sample of the exact
+        output wanted (used as a format/tone reference, never copied); `columns`
+        are the match-row fields the writer sees (default company_summary +
+        grant_summary; others: companyName, firstName, lastName, title,
+        topic_number, agency, due_date, funding_amount, ...). Setting it turns
+        `prewrite_email` on. Before calling this tool:
+          1. If the person has not said whether they want custom messages, ASK
+             whether they'd like one written for each match.
+          2. If yes, ASK what the message should say and for an example of the
+             exact output they want (or the format to follow).
+          3. Write a DIFFERENT example yourself — the same format, tone and
+             length, applied to a different made-up company and grant — show it,
+             and ask them to confirm that is exactly the output they want. Revise
+             until they confirm. Only then include it in `custom_messages`.
+
+        Call once WITHOUT confirm_token to get an estimate and a confirm_token
+        (it echoes the custom messages back), then call again with the SAME
+        arguments plus that confirm_token to start the run."""
         args = {'agencies': agencies, 'sources': sources, 'threshold': threshold,
                 'top_k': top_k, 'ai_validation': ai_validation,
                 'prewrite_email': prewrite_email,
                 'include_procurement': include_procurement,
                 'date_column': date_column, 'date_from': date_from,
-                'date_to': date_to, 'include_undated': include_undated}
+                'date_to': date_to, 'include_undated': include_undated,
+                'custom_messages': custom_messages}
         return run_trigger('run_matching', args, confirm_token)
 
     @mcp.tool()

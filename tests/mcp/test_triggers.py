@@ -352,3 +352,67 @@ def test_run_matching_email_config_is_dict(storage):
     cfg = json.loads(storage.bucket(tg.BUCKET).blob(
         f"job-configs/{out['run_id']}.json").download_as_text())
     assert cfg['email_config'] == {} and cfg['prewrite_email'] is True
+
+
+_MSG = {'name': 'intro_line',
+        'instructions': 'One sentence on why this topic fits the company.',
+        'example': 'Your lidar fits the Army GPS-denied navigation topic.',
+        'columns': ['company_summary', 'grant_summary', 'title'],
+        'word_limit': 40}
+
+
+def test_run_matching_custom_messages_config(storage):
+    # passed as the JSON string the MCP tool receives
+    args = {'agencies': ['DOD'], 'sources': ['apollo'],
+            'custom_messages': json.dumps([_MSG])}
+    est = tg.estimate(storage, 'run_matching', args, EMAIL, secret=SECRET, now=1000)
+    assert est['custom_messages'][0]['name'] == 'intro_line'  # echoed for review
+    out = tg.trigger(storage, 'run_matching', args, EMAIL, est['confirm_token'],
+                     secret=SECRET, jobs_client=FakeJobs(), now=1001)
+    assert out['triggered']
+    cfg = json.loads(storage.bucket(tg.BUCKET).blob(
+        f"job-configs/{out['run_id']}.json").download_as_text())
+    assert cfg['prewrite_email'] is True          # turned on by the message
+    (cp,) = cfg['email_config']['custom_prompts']
+    assert cp['output_column'] == 'intro_line' and cp['word_limit'] == 40
+    assert cp['columns'] == ['company_summary', 'grant_summary', 'title']
+    assert _MSG['instructions'] in cp['system'] and _MSG['example'] in cp['system']
+    assert '{word_limit}' in cp['system']         # filled in by matching_job
+    assert 'subject_line' not in cfg['email_config']  # defaults kept
+
+
+def test_run_matching_estimate_counts_prewrite_and_messages(storage):
+    base = {'agencies': ['DOD'], 'sources': ['apollo']}
+    plain = tg.estimate(storage, 'run_matching', base, EMAIL, secret=SECRET)
+    pw = tg.estimate(storage, 'run_matching', {**base, 'prewrite_email': True},
+                     EMAIL, secret=SECRET)
+    two = tg.estimate(storage, 'run_matching',
+                      {**base, 'custom_messages': [_MSG, {**_MSG, 'name': 'b'}]},
+                      EMAIL, secret=SECRET)
+    c = lambda e: e['estimate']['est_cost_usd']  # noqa: E731
+    assert c(plain) < c(pw) < c(two)  # forced pre-write + each message is charged
+
+
+def test_run_matching_custom_messages_token_binds_to_message(storage):
+    args = {'agencies': ['DOD'], 'sources': ['apollo'], 'custom_messages': [_MSG]}
+    est = tg.estimate(storage, 'run_matching', args, EMAIL, secret=SECRET, now=1000)
+    changed = {**args, 'custom_messages': [{**_MSG, 'example': 'Something else.'}]}
+    out = tg.trigger(storage, 'run_matching', changed, EMAIL, est['confirm_token'],
+                     secret=SECRET, jobs_client=FakeJobs(), now=1001)
+    assert 'error' in out and 'confirm_token' in out['error']
+
+
+@pytest.mark.parametrize('bad', [
+    'not json',
+    [{**_MSG, 'name': 'Intro Line'}],                 # not a column name
+    [{**_MSG, 'name': 'subject_line'}],               # reserved output
+    [{**_MSG, 'name': 'record_kind'}],                # grant metadata the job copies
+    [{**_MSG, 'instructions': ''}],
+    [{**_MSG, 'columns': ['bogus']}],
+    [{**_MSG, 'word_limit': 0}],
+    [_MSG, _MSG],                                     # duplicate name
+    [{**_MSG, 'name': f'm{i}'} for i in range(6)],    # over the per-run limit
+])
+def test_run_matching_custom_messages_rejects_bad_input(storage, bad):
+    args = {'agencies': ['DOD'], 'sources': ['apollo'], 'custom_messages': bad}
+    assert 'error' in tg.estimate(storage, 'run_matching', args, EMAIL, secret=SECRET)

@@ -273,11 +273,25 @@ async def _generate_email_batch(
                     f"{col}: {str(row.get(col, '') or '')}"
                     for col in cp.get('columns', [])
                 )
-                outputs[cp['output_column']] = await async_custom_prompt(
-                    text=col_text,
-                    system=cp['system'],
-                    anth_client=anth,
-                )
+                word_limit = int(cp.get('word_limit', 30) or 30)
+                try:
+                    outputs[cp['output_column']] = await async_custom_prompt(
+                        text=col_text,
+                        # Bulk Matching's help text promises {word_limit} is
+                        # filled in, as it is for the subject line and AI message.
+                        system=cp['system'].replace('{word_limit}', str(word_limit)),
+                        anth_client=anth,
+                        # ~1.3 tokens/word plus headroom, so a long message is
+                        # never silently cut off at the 500-token default.
+                        max_tokens=max(500, word_limit * 2 + 100),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # One refused or failed row must not abort the whole run
+                    # (gather has no return_exceptions) after validation was
+                    # already paid for. A blank cell reads as "not written".
+                    print(f"  custom prompt {cp['output_column']!r} failed for "
+                          f"row {idx}: {type(e).__name__}: {e}", flush=True)
+                    outputs[cp['output_column']] = ''
             return idx, outputs
 
         return await asyncio.gather(*[_one(idx, row) for idx, row in rows])
@@ -366,7 +380,17 @@ def _flush_segment(
     # ── Email pre-write ────────────────────────────────────────────────────
     if prewrite_email:
         segment = segment.copy()
-        custom_cols = [cp['output_column'] for cp in email_config.get('custom_prompts', [])]
+        # A custom output column must never overwrite data the row already has
+        # (grant metadata, contact fields) — drop the clashing prompt loudly.
+        kept = []
+        for cp in email_config.get('custom_prompts', []):
+            if cp['output_column'] in segment.columns:
+                print(f"  custom prompt {cp['output_column']!r} skipped: that "
+                      'column already exists in the match rows', flush=True)
+            else:
+                kept.append(cp)
+        email_config = {**email_config, 'custom_prompts': kept}
+        custom_cols = [cp['output_column'] for cp in kept]
         for col in ['subject_line', 'ai_message'] + custom_cols:
             segment[col] = None
 

@@ -170,6 +170,18 @@ def test_get_match_results_filter_and_paginate(storage):
     assert t_runs.get_match_results(storage, 'ghost')['found'] is False
 
 
+def test_get_match_results_includes_custom_message_columns(storage):
+    seg = pd.DataFrame([{'companyName': 'Acme', 'companyWebsite': 'https://acme.com',
+                         'topic_number': 'A1', 'ai_message': 'body',
+                         'intro_line': 'Your sensors fit.', 'unrelated': 'x'}])
+    put_csv(storage, 'matching-results/run2/segment_001.csv', seg)
+    put_json(storage, 'job-configs/run2.json', {'email_config': {'custom_prompts': [
+        {'output_column': 'intro_line', 'system': 's', 'columns': []}]}})
+    (row,) = t_runs.get_match_results(storage, 'run2')['rows']
+    assert row['intro_line'] == 'Your sensors fit.' and row['ai_message'] == 'body'
+    assert 'unrelated' not in row
+
+
 def test_whats_new(storage):
     put_json(storage, 'drive-sync-jobs/ds1/status.json',
              {'state': 'complete', 'clients_updated': 4, 'attention_written': 7})

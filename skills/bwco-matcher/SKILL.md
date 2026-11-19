@@ -135,12 +135,48 @@ don't guess codes:
      `scraped_at`, with a from/to range (either side alone is fine, e.g. "due
      before 2026-12-31"), and whether to keep undated/rolling grants
      (`include_undated`, default yes). Skip it if they don't want one.
+   - **Custom messages** — if they haven't said, ask whether they'd like a
+     custom message written for each match (see below). Skip it if not.
 3. **Then the two-step:** call `run_matching` with the chosen `sources`,
-   `agencies`, and any `date_column`/`date_from`/`date_to`/`include_undated`,
-   **without** `confirm_token` → show the cost estimate → call again with the
+   `agencies`, any `date_column`/`date_from`/`date_to`/`include_undated`, and
+   any confirmed `custom_messages`, **without** `confirm_token` → show the cost
+   estimate (it echoes the custom messages back) → call again with the
    **same** arguments plus the `confirm_token` → follow with
    `get_run_status("matching-job", run_id)` and read the rows with
    `get_match_results`.
+
+#### Custom messages
+
+Custom messages are the connector's version of Bulk Matching's "custom
+prompts": each one adds an AI-written column to every matched row (an intro
+line, a "why you fit" sentence, a LinkedIn note…), written from that row's
+company and grant. Never invent one or skip the confirmation:
+
+1. **Ask** whether they want a custom message, unless they already said.
+2. **Ask what it should say and for an example** of the exact output they want
+   (or the format to follow). Also ask for a column name if they care, and a
+   rough length.
+3. **Confirm with a different example.** Write one yourself in the same format,
+   tone and length but about a *different* made-up company and grant, show it,
+   and ask "Is this exactly the output you want?" Revise until they say yes —
+   do not call `run_matching` before that.
+4. Pass it as `custom_messages`, a JSON array (up to 5):
+   ```json
+   [{"name": "intro_line",
+     "instructions": "One friendly sentence telling the founder why this topic fits their technology.",
+     "example": "Your low-SWaP lidar lines up well with the Army's GPS-denied navigation topic.",
+     "columns": ["company_summary", "grant_summary", "title", "agency"],
+     "word_limit": 40}]
+   ```
+   `name` is a lowercase column name (it can't reuse an existing column like
+   `subject_line`). `example` is used as a format/tone reference — the job
+   never copies its specifics. `columns` default to `company_summary` +
+   `grant_summary`; add `firstName`, `companyName`, `title`, `agency`,
+   `due_date`, `funding_amount`… if the message needs them (a message that
+   greets by name needs `firstName`). Setting `custom_messages` turns on
+   email pre-write, so the run also writes the default `subject_line` and
+   `ai_message` columns.
+5. The messages appear as extra columns in `get_match_results`.
 
 Remember a contact source (apollo, clients…) is **what gets scored**; an agency
 (DOD, SAM-GOV…) is **what it is scored against** — SAM-GOV is an agency, not a

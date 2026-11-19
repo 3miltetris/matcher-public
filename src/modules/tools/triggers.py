@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -327,6 +328,113 @@ def _build_date_filter(args: dict):
     }], None
 
 
+# Custom messages are the MCP form of Bulk Matching's "Custom prompts": one extra
+# output column per message, written by matching_job's email pre-write step from
+# the listed match-row columns. The column allowlist mirrors
+# views/bulk_matching._ALL_COLUMNS — a column the job does not have would just
+# feed the prompt an empty value, so it is refused here instead.
+CUSTOM_MESSAGE_COLUMNS = (
+    'company_summary', 'companyName', 'companyWebsite',
+    'firstName', 'lastName', 'email', 'source',
+    'grant_summary', 'title', 'topic_number',
+    'agency', 'broad_agency', 'due_date', 'funding_amount',
+    'phase1_ceiling_num', 'phase2_ceiling_num', 'award_ceiling_num', 'ceiling_source',
+)
+_DEFAULT_MESSAGE_COLUMNS = ['company_summary', 'grant_summary']
+# Columns a match row already carries; a custom message must not overwrite them.
+# Covers matching_job's grant_meta copy (keep in step with its `grant_cols`) and
+# the contact columns the stores hold. The job also refuses a clash at run time.
+_RESERVED_OUTPUT_COLUMNS = set(CUSTOM_MESSAGE_COLUMNS) | {
+    'subject_line', 'ai_message', 'good_match', 'score', 'similarity', 'uuid',
+    'embeddings', 'summary', 'scraped_at', 'open_date', 'close_date',
+    'record_kind', 'is_rolling', 'last_verified_active', 'verify_status',
+    'grant_source', 'company_name', 'state', 'phone', 'segment', 'industry',
+    'full_text', 'page_text', 'pool',
+    'technology_data', 'technology_summary', 'technology_updated_at',
+    'financial_data', 'financial_summary', 'financials_updated_at',
+    'client_docs_data', 'client_docs_summary', 'docs_updated_at',
+    'client_meetings_data', 'client_meetings_summary', 'meetings_updated_at',
+}
+_MAX_CUSTOM_MESSAGES = 5
+_MAX_INSTRUCTIONS_CHARS = 4000
+_MAX_EXAMPLE_CHARS = 2000
+_OUTPUT_NAME_RE = re.compile(r'^[a-z][a-z0-9_]{0,39}$')
+
+
+def _parse_custom_messages(raw):
+    """(messages, error). `raw` is a list of dicts or its JSON string (the MCP
+    tool passes a string). Each message: name (the output column), instructions
+    (what to write), optional example (a sample of the exact output wanted),
+    optional columns (match-row inputs, default company + grant summary) and
+    word_limit (default 60). Returned normalised so the confirm token signs it."""
+    if raw in (None, '', [], ()):
+        return [], None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None, 'custom_messages must be a JSON array of message objects'
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return None, 'custom_messages must be a JSON array of message objects'
+    if len(raw) > _MAX_CUSTOM_MESSAGES:
+        return None, f'at most {_MAX_CUSTOM_MESSAGES} custom messages per run'
+    out, names = [], set()
+    for i, m in enumerate(raw, 1):
+        if not isinstance(m, dict):
+            return None, f'custom message {i} must be an object'
+        name = str(m.get('name', '') or '').strip().lower()
+        if not _OUTPUT_NAME_RE.match(name):
+            return None, (f'custom message {i}: name must be a lowercase column name '
+                          '(letters, digits, underscores; e.g. "intro_line")')
+        if name in _RESERVED_OUTPUT_COLUMNS:
+            return None, f'custom message {i}: "{name}" is already an output column'
+        if name in names:
+            return None, f'custom message {i}: duplicate name "{name}"'
+        names.add(name)
+        instructions = str(m.get('instructions', '') or '').strip()
+        if not instructions:
+            return None, f'custom message {i} ("{name}"): instructions are required'
+        if len(instructions) > _MAX_INSTRUCTIONS_CHARS:
+            return None, (f'custom message {i} ("{name}"): instructions exceed '
+                          f'{_MAX_INSTRUCTIONS_CHARS} characters')
+        example = str(m.get('example', '') or '').strip()
+        if len(example) > _MAX_EXAMPLE_CHARS:
+            return None, (f'custom message {i} ("{name}"): example exceeds '
+                          f'{_MAX_EXAMPLE_CHARS} characters')
+        cols = _as_list(m.get('columns')) or list(_DEFAULT_MESSAGE_COLUMNS)
+        bad = [c for c in cols if c not in CUSTOM_MESSAGE_COLUMNS]
+        if bad:
+            return None, (f'custom message {i} ("{name}"): unknown columns {bad}; '
+                          f'choose from {list(CUSTOM_MESSAGE_COLUMNS)}')
+        try:
+            wl = m.get('word_limit')
+            word_limit = 60 if wl in (None, '') else int(wl)
+        except (TypeError, ValueError):
+            return None, f'custom message {i} ("{name}"): word_limit must be a number'
+        if not 1 <= word_limit <= 500:
+            return None, f'custom message {i} ("{name}"): word_limit must be 1-500'
+        out.append({'name': name, 'instructions': instructions, 'example': example,
+                    'columns': cols, 'word_limit': word_limit})
+    return out, None
+
+
+def custom_message_system(msg: dict) -> str:
+    """The system prompt matching_job runs for one custom message. The example
+    is a style/format reference, never text to copy, so every row is written
+    fresh from its own company and topic."""
+    parts = [msg['instructions'].strip()]
+    if msg.get('example'):
+        parts.append('Match the format, tone and length of this example exactly, '
+                     'but write it fresh from the company and grant details '
+                     "provided — never reuse the example's specifics:\n"
+                     f"<example>\n{msg['example']}\n</example>")
+    parts.append('Use no more than {word_limit} words. Respond with only the '
+                 'message text — no preamble, labels, quotes or notes.')
+    return '\n\n'.join(parts)
+
+
 def _resolve_matching(gcs_client, args: dict, bucket: str):
     agencies = _as_list(args.get('agencies'))
     sources = _as_list(args.get('sources'))
@@ -337,20 +445,39 @@ def _resolve_matching(gcs_client, args: dict, bucket: str):
     topic_filters, err = _build_date_filter(args)
     if err:
         return None, 0, {}, err
+    custom_messages, err = _parse_custom_messages(args.get('custom_messages'))
+    if err:
+        return None, 0, {}, err
     norm = {
         'agencies': sorted(agencies),
         'sources': sorted(sources),
         'threshold': round(float(args.get('threshold', 0.82)), 4),
         'top_k': int(args.get('top_k', 5)),
         'ai_validation': bool(args.get('ai_validation', True)),
-        'prewrite_email': bool(args.get('prewrite_email', False)),
+        # Custom messages are written by the job's email pre-write step, exactly
+        # as in Bulk Matching, so asking for one turns pre-write on.
+        'prewrite_email': bool(args.get('prewrite_email', False)) or bool(custom_messages),
         'include_procurement': bool(args.get('include_procurement', False)),
         'topic_filters': topic_filters,
     }
+    if custom_messages:
+        # Only present when used, so tokens for message-less runs are unchanged.
+        norm['custom_messages'] = custom_messages
     return norm, 1, {}, None
 
 
 def _config_matching(norm: dict, extra: dict, run_id: str) -> dict:
+    # {} not None: matching_job does config.get('email_config', {}), which
+    # returns the value when the key is present, so None would reach
+    # email_config.get(...) and crash the run when prewrite_email is on.
+    email_config: dict = {}
+    if norm.get('custom_messages'):
+        # Subject line + AI message keep the job's defaults (no subject_line /
+        # ai_message keys), as an untouched Bulk Matching form would.
+        email_config = {'custom_prompts': [
+            {'output_column': m['name'], 'columns': m['columns'],
+             'system': custom_message_system(m), 'word_limit': m['word_limit']}
+            for m in norm['custom_messages']]}
     return {
         'run_id': run_id,
         'threshold': norm['threshold'],
@@ -361,10 +488,7 @@ def _config_matching(norm: dict, extra: dict, run_id: str) -> dict:
         'include_procurement': norm['include_procurement'],
         'ai_validation': norm['ai_validation'],
         'prewrite_email': norm['prewrite_email'],
-        # {} not None: matching_job does config.get('email_config', {}), which
-        # returns the value when the key is present, so None would reach
-        # email_config.get(...) and crash the run when prewrite_email is on.
-        'email_config': {},
+        'email_config': email_config,
     }
 
 
@@ -572,10 +696,24 @@ def _unit_cap(tool: str, limits: dict) -> int:
     return int(limits.get('unit_caps', {}).get(tool, _SPECS[tool].unit_cap))
 
 
-def _estimate_cost_minutes(spec: Spec, units: int) -> tuple[float, int]:
-    cost = round(spec.base_cost + spec.cost_per_unit * units, 2)
-    minutes = int(round(spec.base_minutes + spec.minutes_per_unit * units))
-    return cost, minutes
+# Email pre-write and custom messages add LLM calls per matched row, and the row
+# count is unknown until the run scores. Rough per-run surcharges sized for a
+# ~2,000-row run (one Haiku call ≈ $0.001/row): pre-write writes a subject line
+# and an AI message, each custom message one more call.
+_PREWRITE_COST, _PREWRITE_MINUTES = 3.0, 6.0
+_CUSTOM_MESSAGE_COST, _CUSTOM_MESSAGE_MINUTES = 2.5, 5.0
+
+
+def _estimate_cost_minutes(spec: Spec, units: int,
+                           norm: dict | None = None) -> tuple[float, int]:
+    cost = spec.base_cost + spec.cost_per_unit * units
+    minutes = spec.base_minutes + spec.minutes_per_unit * units
+    norm = norm or {}
+    if norm.get('prewrite_email'):
+        n_msgs = len(norm.get('custom_messages') or [])
+        cost += _PREWRITE_COST + _CUSTOM_MESSAGE_COST * n_msgs
+        minutes += _PREWRITE_MINUTES + _CUSTOM_MESSAGE_MINUTES * n_msgs
+    return round(cost, 2), int(round(minutes))
 
 
 # ── public: estimate / trigger ────────────────────────────────────────────────
@@ -602,7 +740,7 @@ def estimate(gcs_client, tool: str, args: dict, email: str, *, secret: str,
         return {'error': f'{units} {spec.unit_noun}s exceeds the per-call limit of '
                          f'{cap} for {tool}; split it into smaller calls'}
 
-    cost, minutes = _estimate_cost_minutes(spec, units)
+    cost, minutes = _estimate_cost_minutes(spec, units, norm)
     daily_cap = daily_cap_for(email, limits)
     spent = today_spend(gcs_client, email, bucket=bucket)
     norm_str = _normalize(tool, norm)
@@ -620,6 +758,14 @@ def estimate(gcs_client, tool: str, args: dict, email: str, *, secret: str,
         'next': ('Call this tool again with the SAME arguments plus confirm_token '
                  'to start the run.'),
     }
+    if norm.get('custom_messages'):
+        # Echo what will run so the person can check it before confirming.
+        out['custom_messages'] = norm['custom_messages']
+        out['prewrite_email'] = True
+        out['note'] = ('custom messages turn on email pre-write, so every matched '
+                       'row also gets the default subject_line and ai_message; '
+                       'the estimate includes those calls (it scales with the '
+                       'number of matched rows)')
     if spent + cost > daily_cap:
         out['warning'] = (f'this would reach ${round(spent + cost, 2)} of your '
                           f'${round(daily_cap, 2)} daily cap and will be refused at '
@@ -657,7 +803,7 @@ def trigger(gcs_client, tool: str, args: dict, email: str, confirm_token: str, *
         return {'error': f'{units} {spec.unit_noun}s exceeds the per-call limit of '
                          f'{cap} for {tool}'}
 
-    cost, minutes = _estimate_cost_minutes(spec, units)
+    cost, minutes = _estimate_cost_minutes(spec, units, norm)
     daily_cap = daily_cap_for(email, limits)
     # Advisory fast-fail on a clearly-over-cap request (friendly message, no write
     # attempt). The race-safe enforcement is add_spend(cap=…) below.
